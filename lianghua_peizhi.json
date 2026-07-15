@@ -1,0 +1,58 @@
+{
+  "banben": 1,
+  "shuju": {
+    "source": "auto",
+    "history_calendar_days": 540,
+    "max_board_stocks": 20,
+    "minimum_history_rows": 120,
+    "request_pause_seconds": 0.15,
+    "akshare_bypass_proxy": true
+  },
+  "guolv": {
+    "min_list_days": 120,
+    "min_price": 2.0,
+    "max_price": 300.0,
+    "min_amount_yuan": 50000000,
+    "exclude_name_keywords": [
+      "ST",
+      "*ST",
+      "退",
+      "N",
+      "C"
+    ],
+    "exclude_latest_limit_up": true
+  },
+  "moxing": {
+    "horizons": [
+      1,
+      2,
+      3
+    ],
+    "validation_ratio": 0.2,
+    "min_training_samples": 500,
+    "min_validation_samples": 100,
+    "learning_rate": 0.05,
+    "max_iter": 180,
+    "max_leaf_nodes": 15,
+    "max_depth": 4,
+    "min_samples_leaf": 30,
+    "l2_regularization": 1.0,
+    "random_state": 42,
+    "prediction_clip_quantiles": [
+      0.01,
+      0.99
+    ],
+    "horizon_weights": {
+      "1": 0.5,
+      "2": 0.3,
+      "3": 0.2
+    }
+  },
+  "jiaoyi": {
+    "max_holding_days": 3,
+    "cost_scenario": "normal_cost",
+    "execution_mode": "research_only",
+    "allow_live_trading": false,
+    "allow_order_submission": false
+  }
+}

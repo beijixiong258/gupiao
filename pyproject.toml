@@ -1,0 +1,60 @@
+[project]
+name = "gupiaoyanjiu"
+version = "0.2.0"
+description = "A股 T+3 量化研究员：单股研究与指定板块短线预测"
+requires-python = ">=3.11"
+readme = "项目设计与实现.md"
+dependencies = [
+    "rich>=13.0.0",
+    "langchain-core>=0.1.0",
+    "langchain-openai>=0.0.5",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.28.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "tushare>=1.2.89",
+    "akshare>=1.12.0",
+    "fastmcp>=3.3.0,<4.0.0",
+]
+
+[project.scripts]
+gpyj = "cli:main"
+gpyj-mcp = "mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "agent"}
+py-modules = ["cli", "mcp_server"]
+
+[tool.setuptools.packages.find]
+where = ["agent"]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"src" = [
+    "providers/*.json",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["agent/tests"]
+pythonpath = ["agent"]
+markers = [
+    "unit: Unit tests (fast, no network)",
+    "integration: Integration tests (may need network)",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["agent"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

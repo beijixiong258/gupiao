@@ -1,0 +1,38 @@
+{
+  "notional_yuan": 20000,
+  "scenarios": [
+    {
+      "name": "zero_cost",
+      "buy_commission_rate": 0.0,
+      "sell_commission_rate": 0.0,
+      "stamp_tax_sell_rate": 0.0,
+      "transfer_fee_buy_rate": 0.0,
+      "transfer_fee_sell_rate": 0.0,
+      "buy_slippage_bps": 0.0,
+      "sell_slippage_bps": 0.0,
+      "min_commission_yuan": 0.0
+    },
+    {
+      "name": "normal_cost",
+      "buy_commission_rate": 0.00025,
+      "sell_commission_rate": 0.00025,
+      "stamp_tax_sell_rate": 0.0005,
+      "transfer_fee_buy_rate": 0.00001,
+      "transfer_fee_sell_rate": 0.00001,
+      "buy_slippage_bps": 2.0,
+      "sell_slippage_bps": 2.0,
+      "min_commission_yuan": 5.0
+    },
+    {
+      "name": "stress_cost",
+      "buy_commission_rate": 0.0003,
+      "sell_commission_rate": 0.0003,
+      "stamp_tax_sell_rate": 0.0005,
+      "transfer_fee_buy_rate": 0.00001,
+      "transfer_fee_sell_rate": 0.00001,
+      "buy_slippage_bps": 5.0,
+      "sell_slippage_bps": 5.0,
+      "min_commission_yuan": 5.0
+    }
+  ]
+}

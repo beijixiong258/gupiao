@@ -1,0 +1,160 @@
+"""Offline tests for the two A-share T+3 business workflows."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from src.ashare.bankuai_yuce import (
+    _filter_constituents,
+    goujian_moxing_shuju,
+    xunlian_yuce_moxing,
+)
+from src.ashare.gupiao_yanjiu import (
+    FEATURE_COLUMNS,
+    akshare_zhilian,
+    biaozhunhua_daima,
+    jiazai_lianghua_peizhi,
+    jisuan_tezheng_biao,
+    zongjie_jishu,
+)
+from src.tools import build_registry
+
+
+def _history(seed: int, rows: int = 280) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2024-01-02", periods=rows)
+    returns = rng.normal(0.0005, 0.015, rows)
+    close = 20.0 * np.exp(np.cumsum(returns))
+    open_price = close * (1.0 + rng.normal(0.0, 0.004, rows))
+    high = np.maximum(open_price, close) * (1.0 + rng.uniform(0.001, 0.02, rows))
+    low = np.minimum(open_price, close) * (1.0 - rng.uniform(0.001, 0.02, rows))
+    volume = rng.integers(1_000_000, 8_000_000, rows).astype(float)
+    return pd.DataFrame(
+        {
+            "trade_date": dates,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("600519", "600519.SH"),
+        ("sz000001", "000001.SZ"),
+        ("430047.BJ", "430047.BJ"),
+    ],
+)
+def test_a_share_code_normalization(raw: str, expected: str) -> None:
+    assert biaozhunhua_daima(raw) == expected
+
+
+def test_non_stock_code_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        biaozhunhua_daima("510300.SH")
+
+
+def test_technical_features_use_only_current_and_past_rows() -> None:
+    original = _history(1)
+    baseline = jisuan_tezheng_biao(original)
+    changed = original.copy()
+    changed.loc[changed.index[-1], "close"] *= 10
+    recalculated = jisuan_tezheng_biao(changed)
+
+    pd.testing.assert_series_equal(
+        baseline.loc[baseline.index[-2], FEATURE_COLUMNS],
+        recalculated.loc[recalculated.index[-2], FEATURE_COLUMNS],
+        check_names=False,
+    )
+    summary = zongjie_jishu(original)
+    assert 0 <= summary["score_0_100"] <= 100
+    assert summary["trade_date"] == original["trade_date"].iloc[-1].strftime("%Y-%m-%d")
+
+
+def test_external_config_hard_caps_horizons_at_t3() -> None:
+    config, path = jiazai_lianghua_peizhi()
+    assert path.endswith("lianghua_peizhi.json")
+    assert config["moxing"]["horizons"] == [1, 2, 3]
+    assert config["jiaoyi"]["max_holding_days"] == 3
+    assert config["shuju"]["akshare_bypass_proxy"] is True
+    assert config["jiaoyi"]["execution_mode"] == "research_only"
+    assert config["jiaoyi"]["allow_live_trading"] is False
+    assert config["jiaoyi"]["allow_order_submission"] is False
+
+
+def test_config_cannot_enable_order_submission(tmp_path: Path) -> None:
+    config, _ = jiazai_lianghua_peizhi()
+    config["jiaoyi"]["allow_order_submission"] = True
+    config_path = tmp_path / "unsafe.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="禁止实盘交易和订单提交"):
+        jiazai_lianghua_peizhi(str(config_path))
+
+
+def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    with akshare_zhilian():
+        assert "HTTP_PROXY" not in os.environ
+        assert "HTTPS_PROXY" not in os.environ
+    assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:7890"
+    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+
+
+def test_agent_exposes_research_tools_only() -> None:
+    assert build_registry().tool_names == ["gupiao_fenxi", "bankuai_xuangu"]
+
+
+def test_filter_removes_st_illiquid_and_limit_up_rows() -> None:
+    config, _ = jiazai_lianghua_peizhi()
+    frame = pd.DataFrame(
+        [
+            {"ts_code": "600001.SH", "name": "正常股份", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
+            {"ts_code": "600002.SH", "name": "ST测试", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
+            {"ts_code": "600003.SH", "name": "低流动", "latest_price": 10, "amount_yuan": 1_000_000, "pct_chg": 1},
+            {"ts_code": "600004.SH", "name": "涨停股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 10},
+        ]
+    )
+    accepted, rejected = _filter_constituents(frame, config)
+    assert accepted["ts_code"].tolist() == ["600001.SH"]
+    assert len(rejected) == 3
+
+
+def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:
+    codes = ["600001.SH", "600002.SH", "600003.SH", "600004.SH", "600005.SH"]
+    histories = {code: _history(index + 10) for index, code in enumerate(codes)}
+    names = {code: f"样本{index}" for index, code in enumerate(codes)}
+    config, _ = jiazai_lianghua_peizhi()
+    panel = goujian_moxing_shuju(histories, names, [1, 2, 3])
+    latest = (
+        panel.sort_values("trade_date")
+        .groupby("ts_code", as_index=False)
+        .tail(1)
+        .dropna(subset=FEATURE_COLUMNS)
+        .reset_index(drop=True)
+    )
+
+    predictions, validation = xunlian_yuce_moxing(panel, latest, config)
+
+    assert {"pred_t1", "pred_t2", "pred_t3"}.issubset(predictions.columns)
+    assert "pred_t5" not in predictions.columns
+    assert set(validation["horizons"]) == {"T+1", "T+2", "T+3"}
+    cutoff = pd.Timestamp(validation["cutoff_date"])
+    for horizon in [1, 2, 3]:
+        target_date = pd.to_datetime(panel[f"target_date_t{horizon}"])
+        train_mask = (pd.to_datetime(panel["trade_date"]) < cutoff) & (target_date < cutoff)
+        assert not (target_date[train_mask] >= cutoff).any()
+        metrics = validation["horizons"][f"T+{horizon}"]
+        assert metrics["train_samples"] >= config["moxing"]["min_training_samples"]
+        assert metrics["validation_samples"] >= config["moxing"]["min_validation_samples"]
