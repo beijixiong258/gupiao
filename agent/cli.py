@@ -8,10 +8,12 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 
 console = Console()
 AGENT_DIR = Path(__file__).resolve().parent
@@ -29,7 +31,10 @@ def _console_safe(value: object) -> str:
     return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
 
-def _build_agent(max_iter: int = 50):
+def _build_agent(
+    max_iter: int = 50,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+):
     from src.agent.loop import AgentLoop
     from src.memory.persistent import PersistentMemory
     from src.providers.chat import ChatLLM
@@ -39,6 +44,7 @@ def _build_agent(max_iter: int = 50):
     return AgentLoop(
         registry=build_registry(persistent_memory=pm, include_shell_tools=False),
         llm=ChatLLM(),
+        event_callback=event_callback,
         max_iterations=max_iter,
         persistent_memory=pm,
     )
@@ -85,23 +91,115 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
     return EXIT_SUCCESS if status == "success" else EXIT_RUN_FAILED
 
 
-def cmd_chat(max_iter: int) -> int:
+def _dayin_duihua_bangzhu() -> None:
+    console.print(
+        Panel(
+            "直接输入自然语言即可连续追问。\n"
+            "/new      新建空白会话\n"
+            "/clear    清空当前会话\n"
+            "/sessions 查看最近会话\n"
+            "/resume ID 切换到指定会话\n"
+            "/history  查看当前会话最近内容\n"
+            "/help     查看命令\n"
+            "/exit     退出并保留会话",
+            title="会话命令",
+        )
+    )
+
+
+def _dayin_huihua_liebiao(cunchu: Any, dangqian_id: str) -> None:
+    sessions = cunchu.liechu(10)
+    if not sessions:
+        console.print("[dim]还没有已保存的会话[/dim]")
+        return
+    table = Table(title="最近会话")
+    table.add_column("当前", width=4)
+    table.add_column("会话 ID", no_wrap=True)
+    table.add_column("标题")
+    table.add_column("轮数", justify="right")
+    table.add_column("更新时间", no_wrap=True)
+    for session in sessions:
+        table.add_row(
+            "*" if session.huihua_id == dangqian_id else "",
+            session.huihua_id,
+            session.biaoti,
+            str(session.lunshu),
+            session.gengxin_shijian.replace("T", " ")[:19],
+        )
+    console.print(table)
+
+
+def _dayin_dangqian_lishi(huihua: Any) -> None:
+    visible: list[tuple[str, str]] = []
+    for message in huihua.xiaoxi:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str) or not content.strip():
+            continue
+        visible.append(("你" if role == "user" else "研究员", content.strip()))
+    if not visible:
+        console.print("[dim]当前会话还没有内容[/dim]")
+        return
+    console.print(f"[dim]当前会话最近 {min(len(visible), 12)} 条消息：[/dim]")
+    for role, content in visible[-12:]:
+        preview = content if len(content) <= 500 else f"{content[:500]}..."
+        console.print(f"[bold]{role} >[/bold] {_console_safe(preview)}")
+
+
+def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
+    tool_text = {
+        "gupiao_fenxi": "正在拉取单股行情、财务与技术数据...",
+        "bankuai_xuangu": "正在拉取板块成分并训练 T+3 模型...",
+    }
+
+    def callback(event_type: str, data: dict[str, Any]) -> None:
+        status = status_ref.get("value")
+        if status is None:
+            return
+        if event_type == "tool_call":
+            message = tool_text.get(str(data.get("tool")), "正在调用研究工具...")
+        elif event_type == "tool_result":
+            message = "数据计算完成，正在整理研判..."
+        elif event_type == "text_delta":
+            message = "正在组织回答..."
+        else:
+            return
+        status.update(f"[cyan]{message}[/cyan]")
+
+    return callback
+
+
+def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool = False) -> int:
     from src.preflight import run_preflight
+    from src.duihua.huihua import DuihuaCunchu, HuihuaCuoWu, zhengli_xiaoxi
 
     results = run_preflight(console)
     if any(result.critical and result.status != "ready" for result in results):
         return EXIT_RUN_FAILED
 
-    agent = _build_agent(max_iter=max_iter)
-    history: list[dict] = []
+    cunchu = DuihuaCunchu()
+    try:
+        if new_session:
+            huihua = cunchu.xinjian()
+        elif session_id:
+            huihua = cunchu.duqu(session_id)
+        else:
+            huihua = cunchu.zuijin() or cunchu.xinjian()
+    except HuihuaCuoWu as exc:
+        console.print(Panel(_console_safe(exc), title="会话载入失败", style="red"))
+        return EXIT_USAGE_ERROR
+
+    history: list[dict[str, Any]] = zhengli_xiaoxi(huihua.xiaoxi)
+    status_ref: dict[str, Any] = {"value": None}
+    agent = _build_agent(max_iter=max_iter, event_callback=_chuangjian_jindu_huidiao(status_ref))
+    mode = f"已续接 {huihua.lunshu} 轮" if huihua.lunshu else "新会话"
 
     console.print(
         Panel(
-            "进入 CLI 对话模式。可询问一只 A 股，或指定板块进行选股和 T+3 预测。\n"
-            "退出：exit / quit / q / 退出\n"
-            "示例：分析 600519.SH 的基本面和技术面\n"
-            "示例：从白酒板块选 3 只股票并预测未来 3 个交易日",
-            title="A股 T+3 量化研究员",
+            f"{mode}\n会话：{huihua.huihua_id}\n"
+            "可直接连续追问；输入 /help 查看会话命令。\n"
+            "示例：分析贵州茅台，然后追问：它未来三天怎么看？",
+            title="A股 T+3 量化研究员 | 连续对话",
         )
     )
 
@@ -114,31 +212,91 @@ def cmd_chat(max_iter: int) -> int:
 
         if not prompt:
             continue
-        if prompt.lower() in {"exit", "quit", "q", "退出"}:
-            console.print("[dim]已退出[/dim]")
+        command = prompt.lower()
+        if command in {"exit", "quit", "q", "退出", "/exit", "/quit", "/q"}:
+            if huihua.lunshu:
+                console.print(f"[dim]会话已保存：{huihua.huihua_id}[/dim]")
+            else:
+                console.print("[dim]已退出；空会话未保存[/dim]")
             return EXIT_SUCCESS
+        if command in {"/help", "帮助"}:
+            _dayin_duihua_bangzhu()
+            continue
+        if command in {"/new", "新对话"}:
+            huihua = cunchu.xinjian()
+            history = []
+            console.print(f"[green]已新建会话：{huihua.huihua_id}[/green]")
+            continue
+        if command in {"/clear", "清空"}:
+            huihua.qingkong()
+            history = []
+            cunchu.baocun(huihua)
+            console.print("[green]当前会话已清空[/green]")
+            continue
+        if command in {"/sessions", "会话列表"}:
+            _dayin_huihua_liebiao(cunchu, huihua.huihua_id)
+            continue
+        if command in {"/history", "历史"}:
+            _dayin_dangqian_lishi(huihua)
+            continue
+        if command.startswith("/resume"):
+            parts = prompt.split(maxsplit=1)
+            if len(parts) != 2:
+                console.print("[yellow]用法：/resume 会话ID[/yellow]")
+                continue
+            try:
+                huihua = cunchu.duqu(parts[1])
+            except HuihuaCuoWu as exc:
+                console.print(f"[red]{_console_safe(exc)}[/red]")
+                continue
+            history = zhengli_xiaoxi(huihua.xiaoxi)
+            console.print(f"[green]已切换：{huihua.biaoti}（{huihua.lunshu} 轮）[/green]")
+            continue
+        if prompt.startswith("/"):
+            console.print("[yellow]未知会话命令。输入 /help 查看可用命令。[/yellow]")
+            continue
 
         started = time.perf_counter()
         try:
-            result = agent.run(user_message=prompt, history=history)
+            with console.status("[cyan]正在理解你的问题...[/cyan]", spinner="dots") as running:
+                status_ref["value"] = running
+                result = agent.run(user_message=prompt, history=history, session_id=huihua.huihua_id)
         except KeyboardInterrupt:
-            console.print("\n[yellow]本轮已中断[/yellow]")
+            console.print("\n[yellow]本轮已中断，会话保留在上一轮[/yellow]")
             continue
         except Exception as exc:
-            console.print(Panel(_console_safe(exc), title="Error", style="red"))
+            console.print(Panel(_console_safe(exc), title="本轮失败", style="red"))
             continue
+        finally:
+            status_ref["value"] = None
 
         elapsed = time.perf_counter() - started
         status = result.get("status", "unknown")
         run_id = result.get("run_id", "")
         content = str(result.get("content") or result.get("reason") or "")
 
-        if content:
-            console.print(Panel(_console_safe(content), title=f"研究员 | {status} | {elapsed:.1f}s | {run_id}"))
-            history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": content})
+        if status == "success" and content:
+            returned_history = result.get("history")
+            if isinstance(returned_history, list):
+                history = zhengli_xiaoxi(returned_history)
+            else:
+                history.extend([
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": content},
+                ])
+            huihua.xiaoxi = history
+            huihua.lunshu += 1
+            huihua.shezhi_shouci_biaoti(prompt)
+            try:
+                cunchu.baocun(huihua)
+            except OSError as exc:
+                console.print(f"[yellow]会话暂未写入磁盘：{_console_safe(exc)}[/yellow]")
+            console.print("\n[bold green]研究员 >[/bold green]")
+            console.print(Markdown(_console_safe(content)))
+            console.print(f"[dim]{elapsed:.1f}s | {run_id} | 会话已保存[/dim]")
         else:
-            console.print(Panel(f"Status: {status}\nRun: {run_id}", title="研究员"))
+            reason = content or "本轮没有生成有效回答"
+            console.print(Panel(_console_safe(reason), title=f"本轮未完成 | {status} | {elapsed:.1f}s", style="red"))
 
 
 def cmd_list(limit: int = 20) -> int:
@@ -246,39 +404,42 @@ def cmd_bankuai(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="A-share quant research assistant")
+    parser = argparse.ArgumentParser(description="A 股 T+3 量化研究员")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="Run one A-share research request")
-    run.add_argument("prompt", nargs="?", help="Natural-language task prompt")
-    run.add_argument("-p", "--prompt", dest="prompt_opt", help="Natural-language task prompt")
+    run = sub.add_parser("run", help="执行一次自然语言研究")
+    run.add_argument("prompt", nargs="?", help="自然语言问题")
+    run.add_argument("-p", "--prompt", dest="prompt_opt", help="自然语言问题")
     run.add_argument("--max-iter", type=int, default=50)
     run.add_argument("--json", action="store_true")
 
-    chat = sub.add_parser("chat", help="Start interactive terminal chat")
+    chat = sub.add_parser("chat", help="进入可续接的终端连续对话")
     chat.add_argument("--max-iter", type=int, default=50)
+    chat_session = chat.add_mutually_exclusive_group()
+    chat_session.add_argument("--new", dest="new_session", action="store_true", help="新建空白会话")
+    chat_session.add_argument("--session", help="按会话 ID 续接历史会话")
 
-    list_cmd = sub.add_parser("list", help="List recent runs")
+    list_cmd = sub.add_parser("list", help="列出最近运行记录")
     list_cmd.add_argument("--limit", type=int, default=20)
 
-    gupiao = sub.add_parser("gupiao", help="Analyze one A-share by code or Chinese name")
-    gupiao.add_argument("gupiao", help="For example 600519.SH or 贵州茅台")
+    gupiao = sub.add_parser("gupiao", help="按代码或名称直接分析一只 A 股")
+    gupiao.add_argument("gupiao", help="例如 600519.SH 或贵州茅台")
     gupiao.add_argument("--source", choices=["auto", "tushare", "akshare"], default="auto")
     gupiao.add_argument("--history-calendar-days", type=int, default=540)
     gupiao.add_argument("--json", action="store_true")
 
-    bankuai = sub.add_parser("bankuai", help="Select stocks from one board and predict T+1/T+2/T+3")
-    bankuai.add_argument("bankuai", help="Chinese industry or concept board name")
+    bankuai = sub.add_parser("bankuai", help="从指定板块选股并预测 T+1/T+2/T+3")
+    bankuai.add_argument("bankuai", help="中国大陆行业或概念板块名称")
     bankuai.add_argument("--type", dest="bankuai_leixing", choices=["auto", "hangye", "gainian"], default="auto")
     bankuai.add_argument("--top-n", type=int, default=3)
     bankuai.add_argument("--source", choices=["auto", "tushare", "akshare"], default="auto")
     bankuai.add_argument("--config", dest="config_path", help="Path to lianghua_peizhi.json")
     bankuai.add_argument("--json", action="store_true")
 
-    sub.add_parser("settings", help="Show runtime settings")
-    openai_login = sub.add_parser("openai-login", help="Login with ChatGPT OAuth for the openai_codex provider")
-    openai_login.add_argument("--no-browser", action="store_true", help="Do not open the login page automatically")
-    sub.add_parser("openai-logout", help="Remove the locally stored ChatGPT OAuth grant")
+    sub.add_parser("settings", help="查看当前运行配置")
+    openai_login = sub.add_parser("openai-login", help="使用 ChatGPT OAuth 登录 OpenAI Provider")
+    openai_login.add_argument("--no-browser", action="store_true", help="不自动打开登录网页")
+    sub.add_parser("openai-logout", help="删除本机保存的 ChatGPT OAuth 登录")
 
     args = parser.parse_args(argv)
 
@@ -289,7 +450,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_USAGE_ERROR
         return cmd_run(prompt, args.max_iter, json_mode=args.json)
     if args.command == "chat":
-        return cmd_chat(args.max_iter)
+        return cmd_chat(args.max_iter, session_id=args.session, new_session=args.new_session)
     if args.command == "list":
         return cmd_list(args.limit)
     if args.command == "gupiao":
@@ -310,8 +471,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "openai-logout":
         return cmd_openai_logout()
 
-    parser.print_help()
-    return EXIT_USAGE_ERROR
+    return cmd_chat(50)
 
 
 if __name__ == "__main__":

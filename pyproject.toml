@@ -3,7 +3,7 @@ name = "gupiaoyanjiu"
 version = "0.2.0"
 description = "A股 T+3 量化研究员：单股研究与指定板块短线预测"
 requires-python = ">=3.11"
-readme = "项目设计与实现.md"
+readme = "README.md"
 dependencies = [
     "rich>=13.0.0",
     "langchain-core>=0.1.0",

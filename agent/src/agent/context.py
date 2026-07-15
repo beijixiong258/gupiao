@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import json
 from datetime import datetime
@@ -45,6 +46,8 @@ This is permanently a research-only system. It must never connect to a broker, r
 
 ## Guidelines
 
+- Treat every user message as part of one continuous conversation. Resolve references such as "它", "刚才那只", "第二只", and "换成这个板块" from conversation history.
+- Reuse an earlier tool result when it already answers the follow-up. Call a tool again only when the user asks for fresher data, changes the stock/board, or requests an analysis absent from the previous result.
 - Ask only when the stock or board cannot be identified. Never invent tickers, dates, board names, or trading assumptions.
 - Only discuss mainland China A-shares. Politely reject US/HK stocks, funds, futures, crypto, and forex in this program.
 - Recommendations and forecasts must come directly from tool output. Do not alter numeric predictions.
@@ -98,7 +101,9 @@ class ContextBuilder:
     def build_messages(self, user_message: str, history: Optional[list[dict]] = None) -> list[dict]:
         messages = [{"role": "system", "content": self.build_system_prompt(user_message)}]
         if history:
-            messages.extend(history)
+            for message in history:
+                if isinstance(message, dict) and message.get("role") in {"user", "assistant", "tool"}:
+                    messages.append(copy.deepcopy(message))
         messages.append({"role": "user", "content": user_message})
         return messages
 

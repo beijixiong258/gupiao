@@ -13,6 +13,7 @@ Tool execution:
 
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 import json
 import logging
@@ -44,6 +45,15 @@ COLLAPSE_TAIL = 500
 TAIL_TOKEN_BUDGET = 20_000
 
 logger = logging.getLogger(__name__)
+
+
+def _export_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a detached conversation history without the system message."""
+    return [
+        copy.deepcopy(message)
+        for message in messages
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant", "tool"}
+    ]
 
 
 def estimate_tokens(messages: list) -> int:
@@ -327,12 +337,10 @@ class AgentLoop:
 
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
-
-        if self.memory.run_dir and Path(self.memory.run_dir).exists():
-            run_dir = Path(self.memory.run_dir)
-        else:
-            run_dir = state_store.create_run_dir(RUNS_DIR)
-            self.memory.run_dir = str(run_dir)
+        self.memory.run_dir = None
+        self.memory.counters.clear()
+        run_dir = state_store.create_run_dir(RUNS_DIR)
+        self.memory.run_dir = str(run_dir)
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
 
@@ -392,6 +400,7 @@ class AgentLoop:
 
                 if not response.has_tool_calls:
                     final_content = response.content or ""
+                    messages.append({"role": "assistant", "content": final_content})
                     trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
@@ -427,6 +436,7 @@ class AgentLoop:
                 "run_id": run_dir.name,
                 "content": "",
                 "react_trace": react_trace,
+                "history": _export_history(messages),
             }
 
         # Determine final status
@@ -449,6 +459,7 @@ class AgentLoop:
             "run_id": run_dir.name,
             "content": final_content,
             "react_trace": react_trace,
+            "history": _export_history(messages),
         }
 
     # -- Tool execution with read/write batching --------------------------------
