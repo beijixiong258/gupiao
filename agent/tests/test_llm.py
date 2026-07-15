@@ -72,7 +72,7 @@ def test_unsupported_provider_is_rejected() -> None:
     with pytest.raises(RuntimeError, match="deepseek, openai, or openai_codex"):
         _settings(
             {
-                "LANGCHAIN_PROVIDER": "groq",
+                "LANGCHAIN_PROVIDER": "unsupported",
                 "LANGCHAIN_MODEL_NAME": "anything",
             }
         )
