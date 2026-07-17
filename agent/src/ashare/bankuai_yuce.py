@@ -7,6 +7,7 @@ import math
 import time
 from collections import Counter
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -19,11 +20,14 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 
+from src.ashare.chengben_huadian import CostScenario
 from src.ashare.chengben_huadian import DEFAULT_CONFIG_PATH as COST_CONFIG_PATH
 from src.ashare.chengben_huadian import _commission_rate, _load_cost_config
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
+    _completed_market_history,
     _json_value,
+    _market_data_freshness,
     _round_optional,
     akshare_zhilian,
     biaozhunhua_daima,
@@ -62,14 +66,26 @@ def _candidate_board_names(ak: Any, query: str, kinds: list[str]) -> tuple[list[
                     similarity = 0.88
                 else:
                     similarity = SequenceMatcher(None, query, value).ratio()
-                if similarity >= 0.55:
+                if similarity >= 0.72:
                     candidates.append((similarity, kind, value))
         except Exception as exc:
             errors.append(f"{kind}板块列表失败：{exc}")
 
     candidates.sort(key=lambda item: (item[0], item[1] == "hangye"), reverse=True)
     if not candidates:
-        candidates = [(0.5, kind, query) for kind in kinds]
+        errors.append(f"没有找到与“{query}”足够相似的板块（最低相似度0.72）")
+        return [], errors
+    top_score, _, top_name = candidates[0]
+    close_names = list(
+        dict.fromkeys(
+            name
+            for score, _, name in candidates[1:]
+            if name != top_name and top_score < 1.0 and top_score - score < 0.03
+        )
+    )
+    if close_names:
+        errors.append(f"板块名称“{query}”存在歧义，候选：{top_name}、{'、'.join(close_names[:4])}")
+        return [], errors
     return candidates, errors
 
 
@@ -118,8 +134,18 @@ def _best_name(query: str, values: list[str]) -> tuple[str, float] | None:
         candidates.append((similarity, value))
     if not candidates:
         return None
-    similarity, value = max(candidates, key=lambda item: item[0])
-    return (value, float(similarity)) if similarity >= 0.55 else None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    similarity, value = candidates[0]
+    if similarity < 0.72:
+        return None
+    ambiguous = [
+        candidate
+        for score, candidate in candidates[1:]
+        if candidate != value and similarity < 1.0 and similarity - score < 0.03
+    ]
+    if ambiguous:
+        raise ValueError(f"名称“{query}”存在歧义，候选：{value}、{'、'.join(ambiguous[:4])}")
+    return value, float(similarity)
 
 
 def _tushare_industry_constituents(query: str) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -136,6 +162,7 @@ def _tushare_industry_constituents(query: str) -> tuple[pd.DataFrame, dict[str, 
     if members.empty:
         raise RuntimeError("Tushare 行业成分为空")
 
+    warnings: list[str] = []
     try:
         _, daily = _latest_tushare_daily(pro, None)
         daily = daily.rename(
@@ -154,15 +181,15 @@ def _tushare_industry_constituents(query: str) -> tuple[pd.DataFrame, dict[str, 
             if column in daily.columns
         ]
         members = members.merge(daily[columns].drop_duplicates("ts_code"), on="ts_code", how="left")
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.append(f"Tushare 最新交易日快照失败，价格和成交额过滤可能无法使用：{exc}")
     return _normalize_constituents(members), {
         "requested_name": query,
         "resolved_name": industry,
         "board_type": "hangye",
         "name_similarity": round(similarity, 4),
         "constituent_source": "tushare_stock_basic",
-        "warnings": [],
+        "warnings": warnings,
     }
 
 
@@ -187,7 +214,19 @@ def _sina_constituents(ak: Any, query: str, kinds: list[str]) -> tuple[pd.DataFr
                     candidates.append((similarity, kind, name, str(row["label"])))
         except Exception as exc:
             errors.append(f"新浪{indicator}列表失败：{exc}")
-    for similarity, kind, name, label in sorted(candidates, reverse=True):
+    ordered_candidates = sorted(candidates, reverse=True)
+    if ordered_candidates:
+        top_score, _, top_name, _ = ordered_candidates[0]
+        close_names = list(
+            dict.fromkeys(
+                name
+                for score, _, name, _ in ordered_candidates[1:]
+                if name != top_name and top_score < 1.0 and top_score - score < 0.03
+            )
+        )
+        if close_names:
+            raise RuntimeError(f"板块名称“{query}”存在歧义，候选：{top_name}、{'、'.join(close_names[:4])}")
+    for similarity, kind, name, label in ordered_candidates:
         try:
             raw = ak.stock_sector_detail(sector=label)
             data = _normalize_constituents(raw)
@@ -288,11 +327,15 @@ def _filter_constituents(frame: pd.DataFrame, config: dict[str, Any]) -> tuple[p
         pct_chg = _round_optional(row.get("pct_chg"))
         if _exclude_name(name, keywords):
             reason = "名称包含新股、ST 或退市风险标记"
-        elif price is not None and price < float(settings.get("min_price", 2.0)):
+        elif price is None:
+            reason = "缺少最新价格，无法应用价格过滤"
+        elif price < float(settings.get("min_price", 2.0)):
             reason = "价格低于配置下限"
-        elif price is not None and price > float(settings.get("max_price", 300.0)):
+        elif price > float(settings.get("max_price", 300.0)):
             reason = "价格高于配置上限"
-        elif amount is not None and amount < float(settings.get("min_amount_yuan", 50_000_000)):
+        elif amount is None:
+            reason = "缺少最新成交额，无法应用流动性过滤"
+        elif amount < float(settings.get("min_amount_yuan", 50_000_000)):
             reason = "最新成交额低于流动性下限"
         elif bool(settings.get("exclude_latest_limit_up", True)) and pct_chg is not None:
             limit_pct = _limit_rate(code, name) * 100.0
@@ -326,7 +369,6 @@ def _fetch_histories(
     names: dict[str, str] = {}
     errors: list[str] = []
     warnings: list[str] = []
-    active_source = source
     for _, row in constituents.head(max_stocks).iterrows():
         code = str(row["ts_code"])
         name = str(row.get("name", ""))
@@ -334,23 +376,33 @@ def _fetch_histories(
             code,
             start_date=start.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"),
-            source=active_source,
+            source=source,
         )
-        if result.data.empty:
+        if source == "auto" and result.adjustment == "raw_unadjusted":
+            fallback = huoqu_rili_xingqing(
+                code,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                source="akshare",
+            )
+            if not fallback.data.empty and fallback.adjustment != "raw_unadjusted":
+                warnings.append(f"{code}: Tushare 复权不可用，已对该股票单独改用 AKShare 前复权日线")
+                result = fallback
+        completed_data, completion_warnings = _completed_market_history(result.data)
+        warnings.extend(f"{code}: {item}" for item in completion_warnings)
+        if completed_data.empty:
             errors.append(f"{code} {name}: " + "；".join(result.errors))
-        elif len(result.data) < minimum_rows:
-            errors.append(f"{code} {name}: 有效日线只有 {len(result.data)} 行，少于 {minimum_rows}")
+        elif result.adjustment == "raw_unadjusted":
+            errors.append(f"{code} {name}: 板块模型拒绝混入未复权日线")
+        elif len(completed_data) < minimum_rows:
+            errors.append(f"{code} {name}: 已完成的有效日线只有 {len(completed_data)} 行，少于 {minimum_rows}")
         else:
-            data = result.data.copy()
+            data = completed_data.copy()
             data["data_source"] = result.source
             data["adjustment"] = result.adjustment
             histories[code] = data
             names[code] = name
             warnings.extend(f"{code}: {item}" for item in result.warnings)
-            if source == "auto" and result.source == "akshare" and any(
-                "adj_factor" in item for item in result.warnings
-            ):
-                active_source = "akshare"
         if pause_seconds > 0:
             time.sleep(pause_seconds)
     return histories, names, errors, warnings
@@ -361,15 +413,73 @@ def goujian_moxing_shuju(
     names: dict[str, str],
     horizons: list[int],
 ) -> pd.DataFrame:
-    """Build pooled panel samples and future-return labels without future features."""
+    """Build executable labels on a shared market-date calendar.
+
+    A signal is produced after the close of date T.  The assumed entry is the
+    next market session's open.  ``T+1`` therefore means the first *sellable*
+    close after that entry (the second market session after the signal), with
+    ``T+2`` and ``T+3`` following on subsequent market sessions.  A suspended
+    stock has no label when it lacks a quote on the required common-market
+    entry or exit date; its next observed bar is never silently treated as the
+    next market session.
+    """
+    market_dates = sorted(
+        {
+            pd.Timestamp(value).normalize()
+            for history in histories.values()
+            if "trade_date" in history.columns
+            for value in pd.to_datetime(history["trade_date"], errors="coerce").dropna()
+        }
+    )
+    market_position = {value: index for index, value in enumerate(market_dates)}
     frames: list[pd.DataFrame] = []
     for code, history in histories.items():
         features = jisuan_tezheng_biao(history)
+        features["trade_date"] = pd.to_datetime(features["trade_date"], errors="coerce").dt.normalize()
+        prices = (
+            features[["trade_date", "open", "high", "low", "close"]]
+            .dropna(subset=["trade_date"])
+            .drop_duplicates("trade_date", keep="last")
+            .set_index("trade_date")
+        )
         features["ts_code"] = code
         features["name"] = names.get(code, "")
         for horizon in horizons:
-            features[f"target_t{horizon}"] = features["close"].shift(-horizon) / features["close"] - 1.0
-            features[f"target_date_t{horizon}"] = features["trade_date"].shift(-horizon)
+            entry_dates: list[Any] = []
+            exit_dates: list[Any] = []
+            for signal_date in features["trade_date"]:
+                position = market_position.get(pd.Timestamp(signal_date)) if pd.notna(signal_date) else None
+                entry_index = position + 1 if position is not None else len(market_dates)
+                exit_index = entry_index + int(horizon)
+                entry_dates.append(market_dates[entry_index] if entry_index < len(market_dates) else pd.NaT)
+                exit_dates.append(market_dates[exit_index] if exit_index < len(market_dates) else pd.NaT)
+
+            entry_series = pd.Series(entry_dates, index=features.index, dtype="datetime64[ns]")
+            exit_series = pd.Series(exit_dates, index=features.index, dtype="datetime64[ns]")
+            entry_open = entry_series.map(pd.to_numeric(prices["open"], errors="coerce"))
+            entry_high = entry_series.map(pd.to_numeric(prices["high"], errors="coerce"))
+            entry_low = entry_series.map(pd.to_numeric(prices["low"], errors="coerce"))
+            limit_rate = _limit_rate(code, names.get(code, ""))
+            entry_limit_up = pd.to_numeric(features["close"], errors="coerce").map(
+                lambda value: _round_price_tick(float(value) * (1.0 + limit_rate))
+                if pd.notna(value)
+                else np.nan
+            )
+            blocked_limit_up = (
+                entry_low.notna()
+                & entry_high.notna()
+                & entry_limit_up.notna()
+                & (entry_low >= entry_limit_up - 0.005)
+                & (entry_high <= entry_limit_up + 0.005)
+            )
+            entry_open = entry_open.mask(blocked_limit_up)
+            exit_close = exit_series.map(pd.to_numeric(prices["close"], errors="coerce"))
+            features[f"entry_date_t{horizon}"] = entry_series
+            features[f"entry_open_t{horizon}"] = entry_open
+            features[f"entry_blocked_limit_up_t{horizon}"] = blocked_limit_up
+            features[f"target_date_t{horizon}"] = exit_series
+            features[f"target_close_t{horizon}"] = exit_close
+            features[f"target_t{horizon}"] = exit_close / entry_open - 1.0
         frames.append(features)
     if not frames:
         return pd.DataFrame()
@@ -415,12 +525,160 @@ def _quality_label(value: float) -> str:
     return "low"
 
 
+def _build_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    learning_rate=float(model_config.get("learning_rate", 0.05)),
+                    max_iter=int(model_config.get("max_iter", 180)),
+                    max_leaf_nodes=int(model_config.get("max_leaf_nodes", 15)),
+                    max_depth=int(model_config.get("max_depth", 4)),
+                    min_samples_leaf=int(model_config.get("min_samples_leaf", 30)),
+                    l2_regularization=float(model_config.get("l2_regularization", 1.0)),
+                    random_state=int(model_config.get("random_state", 42)),
+                ),
+            ),
+        ]
+    )
+
+
+def _load_cost_assumption(scenario_name: str) -> tuple[float, CostScenario, str, list[str]]:
+    budget, scenarios, path, errors = _load_cost_config(str(COST_CONFIG_PATH))
+    scenario = next((item for item in scenarios if item.name == scenario_name), None)
+    if scenario is None:
+        raise ValueError(f"交易成本配置中不存在场景：{scenario_name}")
+    return float(budget), scenario, path, errors
+
+
+def _buy_order_rule(ts_code: str) -> tuple[int, int, str]:
+    """Return minimum shares, share increment and board label for a buy order."""
+    normalized = str(ts_code).upper()
+    digits = normalized.split(".")[0]
+    if normalized.endswith(".BJ"):
+        return 100, 1, "beijing"
+    if digits.startswith(("688", "689")):
+        return 200, 1, "star"
+    return 100, 100, "main_or_chinext"
+
+
+def _position_for_budget(ts_code: str, price: float, budget_yuan: float) -> dict[str, Any]:
+    minimum, increment, board = _buy_order_rule(ts_code)
+    valid = math.isfinite(float(price)) and float(price) > 0 and float(budget_yuan) > 0
+    affordable = int(math.floor(float(budget_yuan) / float(price) + 1e-9)) if valid else 0
+    if affordable < minimum:
+        shares = 0
+    elif increment == 1:
+        shares = affordable
+    else:
+        shares = affordable // increment * increment
+    actual_notional = float(shares) * float(price) if shares else 0.0
+    return {
+        "board": board,
+        "minimum_buy_shares": int(minimum),
+        "buy_share_increment": int(increment),
+        "target_budget_yuan": round(float(budget_yuan), 2),
+        "sizing_price": round(float(price), 3) if valid else None,
+        "estimated_buy_shares": int(shares),
+        "estimated_buy_notional_yuan": round(actual_notional, 2),
+        "budget_utilization": round(actual_notional / float(budget_yuan), 6) if budget_yuan > 0 else None,
+        "execution_feasible": bool(shares >= minimum),
+    }
+
+
+def _stock_roundtrip_cost(
+    ts_code: str,
+    price: float,
+    budget_yuan: float,
+    scenario: CostScenario,
+) -> tuple[float | None, dict[str, Any]]:
+    position = _position_for_budget(ts_code, price, budget_yuan)
+    notional = float(position["estimated_buy_notional_yuan"])
+    if not position["execution_feasible"] or notional <= 0:
+        return None, {
+            **position,
+            "cost_scenario": scenario.name,
+            "estimated_roundtrip_cost_rate": None,
+            "reason": "目标资金不足以按所属板块的最低买入数量建仓",
+        }
+    buy_commission = _commission_rate(scenario.buy_commission_rate, scenario.min_commission_yuan, notional)
+    sell_commission = _commission_rate(scenario.sell_commission_rate, scenario.min_commission_yuan, notional)
+    buy_cost = buy_commission + scenario.transfer_fee_buy_rate + scenario.buy_slippage_bps / 10000.0
+    sell_cost = (
+        sell_commission
+        + scenario.transfer_fee_sell_rate
+        + scenario.stamp_tax_sell_rate
+        + scenario.sell_slippage_bps / 10000.0
+    )
+    roundtrip = 1.0 - (1.0 - buy_cost) * (1.0 - sell_cost)
+    return float(roundtrip), {
+        **position,
+        "cost_scenario": scenario.name,
+        "estimated_roundtrip_cost_rate": round(float(roundtrip), 6),
+        "stamp_tax_sell_rate": scenario.stamp_tax_sell_rate,
+    }
+
+
+def _top_n_validation_metrics(
+    validation_frame: pd.DataFrame,
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    horizon: int,
+    budget_yuan: float,
+    scenario: CostScenario,
+    top_n: int,
+) -> dict[str, Any]:
+    evaluation = validation_frame[["trade_date", "ts_code", f"entry_open_t{horizon}"]].copy()
+    evaluation["actual"] = actual
+    evaluation["predicted"] = predicted
+    net_actual: list[float] = []
+    net_predicted: list[float] = []
+    for _, row in evaluation.iterrows():
+        cost_rate, _ = _stock_roundtrip_cost(
+            str(row["ts_code"]),
+            float(row[f"entry_open_t{horizon}"]),
+            budget_yuan,
+            scenario,
+        )
+        if cost_rate is None:
+            net_actual.append(np.nan)
+            net_predicted.append(np.nan)
+        else:
+            net_actual.append(_apply_cost(float(row["actual"]), cost_rate))
+            net_predicted.append(_apply_cost(float(row["predicted"]), cost_rate))
+    evaluation["net_actual"] = net_actual
+    evaluation["net_predicted"] = net_predicted
+    evaluation = evaluation.dropna(subset=["net_actual", "net_predicted"])
+
+    selected_returns: list[float] = []
+    excess_returns: list[float] = []
+    for _, group in evaluation.groupby("trade_date"):
+        if len(group) < 2:
+            continue
+        selected = group.nlargest(min(int(top_n), len(group)), "net_predicted")
+        selected_return = float(selected["net_actual"].mean())
+        selected_returns.append(selected_return)
+        excess_returns.append(selected_return - float(group["net_actual"].mean()))
+    return {
+        "top_n": int(top_n),
+        "top_n_days": int(len(selected_returns)),
+        "top_n_mean_net_return": round(float(np.mean(selected_returns)), 6) if selected_returns else 0.0,
+        "top_n_positive_day_rate": round(float(np.mean(np.asarray(selected_returns) > 0)), 6)
+        if selected_returns
+        else 0.0,
+        "top_n_mean_excess_vs_universe": round(float(np.mean(excess_returns)), 6) if excess_returns else 0.0,
+    }
+
+
 def xunlian_yuce_moxing(
     panel: pd.DataFrame,
     latest: pd.DataFrame,
     config: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Train one purged chronological model per horizon and predict latest rows."""
+    """Validate chronologically, then refit each accepted candidate model on all labels."""
     model_config = config["moxing"]
     horizons = [int(value) for value in model_config["horizons"]]
     dates = sorted(pd.to_datetime(panel["trade_date"].dropna().unique()))
@@ -433,6 +691,13 @@ def xunlian_yuce_moxing(
     validation: dict[str, Any] = {
         "split_method": "chronological_purged_holdout",
         "cutoff_date": cutoff.strftime("%Y-%m-%d"),
+        "signal_and_execution": {
+            "signal": "T日收盘后",
+            "entry": "下一市场交易日（T+1）开盘",
+            "T+1": "入场后第1个可卖出交易日收盘，即信号后的第2个市场交易日",
+            "T+2": "入场后第2个可卖出交易日收盘",
+            "T+3": "入场后第3个可卖出交易日收盘",
+        },
         "feature_count": len(FEATURE_COLUMNS),
         "features": list(FEATURE_COLUMNS),
         "horizons": {},
@@ -442,13 +707,21 @@ def xunlian_yuce_moxing(
     minimum_validation = int(model_config.get("min_validation_samples", 100))
     quantiles = model_config.get("prediction_clip_quantiles", [0.01, 0.99])
     lower_q, upper_q = float(quantiles[0]), float(quantiles[1])
+    cost_scenario_name = str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
+    budget_yuan, cost_scenario, _, _ = _load_cost_assumption(cost_scenario_name)
+    validation_top_n = max(1, int(model_config.get("validation_top_n", 3)))
 
     for horizon in horizons:
         target_column = f"target_t{horizon}"
         target_date_column = f"target_date_t{horizon}"
-        usable = panel.dropna(subset=[target_column, target_date_column]).copy()
+        entry_date_column = f"entry_date_t{horizon}"
+        entry_open_column = f"entry_open_t{horizon}"
+        usable = panel.dropna(
+            subset=[target_column, target_date_column, entry_date_column, entry_open_column]
+        ).copy()
         usable["trade_date"] = pd.to_datetime(usable["trade_date"])
         usable[target_date_column] = pd.to_datetime(usable[target_date_column])
+        usable[entry_date_column] = pd.to_datetime(usable[entry_date_column])
         train = usable[(usable["trade_date"] < cutoff) & (usable[target_date_column] < cutoff)]
         validation_frame = usable[usable["trade_date"] >= cutoff]
         if len(train) < minimum_train or len(validation_frame) < minimum_validation:
@@ -462,23 +735,7 @@ def xunlian_yuce_moxing(
         clip_high = float(np.nanquantile(y_train_raw, upper_q))
         y_train = np.clip(y_train_raw, clip_low, clip_high)
         y_validation = validation_frame[target_column].astype(float).to_numpy()
-        pipeline = Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="median")),
-                (
-                    "model",
-                    HistGradientBoostingRegressor(
-                        learning_rate=float(model_config.get("learning_rate", 0.05)),
-                        max_iter=int(model_config.get("max_iter", 180)),
-                        max_leaf_nodes=int(model_config.get("max_leaf_nodes", 15)),
-                        max_depth=int(model_config.get("max_depth", 4)),
-                        min_samples_leaf=int(model_config.get("min_samples_leaf", 30)),
-                        l2_regularization=float(model_config.get("l2_regularization", 1.0)),
-                        random_state=int(model_config.get("random_state", 42)),
-                    ),
-                ),
-            ]
-        )
+        pipeline = _build_model_pipeline(model_config)
         pipeline.fit(train[FEATURE_COLUMNS], y_train)
         validation_prediction = np.clip(
             pipeline.predict(validation_frame[FEATURE_COLUMNS]),
@@ -501,8 +758,43 @@ def xunlian_yuce_moxing(
             rank_ic=rank_ic,
             skill_vs_baseline=skill,
         )
+        top_n_metrics = _top_n_validation_metrics(
+            validation_frame,
+            y_validation,
+            validation_prediction,
+            horizon=horizon,
+            budget_yuan=budget_yuan,
+            scenario=cost_scenario,
+            top_n=validation_top_n,
+        )
+        minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
+        minimum_skill = float(model_config.get("min_skill_vs_baseline", 0.01))
+        minimum_direction = float(model_config.get("min_direction_accuracy", 0.52))
+        minimum_rank_days = int(model_config.get("min_rank_ic_days", 10))
+        minimum_top_n_days = int(model_config.get("min_top_n_days", 10))
+        validation_passed = bool(
+            direction_accuracy >= minimum_direction
+            and rank_ic >= minimum_rank_ic
+            and rank_ic_days >= minimum_rank_days
+            and skill >= minimum_skill
+            and top_n_metrics["top_n_days"] >= minimum_top_n_days
+            and top_n_metrics["top_n_mean_net_return"] > 0
+            and top_n_metrics["top_n_mean_excess_vs_universe"] > 0
+        )
 
-        latest_prediction = np.clip(pipeline.predict(latest[FEATURE_COLUMNS]), clip_low, clip_high)
+        # Holdout metrics above stay untouched.  The production forecast is
+        # refit on every label whose entry and exit are already known so the
+        # freshest labelled observations are not discarded after validation.
+        y_full_raw = usable[target_column].astype(float).to_numpy()
+        final_clip_low = float(np.nanquantile(y_full_raw, lower_q))
+        final_clip_high = float(np.nanquantile(y_full_raw, upper_q))
+        final_pipeline = _build_model_pipeline(model_config)
+        final_pipeline.fit(usable[FEATURE_COLUMNS], np.clip(y_full_raw, final_clip_low, final_clip_high))
+        latest_prediction = np.clip(
+            final_pipeline.predict(latest[FEATURE_COLUMNS]),
+            final_clip_low,
+            final_clip_high,
+        )
         predictions[f"pred_t{horizon}"] = latest_prediction
         validation["horizons"][f"T+{horizon}"] = {
             "train_samples": int(len(train)),
@@ -516,9 +808,23 @@ def xunlian_yuce_moxing(
             "mean_daily_rank_ic": round(rank_ic, 6),
             "rank_ic_days": int(rank_ic_days),
             "prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
+            "final_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)],
+            "final_train_samples": int(len(usable)),
+            "final_training_end": usable[target_date_column].max().strftime("%Y-%m-%d"),
+            "retrained_on_all_labeled_data": True,
+            **top_n_metrics,
             "quality_score": round(quality, 4),
             "quality_label": _quality_label(quality),
-            "validation_passed": bool(direction_accuracy >= 0.52 and rank_ic > 0 and skill > 0),
+            "validation_thresholds": {
+                "direction_accuracy": minimum_direction,
+                "mean_daily_rank_ic": minimum_rank_ic,
+                "rank_ic_days": minimum_rank_days,
+                "skill_vs_median_baseline": minimum_skill,
+                "top_n_days": minimum_top_n_days,
+                "top_n_mean_net_return": "> 0",
+                "top_n_mean_excess_vs_universe": "> 0",
+            },
+            "validation_passed": validation_passed,
         }
 
     quality_values = [float(item["quality_score"]) for item in validation["horizons"].values()]
@@ -529,10 +835,8 @@ def xunlian_yuce_moxing(
 
 
 def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
-    notional, scenarios, path, errors = _load_cost_config(str(COST_CONFIG_PATH))
-    scenario = next((item for item in scenarios if item.name == scenario_name), None)
-    if scenario is None:
-        raise ValueError(f"交易成本配置中不存在场景：{scenario_name}")
+    """Return a reference cost; stock rows recalculate it after legal lot sizing."""
+    notional, scenario, path, errors = _load_cost_assumption(scenario_name)
     buy_commission = _commission_rate(scenario.buy_commission_rate, scenario.min_commission_yuan, notional)
     sell_commission = _commission_rate(scenario.sell_commission_rate, scenario.min_commission_yuan, notional)
     buy_cost = buy_commission + scenario.transfer_fee_buy_rate + scenario.buy_slippage_bps / 10000.0
@@ -547,14 +851,33 @@ def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
         "scenario": scenario.name,
         "config_path": path,
         "notional_yuan": float(notional),
+        "reference_roundtrip_cost_rate": round(float(roundtrip), 6),
         "estimated_roundtrip_cost_rate": round(float(roundtrip), 6),
+        "estimated_roundtrip_cost_rate_is_reference_only": True,
         "stamp_tax_sell_rate": scenario.stamp_tax_sell_rate,
+        "position_sizing": "每只股票按目标资金、T+1最不利可买价格和所属板块买入数量规则重新计算，见个股明细",
         "config_errors": errors,
     }
 
 
 def _apply_cost(gross_return: float, cost_rate: float) -> float:
     return (1.0 + gross_return) * (1.0 - cost_rate) - 1.0
+
+
+def _round_price_tick(value: float) -> float:
+    return float(Decimal(str(max(float(value), 0.01))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _price_limit_bounds(reference_price: float, limit_rate: float | None, sessions: int) -> tuple[float, float]:
+    """Apply the daily limit and one-cent tick repeatedly from a reference price."""
+    if limit_rate is None or not math.isfinite(float(limit_rate)) or float(limit_rate) <= 0:
+        return 0.01, math.inf
+    lower = _round_price_tick(reference_price)
+    upper = lower
+    for _ in range(max(1, int(sessions))):
+        lower = _round_price_tick(lower * (1.0 - float(limit_rate)))
+        upper = _round_price_tick(upper * (1.0 + float(limit_rate)))
+    return lower, upper
 
 
 def _prediction_rows(
@@ -571,51 +894,116 @@ def _prediction_rows(
         for label, metrics in validation["horizons"].items()
         if metrics.get("validation_passed")
     }
+    budget_yuan, cost_scenario, _, _ = _load_cost_assumption(
+        str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
+    )
     constituent_map = constituents.set_index("ts_code").to_dict("index")
     rows: list[dict[str, Any]] = []
     for _, row in predictions.iterrows():
         code = str(row["ts_code"])
         name = str(row["name"])
         close = float(row["close"])
+        raw_limit_rate = _limit_rate(code, name)
+        limit_rate = float(raw_limit_rate) if raw_limit_rate is not None else None
+        _, entry_price_ceiling = _price_limit_bounds(close, limit_rate, 1)
+        if not math.isfinite(entry_price_ceiling):
+            entry_price_ceiling = close
+        stock_cost_rate, position_cost = _stock_roundtrip_cost(
+            code,
+            entry_price_ceiling,
+            budget_yuan,
+            cost_scenario,
+        )
         forecasts: dict[str, Any] = {}
-        weighted_net = 0.0
+        active_horizons = [
+            value
+            for value in horizons
+            if value in passed_horizons and max(weights.get(value, 0.0), 0.0) > 0
+        ]
+        active_weight_sum = sum(max(weights.get(value, 0.0), 0.0) for value in active_horizons)
+        normalized_weights = {
+            value: max(weights.get(value, 0.0), 0.0) / active_weight_sum
+            for value in active_horizons
+        } if active_weight_sum > 0 else {}
+        weighted_net = 0.0 if active_horizons and stock_cost_rate is not None else None
         for horizon in horizons:
             gross = float(row[f"pred_t{horizon}"])
-            net = _apply_cost(gross, cost_rate)
+            net = _apply_cost(gross, stock_cost_rate) if stock_cost_rate is not None else None
             quality = validation["horizons"][f"T+{horizon}"]
+            # The reference path starts at the signal close.  The first
+            # sellable exit spans the T+1 entry session and T+2 exit session,
+            # hence horizon + 1 daily-limit steps.
+            price_limit_sessions = horizon + 1
+            price_lower, price_upper = _price_limit_bounds(close, limit_rate, price_limit_sessions)
+            unconstrained_reference_price = _round_price_tick(close * (1.0 + gross))
+            constrained_reference_price = _round_price_tick(
+                min(max(unconstrained_reference_price, price_lower), price_upper)
+            )
             forecasts[f"T+{horizon}"] = {
-                "cumulative_close_return": round(gross, 6),
-                "cumulative_close_return_pct": round(gross * 100.0, 3),
-                "estimated_net_return_after_cost": round(net, 6),
-                "estimated_net_return_after_cost_pct": round(net * 100.0, 3),
-                "predicted_close": round(close * (1.0 + gross), 3),
+                "entry_to_exit_gross_return": round(gross, 6),
+                "entry_to_exit_gross_return_pct": round(gross * 100.0, 3),
+                "estimated_net_return_after_cost": round(net, 6) if net is not None else None,
+                "estimated_net_return_after_cost_pct": round(net * 100.0, 3) if net is not None else None,
+                "predicted_close": None,
+                "predicted_close_unavailable_reason": "实际T+1开盘价尚未知，不能把模型收益可靠换算成目标收盘价",
+                "signal_close_reference_price": _round_price_tick(close),
+                "model_reference_exit_price_unconstrained": unconstrained_reference_price,
+                "model_reference_exit_price_clipped_to_legal_range": constrained_reference_price,
+                "reference_exit_price_limit_lower": price_lower,
+                "reference_exit_price_limit_upper": price_upper if math.isfinite(price_upper) else None,
+                "price_limit_sessions_from_signal_close": int(price_limit_sessions),
+                "timing": (
+                    f"T日收盘信号，T+1开盘入场；本项为入场后第{horizon}个可卖出交易日收盘"
+                ),
+                "used_for_ranking": bool(horizon in active_horizons),
                 "model_quality": quality["quality_label"],
             }
-            weighted_net += weights.get(horizon, 0.0) * net
-        exit_candidates = sorted(passed_horizons) if passed_horizons else horizons
-        best_horizon = max(
-            exit_candidates,
-            key=lambda value: forecasts[f"T+{value}"]["estimated_net_return_after_cost"],
+            if weighted_net is not None and horizon in normalized_weights and net is not None:
+                weighted_net += normalized_weights[horizon] * net
+        best_horizon = (
+            max(
+                active_horizons,
+                key=lambda value: forecasts[f"T+{value}"]["estimated_net_return_after_cost"],
+            )
+            if active_horizons and stock_cost_rate is not None
+            else None
         )
         annualized_volatility = float(row.get("volatility_20", 0.0) or 0.0)
         atr_pct = float(row.get("atr_14_pct", 0.0) or 0.0)
-        trend = float(row.get("ma_trend_5_20", 0.0) or 0.0)
-        risk_penalty = 0.01 * max(annualized_volatility, 0.0) + 0.10 * max(atr_pct, 0.0)
-        trend_bonus = 0.10 * max(min(trend, 0.05), 0.0)
-        selection_score = weighted_net - risk_penalty + trend_bonus
+        holding_sessions = (
+            sum(normalized_weights[value] * (value + 1) for value in active_horizons)
+            if normalized_weights
+            else 1.0
+        )
+        holding_volatility = max(annualized_volatility, 0.0) / math.sqrt(252.0) * math.sqrt(holding_sessions)
+        risk_scale = max(holding_volatility, max(atr_pct, 0.0), 0.01)
+        selection_score = weighted_net / risk_scale if weighted_net is not None else None
         current = constituent_map.get(code, {})
         rows.append(
             {
                 "ts_code": code,
                 "name": name,
                 "as_of": pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d"),
+                "signal_date": pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d"),
                 "latest_close": round(close, 3),
-                "selection_score": round(selection_score, 6),
-                "weighted_expected_net_return": round(weighted_net, 6),
-                "suggested_exit": f"T+{best_horizon}",
-                "suggested_holding_trading_days": int(best_horizon),
-                "suggested_exit_validation_passed": bool(best_horizon in passed_horizons),
+                "selection_score": round(selection_score, 6) if selection_score is not None else None,
+                "selection_score_definition": (
+                    "通过验证周期的加权成本后收益 / max(持有期历史波动率, ATR占比, 1%)"
+                ),
+                "selection_expected_holding_sessions": round(float(holding_sessions), 4),
+                "selection_risk_scale": round(risk_scale, 6),
+                "weighted_expected_net_return": round(weighted_net, 6) if weighted_net is not None else None,
+                "ranking_horizons": [f"T+{value}" for value in active_horizons],
+                "ranking_horizon_weights": {
+                    f"T+{value}": round(weight, 6) for value, weight in normalized_weights.items()
+                },
+                "suggested_exit": f"T+{best_horizon}" if best_horizon is not None else None,
+                "suggested_holding_trading_days": int(best_horizon) if best_horizon is not None else None,
+                "suggested_exit_validation_passed": bool(best_horizon in passed_horizons)
+                if best_horizon is not None
+                else False,
                 "forecast": forecasts,
+                "position_and_cost": position_cost,
                 "technical_snapshot": {
                     "ret_5": _round_optional(row.get("ret_5"), 6),
                     "ma5_vs_ma20": _round_optional(row.get("ma_trend_5_20"), 6),
@@ -632,12 +1020,21 @@ def _prediction_rows(
                     if key in current
                 },
                 "a_share_constraints": {
-                    "can_sell_earliest": "T+1",
-                    "price_limit_pct": round(_limit_rate(code, name) * 100.0, 2),
+                    "signal_time": "T日收盘后",
+                    "planned_entry": "下一市场交易日（T+1）开盘",
+                    "can_sell_earliest": "信号后的第2个市场交易日收盘（输出标记为T+1）",
+                    "price_limit_pct": round(limit_rate * 100.0, 2) if limit_rate is not None else None,
                 },
             }
         )
-    return sorted(rows, key=lambda item: item["selection_score"], reverse=True)
+    return sorted(
+        rows,
+        key=lambda item: (
+            bool(item["position_and_cost"]["execution_feasible"]),
+            float(item["selection_score"]) if item["selection_score"] is not None else -math.inf,
+        ),
+        reverse=True,
+    )
 
 
 def _source_summary(histories: dict[str, pd.DataFrame]) -> dict[str, Any]:
@@ -665,7 +1062,7 @@ def _save_artifacts(run_dir: str, result: dict[str, Any]) -> dict[str, str]:
         }
         for horizon in [1, 2, 3]:
             forecast = item["forecast"][f"T+{horizon}"]
-            row[f"t{horizon}_gross_return"] = forecast["cumulative_close_return"]
+            row[f"t{horizon}_entry_to_exit_gross_return"] = forecast["entry_to_exit_gross_return"]
             row[f"t{horizon}_net_return"] = forecast["estimated_net_return_after_cost"]
         flat_rows.append(row)
     pd.DataFrame(flat_rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -737,6 +1134,28 @@ def bankuai_xuangu(
     if latest.empty:
         return {"status": "error", "error": "候选股没有足够的最新技术指标"}
     global_as_of = pd.to_datetime(latest["trade_date"]).max()
+    market_freshness = _market_data_freshness(global_as_of)
+    if market_freshness["status"] == "too_stale":
+        return {
+            "status": "error",
+            "error": (
+                f"板块最新可用行情停留在 {global_as_of.strftime('%Y-%m-%d')}，"
+                f"距最近应完成交易日已 {market_freshness['business_days_old']} 个工作日；"
+                "可能存在停牌或数据源延迟，已停止输出当前预测"
+            ),
+            "board": board_meta,
+            "market_freshness": market_freshness,
+            "history_stock_count": int(len(histories)),
+            "fetch_errors": fetch_errors[:30],
+        }
+    if market_freshness["status"] == "possibly_stale":
+        fetch_warnings.append(
+            f"板块最新行情距最近应完成交易日约 {market_freshness['business_days_old']} 个工作日，"
+            "可能存在长假或数据接口延迟"
+        )
+    latest_dates = pd.to_datetime(latest["trade_date"])
+    stale_latest = latest[latest_dates != global_as_of][["ts_code", "name", "trade_date"]].copy()
+    feature_ready_stock_count = int(len(latest))
     latest = latest[pd.to_datetime(latest["trade_date"]) == global_as_of].reset_index(drop=True)
 
     try:
@@ -762,21 +1181,42 @@ def bankuai_xuangu(
         item
         for item in ranked
         if passed_horizon_labels
+        and item["position_and_cost"]["execution_feasible"]
         and item["suggested_exit_validation_passed"]
+        and item["weighted_expected_net_return"] is not None
         and float(item["weighted_expected_net_return"]) > 0
+        and item["selection_score"] is not None
         and float(item["selection_score"]) > 0
         and float(item["forecast"][item["suggested_exit"]]["estimated_net_return_after_cost"]) > 0
     ]
     recommendations = eligible[:top_n]
+    daily_source_policy = {
+        "auto": "个股日线优先 Tushare，失败后降级 AKShare",
+        "tushare": "个股日线固定使用 Tushare，不自动降级 AKShare",
+        "akshare": "个股日线固定使用 AKShare（新浪优先，东方财富降级）",
+    }[source]
     result: dict[str, Any] = {
         "status": "ok",
         "analysis_type": "board_selection_t3_prediction",
         "board": board_meta,
         "as_of": global_as_of.strftime("%Y-%m-%d"),
+        "market_freshness": market_freshness,
         "prediction_horizons": ["T+1", "T+2", "T+3"],
+        "prediction_horizon_definition": "T+1/T+2/T+3分别指在T+1开盘入场后第1/2/3个可卖出交易日；首个退出日是信号后的第2个市场交易日",
         "constituent_count": int(len(constituents)),
         "post_filter_count": int(len(filtered)),
         "history_stock_count": int(len(histories)),
+        "feature_ready_stock_count": feature_ready_stock_count,
+        "same_as_of_prediction_stock_count": int(len(latest)),
+        "stale_date_excluded_count": int(len(stale_latest)),
+        "stale_date_excluded_examples": [
+            {
+                "ts_code": str(item["ts_code"]),
+                "name": str(item["name"]),
+                "latest_trade_date": pd.Timestamp(item["trade_date"]).strftime("%Y-%m-%d"),
+            }
+            for item in stale_latest.to_dict("records")[:20]
+        ],
         "model_sample_count": int(len(panel)),
         "recommendations": recommendations,
         "recommendation_count": int(len(recommendations)),
@@ -786,7 +1226,9 @@ def bankuai_xuangu(
             "passed_horizons": passed_horizon_labels,
             "rules": [
                 "至少一个预测周期通过样本外验证",
+                "只有通过验证的预测周期才参与加权收益和排名，剩余权重重新归一化",
                 "建议卖出周期必须是已通过验证的周期",
+                "目标资金必须能够按所属板块最低买入数量建仓",
                 "加权成本后收益、建议周期成本后收益、风险调整分数都必须为正",
             ],
         },
@@ -794,7 +1236,7 @@ def bankuai_xuangu(
         "data_provenance": {
             "board_constituents": board_meta["constituent_source"],
             **_source_summary(histories),
-            "source_policy": "行业成分优先 Tushare；免费降级依次为新浪和东方财富。个股日线优先 Tushare，失败后降级 AKShare",
+            "source_policy": f"行业成分优先 Tushare，免费降级依次为新浪和东方财富；{daily_source_policy}",
             "config_path": resolved_config,
         },
         "filter_summary": {
@@ -805,15 +1247,17 @@ def bankuai_xuangu(
         "fetch_errors": fetch_errors[:30],
         "methodology": {
             "model": "HistGradientBoostingRegressor，T+1/T+2/T+3 分别训练",
-            "validation": "按交易日期顺序切分，并清除目标日期跨越切分点的训练样本",
-            "target": "从最新收盘价到未来第 1/2/3 个交易日收盘价的累计收益",
-            "ranking": "成本后预测收益加权，扣除 ATR 与波动率风险惩罚",
+            "validation": "按交易日期顺序切分并清除跨越切分点样本；同时要求Top-N扣成本收益为正且优于当日候选池；验证后用全部已知标签重训",
+            "target": "T日收盘后生成信号，下一市场交易日开盘入场；预测入场后第1/2/3个可卖出交易日收盘相对入场开盘的收益",
+            "calendar_alignment": "入口和出口按板块共同市场日期定位；股票在必需日期停牌或缺行情时不生成该样本",
+            "ranking": "只对通过验证的周期归一化加权成本后预测收益，再除以持有期波动率、ATR占比和1%下限中的最大值",
             "survivorship_bias": "模型使用当前板块成分回看历史，验证结果仍可能含当前成分股带来的幸存者偏差",
         },
         "a_share_rules": {
-            "t_plus_one": "当日买入最早下一个交易日卖出，因此不输出 T+0",
-            "max_holding": "最多 T+3；系统不会输出更远预测",
-            "price_limits": "过滤最新交易日接近涨停的股票，并按主板、ST、创业板/科创板、北交所识别涨跌幅限制",
+            "signal_and_entry": "T日收盘后生成信号，计划在下一市场交易日（T+1）开盘买入",
+            "t_plus_one": "输出T+1指入场后第1个可卖出交易日，实际是信号后的第2个市场交易日；不输出不可执行的同日卖出",
+            "max_holding": "最多输出入场后第3个可卖出交易日；系统不会输出更远预测",
+            "price_limits": "不输出目标收盘价；仅展示模型未约束参考价和从信号收盘逐日推导、按0.01元取整的合法价格区间，实际T+1开盘确定后必须重算",
         },
         "scope_note": "预测是有验证指标和成本假设的概率研究，不是价格承诺。验证质量低时应降低仓位或不交易。",
         "execution_policy": "research_only：只输出研究候选和预测，永不连接券商、永不提交订单、永不自动交易。",
@@ -822,7 +1266,7 @@ def bankuai_xuangu(
         if not passed_horizon_labels:
             result["no_trade_reason"] = "T+1、T+2、T+3 均未通过样本外验证，系统选择不推荐任何股票。"
         else:
-            result["no_trade_reason"] = "通过验证的周期内，没有股票同时覆盖交易成本和风险惩罚，系统选择不推荐。"
+            result["no_trade_reason"] = "通过验证的周期内，没有股票同时满足合法买入数量、成本后收益和风险调整门槛，系统选择不推荐。"
     if validation["overall_quality_label"] == "low":
         result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也不应把它当作高确信度交易信号。"
     if run_dir:

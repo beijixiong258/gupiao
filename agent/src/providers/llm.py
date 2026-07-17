@@ -179,6 +179,10 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         raise RuntimeError("langchain-openai is not installed")
 
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
+    configured_service_tier = os.getenv("LANGCHAIN_SERVICE_TIER", "").strip().lower() or None
+    # Codex exposes the user-facing tier as "fast", while the Responses wire
+    # value accepted by the ChatGPT backend is "priority".
+    service_tier = "priority" if configured_service_tier == "fast" else configured_service_tier
     common: Dict[str, Any] = {
         "model": name,
         "api_key": settings["api_key"],
@@ -202,8 +206,10 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         use_responses_api=bool(settings.get("use_responses_api")),
         output_version="v0",
         store=False,
+        streaming=settings["provider"] == "openai_codex",
         include=["reasoning.encrypted_content"] if settings["provider"] == "openai_codex" else None,
         reasoning=reasoning,
+        service_tier=service_tier,
     )
 
 

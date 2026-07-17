@@ -10,8 +10,9 @@ class BankuaiXuanguTool(BaseTool):
     name = "bankuai_xuangu"
     description = (
         "Select mainland China A-shares only from a user-specified industry or concept board. "
-        "Runs chronological out-of-sample validation and returns cost-adjusted T+1, T+2, and T+3 forecasts only. "
-        "Use this for natural-language requests to pick stocks from a sector and predict the next three trading days. "
+        "Runs chronological out-of-sample validation and returns cost-adjusted T+1, T+2, and T+3 sellable-horizon forecasts. "
+        "Signals use the completed close, entry is the next session open, and T+1 is the first later session when the new shares can be sold. "
+        "Use this for natural-language requests to pick stocks from a sector and compare those three sellable horizons. "
         "Research only; it never connects to a broker or submits orders."
     )
     parameters = {

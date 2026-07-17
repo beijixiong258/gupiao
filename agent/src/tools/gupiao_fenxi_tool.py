@@ -20,7 +20,10 @@ class GupiaoFenxiTool(BaseTool):
             "source": {
                 "type": "string",
                 "enum": ["auto", "tushare", "akshare"],
-                "description": "Market-data source. auto means Tushare first, then AKShare fallback.",
+                "description": (
+                    "Stock-name resolution and daily-bar source. auto means Tushare first, then AKShare fallback. "
+                    "Fundamentals still use their own Tushare-first fallback policy."
+                ),
             },
             "history_calendar_days": {
                 "type": "integer",

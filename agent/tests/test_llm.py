@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from src.providers import llm as llm_mod
-from src.providers.llm import _extract_balanced_json, resolve_provider_settings
+from src.providers.llm import _extract_balanced_json, build_llm, resolve_provider_settings
 
 
 def _settings(env: dict[str, str]) -> dict:
@@ -66,6 +66,36 @@ def test_codex_alias_and_model_prefix(monkeypatch) -> None:
     assert settings["provider"] == "openai_codex"
     assert settings["model"] == "gpt-5.3-codex"
     assert settings["default_headers"] == {"X-Test": "token-test"}
+
+
+def test_build_openai_codex_passes_fast_tier_and_medium_reasoning() -> None:
+    settings = {
+        "provider": "openai_codex",
+        "model": "gpt-5.6-luna",
+        "api_key": "token-test",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "default_headers": {"X-Test": "token-test"},
+        "use_responses_api": True,
+    }
+    with (
+        patch.object(llm_mod, "resolve_provider_settings", return_value=settings),
+        patch.object(llm_mod, "ChatOpenAI") as constructor,
+        patch.dict(
+            os.environ,
+            {
+                "LANGCHAIN_REASONING_EFFORT": "medium",
+                "LANGCHAIN_SERVICE_TIER": "fast",
+            },
+            clear=True,
+        ),
+    ):
+        build_llm()
+
+    kwargs = constructor.call_args.kwargs
+    assert kwargs["model"] == "gpt-5.6-luna"
+    assert kwargs["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert kwargs["service_tier"] == "priority"
+    assert kwargs["streaming"] is True
 
 
 def test_unsupported_provider_is_rejected() -> None:

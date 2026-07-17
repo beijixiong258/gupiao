@@ -198,7 +198,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
         Panel(
             f"{mode}\n会话：{huihua.huihua_id}\n"
             "可直接连续追问；输入 /help 查看会话命令。\n"
-            "示例：分析贵州茅台，然后追问：它未来三天怎么看？",
+            "示例：分析贵州茅台，然后追问：它目前主要有哪些风险？",
             title="A股 T+3 量化研究员 | 连续对话",
         )
     )
@@ -324,6 +324,8 @@ def cmd_settings() -> int:
                 [
                     f"Provider: {provider}",
                     f"Model: {os.getenv('LANGCHAIN_MODEL_NAME', os.getenv('DEEPSEEK_MODEL', '(not set)'))}",
+                    f"Reasoning: {os.getenv('LANGCHAIN_REASONING_EFFORT', '(default)')}",
+                    f"Service tier: {os.getenv('LANGCHAIN_SERVICE_TIER', 'standard')}",
                     f"DeepSeek key: {'set' if os.getenv('DEEPSEEK_API_KEY') else 'not set'}",
                     f"OpenAI API key: {'set' if os.getenv('OPENAI_API_KEY') else 'not set'}",
                     f"ChatGPT OAuth: {'ready' if oauth_status['configured'] else 'not logged in'}",
@@ -424,7 +426,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     gupiao = sub.add_parser("gupiao", help="按代码或名称直接分析一只 A 股")
     gupiao.add_argument("gupiao", help="例如 600519.SH 或贵州茅台")
-    gupiao.add_argument("--source", choices=["auto", "tushare", "akshare"], default="auto")
+    gupiao.add_argument(
+        "--source",
+        choices=["auto", "tushare", "akshare"],
+        default="auto",
+        help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
+    )
     gupiao.add_argument("--history-calendar-days", type=int, default=540)
     gupiao.add_argument("--json", action="store_true")
 
@@ -432,7 +439,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     bankuai.add_argument("bankuai", help="中国大陆行业或概念板块名称")
     bankuai.add_argument("--type", dest="bankuai_leixing", choices=["auto", "hangye", "gainian"], default="auto")
     bankuai.add_argument("--top-n", type=int, default=3)
-    bankuai.add_argument("--source", choices=["auto", "tushare", "akshare"], default="auto")
+    bankuai.add_argument(
+        "--source",
+        choices=["auto", "tushare", "akshare"],
+        default="auto",
+        help="个股日线行情来源；板块成分仍按独立的数据源顺序获取",
+    )
     bankuai.add_argument("--config", dest="config_path", help="Path to lianghua_peizhi.json")
     bankuai.add_argument("--json", action="store_true")
 

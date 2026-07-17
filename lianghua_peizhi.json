@@ -1,7 +1,6 @@
 {
   "banben": 1,
   "shuju": {
-    "source": "auto",
     "history_calendar_days": 540,
     "max_board_stocks": 20,
     "minimum_history_rows": 120,
@@ -9,7 +8,6 @@
     "akshare_bypass_proxy": true
   },
   "guolv": {
-    "min_list_days": 120,
     "min_price": 2.0,
     "max_price": 300.0,
     "min_amount_yuan": 50000000,
@@ -31,6 +29,12 @@
     "validation_ratio": 0.2,
     "min_training_samples": 500,
     "min_validation_samples": 100,
+    "min_direction_accuracy": 0.52,
+    "min_mean_daily_rank_ic": 0.01,
+    "min_rank_ic_days": 10,
+    "min_skill_vs_baseline": 0.01,
+    "validation_top_n": 3,
+    "min_top_n_days": 10,
     "learning_rate": 0.05,
     "max_iter": 180,
     "max_leaf_nodes": 15,

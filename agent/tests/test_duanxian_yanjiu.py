@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.ashare import gupiao_yanjiu
 from src.ashare.bankuai_yuce import (
     _filter_constituents,
     goujian_moxing_shuju,
@@ -17,6 +18,7 @@ from src.ashare.bankuai_yuce import (
 )
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
+    _a_share_rules,
     akshare_zhilian,
     biaozhunhua_daima,
     jiazai_lianghua_peizhi,
@@ -90,6 +92,8 @@ def test_external_config_hard_caps_horizons_at_t3() -> None:
     assert config["jiaoyi"]["execution_mode"] == "research_only"
     assert config["jiaoyi"]["allow_live_trading"] is False
     assert config["jiaoyi"]["allow_order_submission"] is False
+    assert "source" not in config["shuju"]
+    assert "min_list_days" not in config["guolv"]
 
 
 def test_config_cannot_enable_order_submission(tmp_path: Path) -> None:
@@ -124,11 +128,35 @@ def test_filter_removes_st_illiquid_and_limit_up_rows() -> None:
             {"ts_code": "600002.SH", "name": "ST测试", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
             {"ts_code": "600003.SH", "name": "低流动", "latest_price": 10, "amount_yuan": 1_000_000, "pct_chg": 1},
             {"ts_code": "600004.SH", "name": "涨停股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 10},
+            {"ts_code": "600005.SH", "name": "N新股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
+            {"ts_code": "600006.SH", "name": "C新股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
+            {"ts_code": "600007.SH", "name": "缺价格", "latest_price": None, "amount_yuan": 90_000_000, "pct_chg": 1},
+            {"ts_code": "600008.SH", "name": "缺成交额", "latest_price": 10, "amount_yuan": None, "pct_chg": 1},
         ]
     )
     accepted, rejected = _filter_constituents(frame, config)
     assert accepted["ts_code"].tolist() == ["600001.SH"]
-    assert len(rejected) == 3
+    assert len(rejected) == 7
+    assert {item["reason"] for item in rejected} >= {
+        "缺少最新价格，无法应用价格过滤",
+        "缺少最新成交额，无法应用流动性过滤",
+    }
+
+
+def test_stock_basic_cache_reads_existing_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache_path = tmp_path / "stock_basic.csv"
+    pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}]).to_csv(cache_path, index=False)
+    monkeypatch.setattr(gupiao_yanjiu, "STOCK_BASIC_CACHE", cache_path)
+
+    cached = gupiao_yanjiu._stock_basic_cache()
+
+    assert cached.to_dict("records") == [{"ts_code": "600519.SH", "name": "贵州茅台"}]
+
+
+def test_single_stock_rules_do_not_claim_a_single_stock_forecast() -> None:
+    rules = _a_share_rules("600519.SH", "贵州茅台")
+    assert "单股工具不输出" in rules["prediction_horizon"]
+    assert "指定板块选股" in rules["prediction_horizon"]
 
 
 def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:
