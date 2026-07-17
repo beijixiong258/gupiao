@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from src.providers.llm import build_llm
+from src.providers.llm import _provider_name, build_llm
 
 
 def _dedupe_finish_reason(raw: str) -> str:
@@ -18,6 +18,23 @@ def _dedupe_finish_reason(raw: str) -> str:
          if raw.endswith(m)),
         raw,
     )
+
+
+def _content_text(content: Any) -> str:
+    """Extract text from string or Responses API content blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str) and block.get("type") in {"text", "output_text"}:
+                parts.append(text)
+    return "".join(parts)
 
 
 @dataclass
@@ -73,7 +90,23 @@ class ChatLLM:
             model_name: Model name; defaults to the environment variable value.
         """
         self.model_name = model_name
+        self.provider = _provider_name()
         self._llm = build_llm(model_name=model_name)
+
+    @staticmethod
+    def _prepare_messages(messages: List[Dict[str, Any]], provider: str) -> List[Dict[str, Any]]:
+        """Adapt message roles required by the ChatGPT Codex backend."""
+        if provider != "openai_codex":
+            return messages
+        prepared: List[Dict[str, Any]] = []
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                converted = dict(message)
+                converted["role"] = "developer"
+                prepared.append(converted)
+            else:
+                prepared.append(message)
+        return prepared
 
     def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, timeout: Optional[int] = None) -> LLMResponse:
         """Call the LLM synchronously.
@@ -88,7 +121,7 @@ class ChatLLM:
         """
         llm = self._llm.bind_tools(tools) if tools else self._llm
         config = {"timeout": timeout} if timeout else {}
-        ai_message = llm.invoke(messages, config=config)
+        ai_message = llm.invoke(self._prepare_messages(messages, self.provider), config=config)
         return self._parse_response(ai_message)
 
     def stream_chat(
@@ -116,9 +149,11 @@ class ChatLLM:
             llm = self._llm.bind_tools(tools) if tools else self._llm
             config = {"timeout": timeout} if timeout else {}
             accumulated = None
-            for chunk in llm.stream(messages, config=config):
-                if chunk.content and on_text_chunk:
-                    on_text_chunk(chunk.content)
+            prepared_messages = self._prepare_messages(messages, self.provider)
+            for chunk in llm.stream(prepared_messages, config=config):
+                text_delta = _content_text(chunk.content)
+                if text_delta and on_text_chunk:
+                    on_text_chunk(text_delta)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
                 return LLMResponse(content="", tool_calls=[], finish_reason="stop")
@@ -139,7 +174,7 @@ class ChatLLM:
         """
         llm = self._llm.bind_tools(tools) if tools else self._llm
         config = {"timeout": timeout} if timeout else {}
-        ai_message = await llm.ainvoke(messages, config=config)
+        ai_message = await llm.ainvoke(self._prepare_messages(messages, self.provider), config=config)
         return self._parse_response(ai_message)
 
     @staticmethod
@@ -150,20 +185,9 @@ class ChatLLM:
         populated by ``ChatOpenAIWithReasoning`` on both stream and non-stream paths.
         """
         raw_content = ai_message.content
-        if isinstance(raw_content, str):
-            content = raw_content
-        elif isinstance(raw_content, list):
-            parts: list[str] = []
-            for block in raw_content:
-                if isinstance(block, str):
-                    parts.append(block)
-                elif isinstance(block, dict):
-                    text = block.get("text")
-                    if isinstance(text, str) and block.get("type") in {"text", "output_text"}:
-                        parts.append(text)
-            content = "\n".join(part for part in parts if part).strip()
-        else:
-            content = str(raw_content or "")
+        content = _content_text(raw_content)
+        if not content and raw_content and not isinstance(raw_content, (str, list)):
+            content = str(raw_content)
 
         additional = dict(ai_message.additional_kwargs or {})
         reasoning_content = additional.get("reasoning_content")

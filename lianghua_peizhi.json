@@ -7,6 +7,26 @@
     "request_pause_seconds": 0.15,
     "akshare_bypass_proxy": true
   },
+  "dangu": {
+    "history_calendar_days": 1080,
+    "max_peer_stocks": 18,
+    "same_industry_stocks": 14,
+    "minimum_peer_stocks": 8,
+    "minimum_history_rows": 180,
+    "min_listing_calendar_days": 180,
+    "min_amount_yuan": 30000000,
+    "request_pause_seconds": 0.08,
+    "walk_forward_folds": 3,
+    "validation_window_days": 45,
+    "minimum_training_dates": 120,
+    "min_fold_training_samples": 500,
+    "min_fold_validation_samples": 80,
+    "min_passed_folds": 2,
+    "min_feature_coverage": 0.2,
+    "decision_min_net_return": 0.003,
+    "decision_min_up_probability": 0.55,
+    "maximum_entry_gap_pct": 0.03
+  },
   "guolv": {
     "min_price": 2.0,
     "max_price": 300.0,

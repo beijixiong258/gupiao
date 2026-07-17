@@ -20,7 +20,7 @@ automatic trading. All outputs are research results for manual review.
 
 mcp = FastMCP(
     name="A股 T+3 量化研究员",
-    version="0.2.0",
+    version="0.3.0",
     instructions=MCP_INSTRUCTIONS,
     mask_error_details=True,
     strict_input_validation=True,
@@ -30,8 +30,8 @@ mcp = FastMCP(
 @mcp.tool(
     name="gupiao_fenxi",
     description=(
-        "分析一只中国大陆 A 股，返回基本资料、估值、财务指标、技术指标、A 股交易规则、"
-        "数据来源和风险。只做研究，不连接券商或下单。"
+        "分析一只中国大陆 A 股，返回行情时点、可交易性、基本面、技术面，以及经过滚动样本外验证和"
+        "交易成本调整的 T+1/T+2/T+3 单股预测与决策。只做研究，不连接券商或下单。"
     ),
     annotations={
         "readOnlyHint": True,
@@ -43,13 +43,17 @@ mcp = FastMCP(
 def gupiao_fenxi(
     gupiao: str,
     source: Literal["auto", "tushare", "akshare"] = "auto",
-    history_calendar_days: int = 540,
+    history_calendar_days: int = 1080,
+    holding_days: Literal[1, 2, 3] = 2,
+    budget_yuan: float | None = None,
 ) -> dict[str, Any]:
     """研究一只 A 股；gupiao 可传代码或中文名称。"""
     return _fenxi_gupiao(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
+        holding_days=holding_days,
+        budget_yuan=budget_yuan,
     )
 
 

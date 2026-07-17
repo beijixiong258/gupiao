@@ -1,7 +1,7 @@
 [project]
 name = "gupiaoyanjiu"
-version = "0.2.0"
-description = "A股 T+3 量化研究员：单股研究与指定板块短线预测"
+version = "0.3.0"
+description = "A股 T+3 量化研究员：单股与指定板块短线量化研究"
 requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [

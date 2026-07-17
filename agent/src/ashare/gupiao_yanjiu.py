@@ -34,6 +34,7 @@ MARKET_DATA_STALE_WARNING_BUSINESS_DAYS = 2
 MARKET_DATA_STALE_ERROR_BUSINESS_DAYS = 7
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 5
+SINGLE_STOCK_TOOL_CONTRACT_VERSION = 2
 
 FEATURE_COLUMNS = [
     "ret_1",
@@ -129,6 +130,38 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         or trading.get("allow_order_submission") is not False
     ):
         raise ValueError("本程序被硬限制为 research_only，禁止实盘交易和订单提交")
+    single = value.get("dangu", {})
+    if not isinstance(single, dict):
+        raise ValueError("dangu 必须是 JSON 对象")
+    try:
+        single_history_days = int(single.get("history_calendar_days", 1080))
+        maximum_peers = int(single.get("max_peer_stocks", 18))
+        same_industry_peers = int(single.get("same_industry_stocks", 14))
+        minimum_peers = int(single.get("minimum_peer_stocks", 8))
+        walk_forward_folds = int(single.get("walk_forward_folds", 3))
+        minimum_passed_folds = int(single.get("min_passed_folds", 2))
+        minimum_feature_coverage = float(single.get("min_feature_coverage", 0.2))
+        minimum_net_return = float(single.get("decision_min_net_return", 0.003))
+        minimum_probability = float(single.get("decision_min_up_probability", 0.55))
+        maximum_entry_gap = float(single.get("maximum_entry_gap_pct", 0.03))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"dangu 数值配置无效：{exc}") from exc
+    if not 540 <= single_history_days <= 1800:
+        raise ValueError("dangu.history_calendar_days 必须在 540 到 1800 之间")
+    if not 8 <= maximum_peers <= 40:
+        raise ValueError("dangu.max_peer_stocks 必须在 8 到 40 之间")
+    if not 4 <= same_industry_peers < maximum_peers:
+        raise ValueError("dangu.same_industry_stocks 必须至少为4且小于 max_peer_stocks")
+    if not 5 <= minimum_peers <= maximum_peers:
+        raise ValueError("dangu.minimum_peer_stocks 必须在5到 max_peer_stocks 之间")
+    if walk_forward_folds < 2 or not 1 <= minimum_passed_folds <= walk_forward_folds:
+        raise ValueError("dangu 的滚动验证折数或最少通过折数无效")
+    if not 0 < minimum_feature_coverage <= 1:
+        raise ValueError("dangu.min_feature_coverage 必须在0到1之间")
+    if not 0 <= minimum_net_return <= 0.2 or not 0.5 <= minimum_probability <= 1:
+        raise ValueError("dangu 的决策收益或上涨比例门槛无效")
+    if not 0 <= maximum_entry_gap <= 0.2:
+        raise ValueError("dangu.maximum_entry_gap_pct 必须在0到0.2之间")
     return value, str(path)
 
 
@@ -1148,7 +1181,11 @@ def _a_share_rules(
             else f"{price_rule.reason}；特殊无涨跌幅限制交易日以交易所当日证券状态为准"
         ),
         "buy_lot": buy_lot,
-        "prediction_horizon": "单股工具不输出 T+1/T+2/T+3 收益或价格预测；三周期模型只用于指定板块选股",
+        "prediction_horizon": (
+            "单股工具支持 T+1/T+2/T+3：T日收盘后生成信号，下一交易日开盘计划入场；"
+            "T+1/T+2/T+3分别表示入场后第1/2/3个可卖出交易日收盘。"
+            "模型输出入场到退出收益，不伪造尚未知开盘价对应的精确目标价"
+        ),
     }
 
 
@@ -1156,12 +1193,23 @@ def fenxi_gupiao(
     *,
     gupiao: str,
     source: str = "auto",
-    history_calendar_days: int = 540,
+    history_calendar_days: int | None = None,
+    holding_days: int = 2,
+    budget_yuan: float | None = None,
+    config_path: str | None = None,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Run a deterministic single-stock fundamental and technical analysis."""
+    """Run deterministic single-stock research with horizon-aware ML gates."""
     _ensure_dotenv()
-    history_calendar_days = max(180, min(int(history_calendar_days), 1800))
+    config, resolved_config = jiazai_lianghua_peizhi(config_path)
+    holding_days = int(holding_days)
+    if holding_days not in {1, 2, 3}:
+        raise ValueError("holding_days 必须是 1、2 或 3 个交易日")
+    if budget_yuan is not None and (not math.isfinite(float(budget_yuan)) or float(budget_yuan) <= 0):
+        raise ValueError("budget_yuan 必须是大于0的有限数值")
+    configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1080))
+    history_calendar_days = configured_history_days if history_calendar_days is None else int(history_calendar_days)
+    history_calendar_days = max(540, min(history_calendar_days, 1800))
     code, resolved, resolve_warnings = jiexi_gupiao(gupiao, source=source)
     reference = datetime.now()
     end = reference.date()
@@ -1229,6 +1277,60 @@ def fenxi_gupiao(
     profile = fundamentals.get("profile") or {}
     name = str(profile.get("name") or resolved.get("name") or "")
     fundamental_score, fundamental_evidence = _fundamental_score(fundamentals)
+    from src.ashare.dangu_yuce import (
+        huoqu_dangqian_kuaizhao,
+        pinggu_kejiaoyixing,
+        yanjiu_dangu_yuce,
+    )
+
+    execution_reference = datetime.now()
+    current_quote = huoqu_dangqian_kuaizhao(code, reference=execution_reference)
+    tradability = pinggu_kejiaoyixing(
+        code=code,
+        name=name,
+        profile=profile,
+        history=analysis_history,
+        freshness=freshness,
+        current_quote=current_quote,
+        config=config,
+        reference=execution_reference,
+    )
+    industry = str(profile.get("industry") or profile.get("所属行业") or resolved.get("industry") or "")
+    try:
+        quantitative = yanjiu_dangu_yuce(
+            code=code,
+            name=name,
+            industry=industry,
+            target_history=analysis_history,
+            target_source=market.source,
+            target_adjustment=market.adjustment,
+            source=source,
+            signal_date=str(technical["trade_date"]),
+            holding_days=holding_days,
+            budget_yuan=budget_yuan,
+            config=config,
+            technical=technical,
+            fundamentals=fundamentals,
+            tradability=tradability,
+        )
+    except Exception as exc:
+        fallback_label = "回避" if not tradability.get("can_open_position") else "证据不足"
+        fallback_reasons = list(tradability.get("hard_blocks", []))
+        fallback_reasons.append(f"单股量化模型本次不可用：{exc}")
+        quantitative = {
+            "status": "unavailable",
+            "requested_horizon": f"T+{holding_days}",
+            "forecast": {},
+            "validation": {"horizons": {}, "passed_horizons": 0},
+            "decision": {
+                "label": fallback_label,
+                "requested_horizon": f"T+{holding_days}",
+                "conclusion": f"{fallback_label}：{fallback_reasons[0]}",
+                "reasons": fallback_reasons,
+            },
+            "error": str(exc),
+            "limitations": ["模型失败时不使用启发式技术分替代收益预测"],
+        }
     risks: list[str] = []
     if market.adjustment == "raw_unadjusted":
         risks.append("行情未复权，历史分红送转可能影响长周期技术指标")
@@ -1251,12 +1353,24 @@ def fenxi_gupiao(
             f"最新行情距最近应完成交易日约 {freshness['business_days_old']} 个工作日，"
             "可能存在停牌、长假或数据接口延迟"
         )
+    risks.extend(str(value) for value in tradability.get("hard_blocks", []))
+    risks.extend(str(value) for value in tradability.get("cautions", []))
+    if quantitative.get("status") != "ok":
+        risks.append("指定持有期量化模型本次不可用或同行样本不足，程序不会生成买入倾向")
 
     result: dict[str, Any] = {
         "status": "ok",
+        "tool_contract_version": SINGLE_STOCK_TOOL_CONTRACT_VERSION,
         "analysis_type": "single_stock",
+        "analysis_request": {
+            "requested_holding_trading_days": holding_days,
+            "requested_horizon": f"T+{holding_days}",
+            "budget_yuan": budget_yuan,
+            "history_calendar_days": history_calendar_days,
+        },
         "stock": {"ts_code": code, "name": name, **{key: value for key, value in profile.items() if key not in {"ts_code", "name"}}},
         "as_of": technical["trade_date"],
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "market_data": {
             "source": market.source,
             "adjustment": market.adjustment,
@@ -1267,6 +1381,10 @@ def fenxi_gupiao(
             "warnings": market_warnings,
             "errors": list(market.errors),
         },
+        "current_quote": current_quote,
+        "tradability": tradability,
+        "quantitative_analysis": quantitative,
+        "decision": quantitative.get("decision", {}),
         "technical_analysis": technical,
         "fundamental_analysis": {
             **fundamentals,
@@ -1279,7 +1397,11 @@ def fenxi_gupiao(
         },
         "a_share_rules": _a_share_rules(code, name),
         "risks": risks,
-        "scope_note": "这是基于公开数据的量化研究结果，不是收益保证；LLM 只负责解释工具返回的事实。",
+        "configuration": {"quant_config_path": resolved_config},
+        "scope_note": (
+            "这是基于公开数据、同行面板和滚动样本外验证的A股研究结果，不是收益保证；"
+            "数值、模型门槛和决策标签由程序生成，LLM只负责解释，不得改写"
+        ),
         "execution_policy": "research_only：程序不连接券商、不读取交易账户、不提交委托，所有买卖决定由用户人工完成。",
     }
 

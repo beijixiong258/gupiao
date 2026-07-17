@@ -46,6 +46,36 @@ def test_responses_api_text_blocks_become_plain_answer() -> None:
     assert response.provider_data["raw_content"] == message.content
 
 
+def test_streaming_responses_blocks_are_forwarded_as_strings() -> None:
+    message = SimpleNamespace(
+        content=[{"type": "text", "text": "深科技研究结果"}],
+        tool_calls=[],
+        additional_kwargs={},
+        response_metadata={"finish_reason": "stop"},
+        id="message_stream_1",
+    )
+
+    class _FakeStreamingLLM:
+        @staticmethod
+        def stream(_messages, config=None):
+            _ = config
+            yield message
+
+    client = object.__new__(ChatLLM)
+    client.provider = "openai_codex"
+    client._llm = _FakeStreamingLLM()
+    chunks: list[str] = []
+
+    response = client.stream_chat(
+        [{"role": "system", "content": "A股规则"}, {"role": "user", "content": "分析深科技"}],
+        on_text_chunk=chunks.append,
+    )
+
+    assert chunks == ["深科技研究结果"]
+    assert all(isinstance(chunk, str) for chunk in chunks)
+    assert response.content == "深科技研究结果"
+
+
 def test_deepseek_reasoning_replay_uses_canonical_field() -> None:
     replay = ContextBuilder.format_assistant_tool_calls(
         [ToolCallRequest(id="call_1", name="gupiao_fenxi", arguments={"gupiao": "600519.SH"})],
@@ -82,4 +112,22 @@ def test_reasoning_alias_is_normalized() -> None:
 
 def test_duplicated_finish_reason_is_deduplicated() -> None:
     assert _dedupe_finish_reason("stopstop") == "stop"
+
+
+def test_chatgpt_codex_converts_system_role_without_mutating_context() -> None:
+    messages = [
+        {"role": "system", "content": "A股研究规则"},
+        {"role": "user", "content": "分析深科技"},
+    ]
+
+    prepared = ChatLLM._prepare_messages(messages, "openai_codex")
+
+    assert prepared[0] == {"role": "developer", "content": "A股研究规则"}
+    assert prepared[1] == messages[1]
+    assert messages[0]["role"] == "system"
+
+
+def test_other_providers_keep_system_role() -> None:
+    messages = [{"role": "system", "content": "A股研究规则"}]
+    assert ChatLLM._prepare_messages(messages, "deepseek") is messages
     assert _dedupe_finish_reason("tool_callstool_calls") == "tool_calls"

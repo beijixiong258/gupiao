@@ -47,12 +47,20 @@ TAIL_TOKEN_BUDGET = 20_000
 logger = logging.getLogger(__name__)
 
 
+class _TransientMessage(dict[str, Any]):
+    """Message visible to the current LLM run but excluded from saved history."""
+
+
 def _export_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return a detached conversation history without the system message."""
     return [
         copy.deepcopy(message)
         for message in messages
-        if isinstance(message, dict) and message.get("role") in {"user", "assistant", "tool"}
+        if (
+            isinstance(message, dict)
+            and not isinstance(message, _TransientMessage)
+            and message.get("role") in {"user", "assistant", "tool"}
+        )
     ]
 
 
@@ -347,6 +355,7 @@ class AgentLoop:
         context = ContextBuilder(self.registry, self.memory,
                                   persistent_memory=self._persistent_memory)
         messages = context.build_messages(user_message, history)
+        required_current_tool = context.required_current_tool(user_message)
         react_trace: List[Dict[str, Any]] = []
 
         trace = TraceWriter(run_dir)
@@ -354,6 +363,8 @@ class AgentLoop:
 
         iteration = 0
         final_content = ""
+        fresh_tool_retry_count = 0
+        enforcement_failure_reason = ""
 
         try:
             while iteration < self.max_iterations:
@@ -399,7 +410,67 @@ class AgentLoop:
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
                 if not response.has_tool_calls:
-                    final_content = response.content or ""
+                    candidate_content = response.content or ""
+                    missing_required_tool = bool(
+                        required_current_tool
+                        and required_current_tool not in self._called_ok
+                    )
+                    if (
+                        missing_required_tool
+                        and context.is_object_clarification(candidate_content)
+                    ):
+                        final_content = candidate_content
+                        messages.append({"role": "assistant", "content": final_content})
+                        trace.write({
+                            "type": "required_tool_clarification",
+                            "iter": iteration,
+                            "tool": required_current_tool,
+                            "content": final_content[:500],
+                        })
+                        react_trace.append({"type": "clarification", "content": final_content[:500]})
+                        break
+                    if missing_required_tool and fresh_tool_retry_count < 1:
+                        fresh_tool_retry_count += 1
+                        trace.write({
+                            "type": "required_tool_answer_blocked",
+                            "iter": iteration,
+                            "tool": required_current_tool,
+                            "blocked_preview": candidate_content[:500],
+                        })
+                        react_trace.append({
+                            "type": "answer_blocked",
+                            "reason": f"本轮尚未成功调用 {required_current_tool}",
+                        })
+                        messages.append(_TransientMessage({
+                            "role": "assistant",
+                            "content": "我需要先获取本轮数据，不能直接沿用历史结论。",
+                        }))
+                        messages.append(_TransientMessage({
+                            "role": "user",
+                            "content": (
+                                f"系统校验：本轮尚未成功调用 {required_current_tool}。"
+                                "当前问题依赖最新市场数据，禁止使用历史结果直接作答。"
+                                "请现在先调用该工具；如果研究对象确实无法识别，只问一个简短的澄清问题。"
+                            ),
+                        }))
+                        continue
+                    if missing_required_tool:
+                        enforcement_failure_reason = (
+                            f"当前问题必须在本轮重新调用 {required_current_tool}，"
+                            "但模型连续两次未发起有效工具调用；已拦截可能过期的回答。"
+                        )
+                        trace.write({
+                            "type": "required_tool_enforcement_failed",
+                            "iter": iteration,
+                            "tool": required_current_tool,
+                            "blocked_preview": candidate_content[:500],
+                        })
+                        react_trace.append({
+                            "type": "answer_blocked",
+                            "reason": enforcement_failure_reason,
+                        })
+                        break
+                    final_content = candidate_content
                     messages.append({"role": "assistant", "content": final_content})
                     trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})
                     react_trace.append({"type": "answer", "content": final_content[:500]})
@@ -443,6 +514,9 @@ class AgentLoop:
         if self._cancelled:
             state_store.mark_failure(run_dir, "cancelled by user")
             final_status = "cancelled"
+        elif enforcement_failure_reason:
+            state_store.mark_failure(run_dir, enforcement_failure_reason)
+            final_status = "failed"
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
@@ -458,6 +532,7 @@ class AgentLoop:
             "run_dir": str(run_dir),
             "run_id": run_dir.name,
             "content": final_content,
+            "reason": enforcement_failure_reason,
             "react_trace": react_trace,
             "history": _export_history(messages),
         }
@@ -673,6 +748,8 @@ class AgentLoop:
         self._update_memory(tc.name)
 
         success = _is_tool_success(result)
+        if success and tc.name == "gupiao_fenxi":
+            success = context.is_compatible_single_stock_result(result)
         if success:
             self._called_ok.add(tc.name)
 

@@ -148,7 +148,7 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
-        "gupiao_fenxi": "正在拉取单股行情、财务与技术数据...",
+        "gupiao_fenxi": "正在核对单股时点、拉取同行历史并训练三周期模型...",
         "bankuai_xuangu": "正在拉取板块成分并训练 T+3 模型...",
     }
 
@@ -366,13 +366,24 @@ def cmd_openai_logout() -> int:
     return EXIT_SUCCESS
 
 
-def cmd_gupiao(gupiao: str, source: str, history_calendar_days: int, json_mode: bool) -> int:
+def cmd_gupiao(
+    gupiao: str,
+    source: str,
+    history_calendar_days: int,
+    holding_days: int,
+    budget_yuan: float | None,
+    config_path: str | None,
+    json_mode: bool,
+) -> int:
     from src.ashare.gupiao_yanjiu import fenxi_gupiao
 
     result = fenxi_gupiao(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
+        holding_days=holding_days,
+        budget_yuan=budget_yuan,
+        config_path=config_path,
     )
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
@@ -432,7 +443,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="auto",
         help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
     )
-    gupiao.add_argument("--history-calendar-days", type=int, default=540)
+    gupiao.add_argument("--history-calendar-days", type=int, default=1080)
+    gupiao.add_argument("--holding-days", type=int, choices=[1, 2, 3], default=2)
+    gupiao.add_argument("--budget-yuan", type=float, help="用于整手和最低佣金估算；不填写则使用成本配置默认资金")
+    gupiao.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     gupiao.add_argument("--json", action="store_true")
 
     bankuai = sub.add_parser("bankuai", help="从指定板块选股并预测 T+1/T+2/T+3")
@@ -466,7 +480,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "list":
         return cmd_list(args.limit)
     if args.command == "gupiao":
-        return cmd_gupiao(args.gupiao, args.source, args.history_calendar_days, args.json)
+        return cmd_gupiao(
+            args.gupiao,
+            args.source,
+            args.history_calendar_days,
+            args.holding_days,
+            args.budget_yuan,
+            args.config_path,
+            args.json,
+        )
     if args.command == "bankuai":
         return cmd_bankuai(
             args.bankuai,
