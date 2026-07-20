@@ -16,10 +16,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+from sklearn.isotonic import IsotonicRegression
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import brier_score_loss, mean_absolute_error
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
 
 from src.ashare.chengben_huadian import CostScenario
 from src.ashare.chengben_huadian import DEFAULT_CONFIG_PATH as COST_CONFIG_PATH
@@ -28,6 +32,7 @@ from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
     _completed_market_history,
     _json_value,
+    _latest_expected_market_date,
     _market_data_freshness,
     _round_optional,
     akshare_zhilian,
@@ -38,8 +43,12 @@ from src.ashare.gupiao_yanjiu import (
     shi_a_gu,
 )
 from src.ashare.shuju_yuan import _latest_tushare_daily, _limit_rate, _load_or_fetch_stock_basic, _tushare_pro
+from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
 from src.providers.llm import _ensure_dotenv
 from src.tools.path_utils import safe_run_dir
+
+
+BOARD_FEATURE_COLUMNS = FEATURE_COLUMNS + DAILY_FACTOR_FEATURE_COLUMNS
 
 
 def _board_name_column(frame: pd.DataFrame) -> str | None:
@@ -364,7 +373,7 @@ def _fetch_histories(
     max_stocks: int,
     pause_seconds: float,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str], list[str], list[str]]:
-    end = datetime.now().date()
+    end = _latest_expected_market_date().date()
     start = end - timedelta(days=history_calendar_days)
     histories: dict[str, pd.DataFrame] = {}
     names: dict[str, str] = {}
@@ -378,6 +387,7 @@ def _fetch_histories(
             start_date=start.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"),
             source=source,
+            use_cache=True,
         )
         if source == "auto" and result.adjustment == "raw_unadjusted":
             fallback = huoqu_rili_xingqing(
@@ -385,6 +395,7 @@ def _fetch_histories(
                 start_date=start.strftime("%Y%m%d"),
                 end_date=end.strftime("%Y%m%d"),
                 source="akshare",
+                use_cache=True,
             )
             if not fallback.data.empty and fallback.adjustment != "raw_unadjusted":
                 warnings.append(f"{code}: Tushare 复权不可用，已对该股票单独改用 AKShare 前复权日线")
@@ -404,7 +415,7 @@ def _fetch_histories(
             histories[code] = data
             names[code] = name
             warnings.extend(f"{code}: {item}" for item in result.warnings)
-        if pause_seconds > 0:
+        if pause_seconds > 0 and "warehouse" not in str(result.source):
             time.sleep(pause_seconds)
     return histories, names, errors, warnings
 
@@ -536,9 +547,33 @@ def _quality_label(value: float) -> str:
     return "low"
 
 
+class _TrainingQuantileClipper(BaseEstimator, TransformerMixin):
+    """Clip each feature to bounds learned only from the active training window."""
+
+    def __init__(self, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> None:
+        self.lower_quantile = lower_quantile
+        self.upper_quantile = upper_quantile
+
+    def fit(self, values: Any, _target: Any = None) -> "_TrainingQuantileClipper":
+        array = np.asarray(values, dtype=float)
+        self.lower_bounds_ = np.nanquantile(array, self.lower_quantile, axis=0)
+        self.upper_bounds_ = np.nanquantile(array, self.upper_quantile, axis=0)
+        return self
+
+    def transform(self, values: Any) -> np.ndarray:
+        array = np.asarray(values, dtype=float)
+        return np.minimum(np.maximum(array, self.lower_bounds_), self.upper_bounds_)
+
+
+def _feature_clipper(model_config: dict[str, Any]) -> _TrainingQuantileClipper:
+    quantiles = model_config.get("feature_winsor_quantiles", [0.01, 0.99])
+    return _TrainingQuantileClipper(float(quantiles[0]), float(quantiles[1]))
+
+
 def _build_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
     return Pipeline(
         [
+            ("training_window_winsorizer", _feature_clipper(model_config)),
             ("imputer", SimpleImputer(strategy="median")),
             (
                 "model",
@@ -554,6 +589,523 @@ def _build_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
             ),
         ]
     )
+
+
+def _build_linear_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
+    """Build the regularized linear component used to offset tree-model bias."""
+    return Pipeline(
+        [
+            ("training_window_winsorizer", _feature_clipper(model_config)),
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", RobustScaler(quantile_range=(10.0, 90.0))),
+            ("model", Ridge(alpha=float(model_config.get("ridge_alpha", 10.0)))),
+        ]
+    )
+
+
+def _fit_model_components(
+    *,
+    train_features: pd.DataFrame,
+    train_target: np.ndarray,
+    predict_features: pd.DataFrame,
+    model_config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    tree = _build_model_pipeline(model_config)
+    linear = _build_linear_model_pipeline(model_config)
+    tree.fit(train_features, train_target)
+    linear.fit(train_features, train_target)
+    return (
+        np.asarray(tree.predict(predict_features), dtype=float),
+        np.asarray(linear.predict(predict_features), dtype=float),
+    )
+
+
+def _select_stable_features(
+    frame: pd.DataFrame,
+    candidate_features: list[str],
+    target_column: str,
+    model_config: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Select factors using only the supplied training window."""
+    enabled = bool(model_config.get("factor_stability_enabled", True))
+    slices = max(2, int(model_config.get("factor_stability_slices", 3)))
+    minimum_valid_slices = max(1, int(model_config.get("factor_min_valid_slices", 2)))
+    minimum_sign_agreement = float(model_config.get("factor_min_sign_agreement", 0.67))
+    minimum_abs_ic = float(model_config.get("factor_min_abs_mean_rank_ic", 0.005))
+    minimum_features = max(1, int(model_config.get("factor_min_features", 12)))
+    coverage_threshold = float(model_config.get("min_feature_coverage", 0.20))
+    coverage = frame[candidate_features].notna().mean()
+    eligible = [
+        feature
+        for feature in candidate_features
+        if float(coverage.get(feature, 0.0)) >= coverage_threshold
+    ]
+    if not enabled:
+        return eligible, {
+            "status": "disabled",
+            "selected_features": eligible,
+            "selection_scope": "training_window_only",
+        }
+
+    dates = [pd.Timestamp(value) for value in sorted(pd.to_datetime(frame["trade_date"], errors="coerce").dropna().unique())]
+    date_slices = [list(values) for values in np.array_split(np.asarray(dates, dtype=object), slices) if len(values)]
+    diagnostics: dict[str, Any] = {}
+    ranked: list[tuple[tuple[float, float, float], str]] = []
+    selected: list[str] = []
+    for feature in eligible:
+        values: list[float] = []
+        for date_slice in date_slices:
+            part = frame[pd.to_datetime(frame["trade_date"]).isin(date_slice)]
+            x = pd.to_numeric(part[feature], errors="coerce")
+            y = pd.to_numeric(part[target_column], errors="coerce")
+            valid = x.notna() & y.notna()
+            if int(valid.sum()) < 30 or int(x[valid].nunique()) < 2 or int(y[valid].nunique()) < 2:
+                continue
+            correlation = float(spearmanr(x[valid], y[valid]).statistic)
+            if math.isfinite(correlation):
+                values.append(correlation)
+        mean_ic = float(np.mean(values)) if values else 0.0
+        sign_agreement = (
+            max(sum(value > 0 for value in values), sum(value < 0 for value in values)) / len(values)
+            if values
+            else 0.0
+        )
+        is_stable = bool(
+            len(values) >= minimum_valid_slices
+            and abs(mean_ic) >= minimum_abs_ic
+            and sign_agreement >= minimum_sign_agreement
+        )
+        diagnostics[feature] = {
+            "coverage": round(float(coverage[feature]), 4),
+            "slice_rank_ic": [round(value, 6) for value in values],
+            "mean_rank_ic": round(mean_ic, 6),
+            "sign_agreement": round(float(sign_agreement), 4),
+            "stable": is_stable,
+        }
+        ranked.append(((float(is_stable), abs(mean_ic), float(coverage[feature])), feature))
+        if is_stable:
+            selected.append(feature)
+    fallback_used = False
+    if len(selected) < min(minimum_features, len(eligible)):
+        fallback_used = True
+        for _, feature in sorted(ranked, reverse=True):
+            if feature not in selected:
+                selected.append(feature)
+            if len(selected) >= min(minimum_features, len(eligible)):
+                break
+    selected = [feature for feature in candidate_features if feature in set(selected)]
+    return selected, {
+        "status": "ok" if selected else "no_eligible_feature",
+        "selection_scope": "training_window_only",
+        "slices": int(len(date_slices)),
+        "candidate_count": int(len(candidate_features)),
+        "coverage_eligible_count": int(len(eligible)),
+        "selected_count": int(len(selected)),
+        "selected_features": selected,
+        "fallback_to_strongest_factors": fallback_used,
+        "thresholds": {
+            "minimum_coverage": coverage_threshold,
+            "minimum_valid_slices": minimum_valid_slices,
+            "minimum_sign_agreement": minimum_sign_agreement,
+            "minimum_abs_mean_rank_ic": minimum_abs_ic,
+            "minimum_features": minimum_features,
+        },
+        "factor_diagnostics": diagnostics,
+    }
+
+
+def _fit_direction_probabilities(
+    *,
+    train_features: pd.DataFrame,
+    train_target: np.ndarray,
+    predict_features: pd.DataFrame,
+    model_config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    labels = (np.asarray(train_target, dtype=float) > 0).astype(int)
+    if len(np.unique(labels)) < 2:
+        probability = float(labels[0]) if len(labels) else 0.5
+        return np.full(len(predict_features), probability, dtype=float), {
+            "status": "single_training_class",
+            "training_positive_rate": probability,
+        }
+    model = Pipeline(
+        [
+            ("training_window_winsorizer", _feature_clipper(model_config)),
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", RobustScaler(quantile_range=(10.0, 90.0))),
+            (
+                "model",
+                LogisticRegression(
+                    C=float(model_config.get("direction_logistic_c", 0.5)),
+                    max_iter=int(model_config.get("direction_logistic_max_iter", 500)),
+                    random_state=int(model_config.get("random_state", 42)),
+                ),
+            ),
+        ]
+    )
+    try:
+        model.fit(train_features, labels)
+        probability = np.asarray(model.predict_proba(predict_features)[:, 1], dtype=float)
+        return probability, {
+            "status": "ok",
+            "training_samples": int(len(labels)),
+            "training_positive_rate": round(float(np.mean(labels)), 6),
+            "model": "winsorized_robust_scaled_logistic_regression",
+        }
+    except Exception as exc:
+        probability = float(np.mean(labels))
+        return np.full(len(predict_features), probability, dtype=float), {
+            "status": "fallback_to_training_base_rate",
+            "training_samples": int(len(labels)),
+            "training_positive_rate": round(probability, 6),
+            "error": str(exc),
+        }
+
+
+def _probability_reliability_bins(actual: np.ndarray, probability: np.ndarray) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    labels = (np.asarray(actual, dtype=float) > 0).astype(int)
+    probabilities = np.asarray(probability, dtype=float)
+    for lower, upper in zip(np.linspace(0.0, 0.8, 5), np.linspace(0.2, 1.0, 5)):
+        mask = (probabilities >= lower) & (probabilities < upper if upper < 1.0 else probabilities <= upper)
+        if not mask.any():
+            continue
+        rows.append(
+            {
+                "probability_bin": [round(float(lower), 2), round(float(upper), 2)],
+                "samples": int(mask.sum()),
+                "mean_predicted_probability": round(float(np.mean(probabilities[mask])), 6),
+                "actual_positive_rate": round(float(np.mean(labels[mask])), 6),
+            }
+        )
+    return rows
+
+
+def _calibrate_direction_probability(
+    *,
+    actual: np.ndarray,
+    raw_probability: np.ndarray,
+    dates: pd.Series,
+    latest_raw_probability: float,
+    model_config: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, errors="coerce"),
+            "actual": np.asarray(actual, dtype=float),
+            "raw": np.asarray(raw_probability, dtype=float),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("date")
+    minimum_samples = int(model_config.get("probability_calibration_min_samples", 120))
+    evaluation_ratio = float(model_config.get("probability_calibration_evaluation_ratio", 0.30))
+    minimum_improvement = float(model_config.get("probability_calibration_min_brier_improvement", 0.0005))
+    raw_latest = float(np.clip(latest_raw_probability, 0.0, 1.0))
+    labels = (frame["actual"].to_numpy(dtype=float) > 0).astype(int)
+    raw = frame["raw"].to_numpy(dtype=float).clip(0.0, 1.0)
+    base = {
+        "status": "raw_probability_retained",
+        "method": "uncalibrated_logistic_probability",
+        "oos_samples": int(len(frame)),
+        "raw_oos_brier_score": round(float(brier_score_loss(labels, raw)), 6) if len(frame) else None,
+        "reliability_bins": _probability_reliability_bins(frame["actual"].to_numpy(dtype=float), raw),
+    }
+    if len(frame) < minimum_samples:
+        base["reason"] = f"样本外方向概率只有{len(frame)}个，少于校准门槛{minimum_samples}"
+        return raw_latest, base
+    split = max(minimum_samples // 2, int(len(frame) * (1.0 - evaluation_ratio)))
+    split = min(split, len(frame) - max(30, minimum_samples // 4))
+    train_labels, evaluation_labels = labels[:split], labels[split:]
+    if len(np.unique(train_labels)) < 2 or len(np.unique(evaluation_labels)) < 2:
+        base["reason"] = "时间校准窗或后段评估窗只有单一方向类别"
+        return raw_latest, base
+    calibration = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    calibration.fit(raw[:split], train_labels)
+    evaluation_calibrated = np.asarray(calibration.predict(raw[split:]), dtype=float).clip(0.0, 1.0)
+    raw_brier = float(brier_score_loss(evaluation_labels, raw[split:]))
+    calibrated_brier = float(brier_score_loss(evaluation_labels, evaluation_calibrated))
+    base["time_ordered_evaluation"] = {
+        "calibration_samples": int(split),
+        "evaluation_samples": int(len(frame) - split),
+        "raw_brier_score": round(raw_brier, 6),
+        "isotonic_brier_score": round(calibrated_brier, 6),
+        "improvement": round(raw_brier - calibrated_brier, 6),
+    }
+    if raw_brier - calibrated_brier < minimum_improvement:
+        base["reason"] = "保序校准未在后段时间窗稳定改善Brier分数"
+        return raw_latest, base
+    production_calibration = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    production_calibration.fit(raw, labels)
+    calibrated_latest = float(production_calibration.predict([raw_latest])[0])
+    calibrated_oos = np.asarray(production_calibration.predict(raw), dtype=float).clip(0.0, 1.0)
+    return calibrated_latest, {
+        **base,
+        "status": "calibrated",
+        "method": "time_ordered_isotonic_then_refit_on_all_oos",
+        "latest_raw_probability": round(raw_latest, 6),
+        "latest_calibrated_probability": round(calibrated_latest, 6),
+        "reliability_bins": _probability_reliability_bins(
+            frame["actual"].to_numpy(dtype=float),
+            calibrated_oos,
+        ),
+    }
+
+
+def _rolling_conformal_interval(
+    *,
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    dates: pd.Series,
+    latest_prediction: float,
+    model_config: dict[str, Any],
+) -> tuple[list[float] | None, dict[str, Any]]:
+    coverage = float(model_config.get("conformal_coverage", 0.80))
+    minimum_samples = int(model_config.get("conformal_min_samples", 80))
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, errors="coerce"),
+            "actual": np.asarray(actual, dtype=float),
+            "predicted": np.asarray(predicted, dtype=float),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("date")
+    residuals = np.abs(frame["actual"].to_numpy(dtype=float) - frame["predicted"].to_numpy(dtype=float))
+    if len(residuals) < minimum_samples:
+        return None, {
+            "status": "insufficient_oos_samples",
+            "samples": int(len(residuals)),
+            "minimum_samples": minimum_samples,
+            "target_coverage": coverage,
+        }
+
+    def radius(values: np.ndarray) -> float:
+        adjusted = min(1.0, math.ceil((len(values) + 1) * coverage) / len(values))
+        return float(np.quantile(values, adjusted, method="higher"))
+
+    hits: list[bool] = []
+    for index in range(minimum_samples, len(frame)):
+        current_radius = radius(residuals[:index])
+        hits.append(bool(residuals[index] <= current_radius))
+    latest_radius = radius(residuals)
+    interval = [float(latest_prediction - latest_radius), float(latest_prediction + latest_radius)]
+    return interval, {
+        "status": "ok",
+        "method": "rolling_split_conformal_absolute_residual",
+        "target_coverage": coverage,
+        "calibration_samples": int(len(residuals)),
+        "rolling_evaluation_samples": int(len(hits)),
+        "rolling_empirical_coverage": round(float(np.mean(hits)), 6) if hits else None,
+        "latest_radius": round(latest_radius, 6),
+    }
+
+
+def _fold_stability(folds: list[dict[str, Any]]) -> dict[str, Any]:
+    successful = [fold for fold in folds if fold.get("status") == "ok"]
+    if not successful:
+        return {"status": "unavailable", "folds": 0}
+    result: dict[str, Any] = {
+        "status": "ok",
+        "folds": int(len(successful)),
+        "passed_rate": round(float(np.mean([bool(fold.get("fold_passed")) for fold in successful])), 6),
+    }
+    for field in ["direction_accuracy", "skill_vs_median_baseline", "mean_daily_rank_ic"]:
+        values = np.asarray([float(fold[field]) for fold in successful if fold.get(field) is not None], dtype=float)
+        result[field] = {
+            "mean": round(float(np.mean(values)), 6) if len(values) else None,
+            "std": round(float(np.std(values, ddof=1)), 6) if len(values) > 1 else 0.0 if len(values) else None,
+            "minimum": round(float(np.min(values)), 6) if len(values) else None,
+            "maximum": round(float(np.max(values)), 6) if len(values) else None,
+        }
+    return result
+
+
+def _regime_stability(
+    oof: pd.DataFrame,
+    *,
+    regime_column: str,
+) -> dict[str, Any]:
+    if regime_column not in oof.columns:
+        return {"status": "unavailable", "reason": f"缺少{regime_column}"}
+    frame = oof.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["actual", "predicted", regime_column]
+    )
+    if len(frame) < 90 or frame[regime_column].nunique() < 3:
+        return {"status": "unavailable", "samples": int(len(frame))}
+    lower, upper = frame[regime_column].quantile([1 / 3, 2 / 3]).tolist()
+    groups = {
+        "weak_market": frame[frame[regime_column] <= lower],
+        "sideways_market": frame[(frame[regime_column] > lower) & (frame[regime_column] < upper)],
+        "strong_market": frame[frame[regime_column] >= upper],
+    }
+    metrics: dict[str, Any] = {}
+    for name, group in groups.items():
+        actual = group["actual"].to_numpy(dtype=float)
+        predicted = group["predicted"].to_numpy(dtype=float)
+        metrics[name] = {
+            "samples": int(len(group)),
+            "mae": round(float(mean_absolute_error(actual, predicted)), 6) if len(group) else None,
+            "direction_accuracy": round(float(np.mean((actual > 0) == (predicted > 0))), 6) if len(group) else None,
+            "mean_actual_return": round(float(np.mean(actual)), 6) if len(group) else None,
+            "mean_predicted_return": round(float(np.mean(predicted)), 6) if len(group) else None,
+        }
+    return {
+        "status": "ok",
+        "regime_factor": regime_column,
+        "tercile_cutoffs": [round(float(lower), 6), round(float(upper), 6)],
+        "regimes": metrics,
+    }
+
+
+def _experiment_fingerprint(
+    *,
+    feature_columns: list[str],
+    target_definition: str,
+    split_method: str,
+    model_config: dict[str, Any],
+) -> str:
+    payload = {
+        "contract": "daily_k_quant_research_v3",
+        "features": feature_columns,
+        "target": target_definition,
+        "split": split_method,
+        "model_config": model_config,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _select_ensemble_weight(
+    actual: np.ndarray,
+    tree_prediction: np.ndarray,
+    linear_prediction: np.ndarray,
+    model_config: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Select a convex tree weight using only already out-of-sample observations."""
+    enabled = bool(model_config.get("ensemble_enabled", True))
+    default_weight = float(model_config.get("ensemble_default_tree_weight", 0.75))
+    minimum_samples = int(model_config.get("ensemble_min_calibration_samples", 80))
+    arrays = [np.asarray(value, dtype=float) for value in (actual, tree_prediction, linear_prediction)]
+    finite = np.isfinite(arrays[0]) & np.isfinite(arrays[1]) & np.isfinite(arrays[2])
+    clean_actual, clean_tree, clean_linear = (value[finite] for value in arrays)
+    if not enabled:
+        return 1.0, {
+            "status": "disabled",
+            "selection_method": "tree_only_by_configuration",
+            "calibration_samples": int(len(clean_actual)),
+            "tree_weight": 1.0,
+            "linear_weight": 0.0,
+        }
+    if len(clean_actual) < minimum_samples:
+        return default_weight, {
+            "status": "insufficient_oos_calibration_samples",
+            "selection_method": "configured_default_until_enough_oos_samples",
+            "calibration_samples": int(len(clean_actual)),
+            "minimum_calibration_samples": minimum_samples,
+            "tree_weight": round(default_weight, 4),
+            "linear_weight": round(1.0 - default_weight, 4),
+        }
+
+    raw_grid = model_config.get("ensemble_tree_weight_grid", [0.0, 0.25, 0.5, 0.75, 1.0])
+    grid = sorted({float(value) for value in raw_grid if 0.0 <= float(value) <= 1.0})
+    if not grid:
+        grid = [default_weight]
+    candidates: list[tuple[float, float, np.ndarray]] = []
+    for tree_weight in grid:
+        blended = tree_weight * clean_tree + (1.0 - tree_weight) * clean_linear
+        candidates.append((float(mean_absolute_error(clean_actual, blended)), tree_weight, blended))
+    selected_mae, selected_weight, selected_prediction = min(
+        candidates,
+        key=lambda item: (item[0], abs(item[1] - default_weight)),
+    )
+    return selected_weight, {
+        "status": "selected_from_oos_predictions",
+        "selection_method": "minimum_mae_on_prior_oos_grid",
+        "calibration_samples": int(len(clean_actual)),
+        "tree_weight": round(float(selected_weight), 4),
+        "linear_weight": round(float(1.0 - selected_weight), 4),
+        "tree_mae": round(float(mean_absolute_error(clean_actual, clean_tree)), 6),
+        "linear_mae": round(float(mean_absolute_error(clean_actual, clean_linear)), 6),
+        "ensemble_mae": round(float(selected_mae), 6),
+        "ensemble_direction_accuracy": round(
+            float(np.mean((selected_prediction > 0) == (clean_actual > 0))),
+            6,
+        ),
+        "candidate_tree_weights": grid,
+    }
+
+
+def _blend_component_predictions(
+    tree_prediction: np.ndarray,
+    linear_prediction: np.ndarray,
+    tree_weight: float,
+) -> np.ndarray:
+    return tree_weight * np.asarray(tree_prediction, dtype=float) + (
+        1.0 - tree_weight
+    ) * np.asarray(linear_prediction, dtype=float)
+
+
+def _nested_training_ensemble_weight(
+    *,
+    train: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    target_date_column: str,
+    clip_low: float,
+    clip_high: float,
+    model_config: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Calibrate a holdout-safe ensemble weight on the tail of the training period."""
+    dates = [pd.Timestamp(value) for value in sorted(train["trade_date"].dropna().unique())]
+    ratio = float(model_config.get("ensemble_calibration_ratio", 0.15))
+    minimum_dates = int(model_config.get("ensemble_min_calibration_dates", 20))
+    if len(dates) < minimum_dates * 2:
+        return _select_ensemble_weight(np.array([]), np.array([]), np.array([]), model_config)
+    calibration_dates = max(minimum_dates, int(len(dates) * ratio))
+    calibration_dates = min(calibration_dates, len(dates) - minimum_dates)
+    cutoff = dates[-calibration_dates]
+    inner_train = train[
+        (train["trade_date"] < cutoff)
+        & (pd.to_datetime(train[target_date_column]) < cutoff)
+    ]
+    calibration = train[train["trade_date"] >= cutoff]
+    minimum_samples = int(model_config.get("ensemble_min_calibration_samples", 80))
+    if len(inner_train) < minimum_samples or len(calibration) < minimum_samples:
+        weight, diagnostics = _select_ensemble_weight(
+            np.array([]), np.array([]), np.array([]), model_config
+        )
+        diagnostics.update(
+            {
+                "nested_train_samples": int(len(inner_train)),
+                "nested_calibration_samples": int(len(calibration)),
+            }
+        )
+        return weight, diagnostics
+    inner_target = np.clip(
+        inner_train[target_column].astype(float).to_numpy(),
+        clip_low,
+        clip_high,
+    )
+    tree_prediction, linear_prediction = _fit_model_components(
+        train_features=inner_train[feature_columns],
+        train_target=inner_target,
+        predict_features=calibration[feature_columns],
+        model_config=model_config,
+    )
+    tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
+    linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
+    weight, diagnostics = _select_ensemble_weight(
+        calibration[target_column].astype(float).to_numpy(),
+        tree_prediction,
+        linear_prediction,
+        model_config,
+    )
+    diagnostics.update(
+        {
+            "selection_scope": "nested_tail_of_outer_training_only",
+            "calibration_start": cutoff.strftime("%Y-%m-%d"),
+            "nested_train_samples": int(len(inner_train)),
+            "nested_calibration_samples": int(len(calibration)),
+        }
+    )
+    return weight, diagnostics
 
 
 def _load_cost_assumption(scenario_name: str) -> tuple[float, CostScenario, str, list[str]]:
@@ -690,17 +1242,33 @@ def xunlian_yuce_moxing(
     config: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Validate chronologically, then refit each accepted candidate model on all labels."""
+    panel = panel.copy()
+    latest = latest.copy()
+    for column in BOARD_FEATURE_COLUMNS:
+        if column not in panel.columns:
+            panel[column] = np.nan
+        if column not in latest.columns:
+            latest[column] = np.nan
     model_config = config["moxing"]
     horizons = [int(value) for value in model_config["horizons"]]
+    minimum_coverage = float(model_config.get("min_feature_coverage", 0.20))
+    coverage = panel[BOARD_FEATURE_COLUMNS].notna().mean()
+    feature_columns = [
+        column
+        for column in BOARD_FEATURE_COLUMNS
+        if float(coverage.get(column, 0.0)) >= minimum_coverage
+    ]
+    if not feature_columns:
+        raise RuntimeError("板块模型没有达到覆盖率门槛的日频特征")
     dates = sorted(pd.to_datetime(panel["trade_date"].dropna().unique()))
     if len(dates) < 100:
         raise RuntimeError(f"可用交易日期只有 {len(dates)} 个，无法进行可靠的时序验证")
     validation_ratio = float(model_config.get("validation_ratio", 0.2))
     cutoff_index = max(60, min(len(dates) - 20, int(len(dates) * (1.0 - validation_ratio))))
     cutoff = pd.Timestamp(dates[cutoff_index])
-    predictions = latest[["ts_code", "name", "trade_date", "close"] + FEATURE_COLUMNS].copy()
+    predictions = latest[["ts_code", "name", "trade_date", "close"] + feature_columns].copy()
     validation: dict[str, Any] = {
-        "split_method": "chronological_purged_holdout",
+        "split_method": "chronological_purged_holdout_with_three_oos_stability_subwindows",
         "cutoff_date": cutoff.strftime("%Y-%m-%d"),
         "signal_and_execution": {
             "signal": "T日收盘后",
@@ -709,8 +1277,10 @@ def xunlian_yuce_moxing(
             "T+2": "入场后第2个可卖出交易日收盘",
             "T+3": "入场后第3个可卖出交易日收盘",
         },
-        "feature_count": len(FEATURE_COLUMNS),
-        "features": list(FEATURE_COLUMNS),
+        "feature_count": len(feature_columns),
+        "features": list(feature_columns),
+        "feature_coverage": {column: round(float(coverage[column]), 4) for column in feature_columns},
+        "feature_preprocessing": "训练窗口内完成因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放，验证和最新数据不参与拟合",
         "horizons": {},
     }
 
@@ -746,10 +1316,43 @@ def xunlian_yuce_moxing(
         clip_high = float(np.nanquantile(y_train_raw, upper_q))
         y_train = np.clip(y_train_raw, clip_low, clip_high)
         y_validation = validation_frame[target_column].astype(float).to_numpy()
-        pipeline = _build_model_pipeline(model_config)
-        pipeline.fit(train[FEATURE_COLUMNS], y_train)
+        validation_features, factor_selection = _select_stable_features(
+            train,
+            feature_columns,
+            target_column,
+            model_config,
+        )
+        if not validation_features:
+            raise RuntimeError(f"T+{horizon} 训练窗口没有稳定可用因子")
+        validation_tree_weight, validation_ensemble = _nested_training_ensemble_weight(
+            train=train,
+            feature_columns=validation_features,
+            target_column=target_column,
+            target_date_column=target_date_column,
+            clip_low=clip_low,
+            clip_high=clip_high,
+            model_config=model_config,
+        )
+        validation_tree_prediction, validation_linear_prediction = _fit_model_components(
+            train_features=train[validation_features],
+            train_target=y_train,
+            predict_features=validation_frame[validation_features],
+            model_config=model_config,
+        )
+        validation_direction_probability, validation_direction_model = _fit_direction_probabilities(
+            train_features=train[validation_features],
+            train_target=y_train_raw,
+            predict_features=validation_frame[validation_features],
+            model_config=model_config,
+        )
+        validation_tree_prediction = np.clip(validation_tree_prediction, clip_low, clip_high)
+        validation_linear_prediction = np.clip(validation_linear_prediction, clip_low, clip_high)
         validation_prediction = np.clip(
-            pipeline.predict(validation_frame[FEATURE_COLUMNS]),
+            _blend_component_predictions(
+                validation_tree_prediction,
+                validation_linear_prediction,
+                validation_tree_weight,
+            ),
             clip_low,
             clip_high,
         )
@@ -799,14 +1402,121 @@ def xunlian_yuce_moxing(
         y_full_raw = usable[target_column].astype(float).to_numpy()
         final_clip_low = float(np.nanquantile(y_full_raw, lower_q))
         final_clip_high = float(np.nanquantile(y_full_raw, upper_q))
-        final_pipeline = _build_model_pipeline(model_config)
-        final_pipeline.fit(usable[FEATURE_COLUMNS], np.clip(y_full_raw, final_clip_low, final_clip_high))
+        production_features, production_factor_selection = _select_stable_features(
+            usable,
+            feature_columns,
+            target_column,
+            model_config,
+        )
+        if not production_features:
+            raise RuntimeError(f"T+{horizon} 全量训练窗口没有稳定可用因子")
+        production_tree_weight, production_ensemble = _select_ensemble_weight(
+            y_validation,
+            validation_tree_prediction,
+            validation_linear_prediction,
+            model_config,
+        )
+        production_tree_prediction, production_linear_prediction = _fit_model_components(
+            train_features=usable[production_features],
+            train_target=np.clip(y_full_raw, final_clip_low, final_clip_high),
+            predict_features=latest[production_features],
+            model_config=model_config,
+        )
+        production_direction_probability, production_direction_model = _fit_direction_probabilities(
+            train_features=usable[production_features],
+            train_target=y_full_raw,
+            predict_features=latest[production_features],
+            model_config=model_config,
+        )
+        production_tree_prediction = np.clip(
+            production_tree_prediction, final_clip_low, final_clip_high
+        )
+        production_linear_prediction = np.clip(
+            production_linear_prediction, final_clip_low, final_clip_high
+        )
         latest_prediction = np.clip(
-            final_pipeline.predict(latest[FEATURE_COLUMNS]),
+            _blend_component_predictions(
+                production_tree_prediction,
+                production_linear_prediction,
+                production_tree_weight,
+            ),
             final_clip_low,
             final_clip_high,
         )
         predictions[f"pred_t{horizon}"] = latest_prediction
+        calibrated_probabilities: list[float] = []
+        probability_calibration: dict[str, Any] = {}
+        conformal_intervals: list[list[float] | None] = []
+        conformal_diagnostics: dict[str, Any] = {}
+        for latest_index, (raw_probability, point_prediction) in enumerate(
+            zip(production_direction_probability, latest_prediction)
+        ):
+            calibrated, calibration_meta = _calibrate_direction_probability(
+                actual=y_validation,
+                raw_probability=validation_direction_probability,
+                dates=validation_frame["trade_date"],
+                latest_raw_probability=float(raw_probability),
+                model_config=model_config,
+            )
+            interval, interval_meta = _rolling_conformal_interval(
+                actual=y_validation,
+                predicted=validation_prediction,
+                dates=validation_frame["trade_date"],
+                latest_prediction=float(point_prediction),
+                model_config=model_config,
+            )
+            calibrated_probabilities.append(float(calibrated))
+            conformal_intervals.append(interval)
+            if latest_index == 0:
+                probability_calibration = calibration_meta
+                conformal_diagnostics = interval_meta
+        predictions[f"direction_prob_t{horizon}"] = calibrated_probabilities
+        predictions[f"conformal_low_t{horizon}"] = [
+            interval[0] if interval else np.nan for interval in conformal_intervals
+        ]
+        predictions[f"conformal_high_t{horizon}"] = [
+            interval[1] if interval else np.nan for interval in conformal_intervals
+        ]
+
+        validation_dates = [pd.Timestamp(value) for value in sorted(validation_frame["trade_date"].unique())]
+        temporal_folds: list[dict[str, Any]] = []
+        for fold_number, date_slice in enumerate(np.array_split(np.asarray(validation_dates, dtype=object), 3), start=1):
+            if not len(date_slice):
+                continue
+            mask = validation_frame["trade_date"].isin(list(date_slice)).to_numpy()
+            fold_actual = y_validation[mask]
+            fold_prediction = validation_prediction[mask]
+            if not len(fold_actual):
+                continue
+            fold_baseline = np.full(len(fold_actual), baseline_value)
+            fold_baseline_mae = float(mean_absolute_error(fold_actual, fold_baseline))
+            fold_mae = float(mean_absolute_error(fold_actual, fold_prediction))
+            fold_skill = 1.0 - fold_mae / fold_baseline_mae if fold_baseline_mae > 0 else 0.0
+            fold_direction = float(np.mean((fold_prediction > 0) == (fold_actual > 0)))
+            fold_rank_ic, _ = _daily_rank_ic(
+                validation_frame.loc[mask, "trade_date"],
+                fold_actual,
+                fold_prediction,
+            )
+            temporal_folds.append(
+                {
+                    "fold": fold_number,
+                    "status": "ok",
+                    "fold_passed": bool(fold_direction >= 0.50 and fold_skill > 0 and fold_rank_ic >= 0),
+                    "direction_accuracy": fold_direction,
+                    "skill_vs_median_baseline": fold_skill,
+                    "mean_daily_rank_ic": fold_rank_ic,
+                }
+            )
+        regime_column = (
+            "market_csi300_ret_20"
+            if "market_csi300_ret_20" in validation_frame.columns
+            and validation_frame["market_csi300_ret_20"].notna().any()
+            else "universe_mean_ret_20"
+        )
+        regime_oof = validation_frame[["trade_date", regime_column]].copy()
+        regime_oof["actual"] = y_validation
+        regime_oof["predicted"] = validation_prediction
         validation["horizons"][f"T+{horizon}"] = {
             "train_samples": int(len(train)),
             "validation_samples": int(len(validation_frame)),
@@ -818,11 +1528,48 @@ def xunlian_yuce_moxing(
             "direction_accuracy": round(direction_accuracy, 6),
             "mean_daily_rank_ic": round(rank_ic, 6),
             "rank_ic_days": int(rank_ic_days),
+            "factor_selection": factor_selection,
+            "production_factor_selection": production_factor_selection,
+            "experiment_fingerprint": _experiment_fingerprint(
+                feature_columns=production_features,
+                target_definition=f"next_session_open_to_{horizon}th_sellable_close_return",
+                split_method="chronological_purged_holdout_with_three_oos_stability_subwindows",
+                model_config=model_config,
+            ),
+            "direction_model": {
+                **validation_direction_model,
+                "brier_score": round(
+                    float(brier_score_loss((y_validation > 0).astype(int), validation_direction_probability)),
+                    6,
+                ),
+                "classification_accuracy": round(
+                    float(np.mean((validation_direction_probability >= 0.5) == (y_validation > 0))),
+                    6,
+                ),
+                "production": production_direction_model,
+            },
+            "direction_probability_calibration": probability_calibration,
+            "conformal_diagnostics": conformal_diagnostics,
+            "fold_stability": _fold_stability(temporal_folds),
+            "market_regime_stability": _regime_stability(regime_oof, regime_column=regime_column),
             "prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
             "final_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)],
             "final_train_samples": int(len(usable)),
             "final_training_end": usable[target_date_column].max().strftime("%Y-%m-%d"),
             "retrained_on_all_labeled_data": True,
+            "model_ensemble": {
+                "components": ["HistGradientBoostingRegressor", "Ridge"],
+                "outer_validation_weight": validation_ensemble,
+                "production_weight": production_ensemble,
+                "outer_validation_mean_absolute_disagreement": round(
+                    float(np.mean(np.abs(validation_tree_prediction - validation_linear_prediction))),
+                    6,
+                ),
+                "latest_component_predictions": {
+                    "tree": [round(float(value), 6) for value in production_tree_prediction],
+                    "linear": [round(float(value), 6) for value in production_linear_prediction],
+                },
+            },
             **top_n_metrics,
             "quality_score": round(quality, 4),
             "quality_label": _quality_label(quality),
@@ -941,6 +1688,9 @@ def _prediction_rows(
             gross = float(row[f"pred_t{horizon}"])
             net = _apply_cost(gross, stock_cost_rate) if stock_cost_rate is not None else None
             quality = validation["horizons"][f"T+{horizon}"]
+            direction_probability = _round_optional(row.get(f"direction_prob_t{horizon}"), 6)
+            conformal_low = _round_optional(row.get(f"conformal_low_t{horizon}"), 6)
+            conformal_high = _round_optional(row.get(f"conformal_high_t{horizon}"), 6)
             # The reference path starts at the signal close.  The first
             # sellable exit spans the T+1 entry session and T+2 exit session,
             # hence horizon + 1 daily-limit steps.
@@ -955,6 +1705,13 @@ def _prediction_rows(
                 "entry_to_exit_gross_return_pct": round(gross * 100.0, 3),
                 "estimated_net_return_after_cost": round(net, 6) if net is not None else None,
                 "estimated_net_return_after_cost_pct": round(net * 100.0, 3) if net is not None else None,
+                "direction_model_positive_probability": direction_probability,
+                "direction_probability_method": (
+                    quality.get("direction_probability_calibration") or {}
+                ).get("method"),
+                "conformal_return_interval_80": [conformal_low, conformal_high]
+                if conformal_low is not None and conformal_high is not None
+                else None,
                 "predicted_close": None,
                 "predicted_close_unavailable_reason": "实际T+1开盘价尚未知，不能把模型收益可靠换算成目标收盘价",
                 "signal_close_reference_price": _round_price_tick(close),
@@ -1162,12 +1919,40 @@ def bankuai_xuangu(
         }
 
     data_config = config["shuju"]
+    history_calendar_days = int(data_config.get("history_calendar_days", 1080))
+    base_max_board_stocks = int(data_config.get("max_board_stocks", 24))
+    applied_max_board_stocks = base_max_board_stocks
+    warehouse_range: dict[str, Any] = {
+        "status": "not_checked",
+        "ready": False,
+        "coverage": 0.0,
+    }
+    try:
+        from src.ashare.riping_cangku import warehouse_range_coverage
+
+        warehouse_end = _latest_expected_market_date()
+        warehouse_range = warehouse_range_coverage(
+            start_date=(warehouse_end - timedelta(days=history_calendar_days)).strftime("%Y%m%d"),
+            end_date=warehouse_end.strftime("%Y%m%d"),
+        )
+        if warehouse_range.get("ready"):
+            applied_max_board_stocks = max(
+                applied_max_board_stocks,
+                int(data_config.get("warehouse_max_board_stocks", 80)),
+            )
+    except Exception as exc:
+        warehouse_range = {
+            "status": "check_failed",
+            "ready": False,
+            "coverage": 0.0,
+            "error": str(exc),
+        }
     histories, names, fetch_errors, fetch_warnings = _fetch_histories(
         filtered,
         source=source,
-        history_calendar_days=int(data_config.get("history_calendar_days", 540)),
+        history_calendar_days=history_calendar_days,
         minimum_rows=int(data_config.get("minimum_history_rows", 120)),
-        max_stocks=int(data_config.get("max_board_stocks", 20)),
+        max_stocks=applied_max_board_stocks,
         pause_seconds=float(data_config.get("request_pause_seconds", 0.15)),
     )
     if not histories:
@@ -1182,6 +1967,12 @@ def bankuai_xuangu(
     panel = goujian_moxing_shuju(histories, names, horizons)
     if panel.empty:
         return {"status": "error", "error": "无法构造模型样本", "fetch_errors": fetch_errors}
+    panel, daily_factor_meta = enrich_daily_factor_panel(
+        panel,
+        source=source,
+        include_historical_valuation=True,
+    )
+    fetch_warnings.extend(str(value) for value in daily_factor_meta.get("warnings", []))
     latest = (
         panel.sort_values("trade_date")
         .groupby("ts_code", as_index=False)
@@ -1334,6 +2125,16 @@ def bankuai_xuangu(
         "data_provenance": {
             "board_constituents": board_meta["constituent_source"],
             **_source_summary(histories),
+            "daily_factors": daily_factor_meta,
+            "warehouse_panel_expansion": {
+                "configured_limit_without_warehouse": base_max_board_stocks,
+                "applied_limit": applied_max_board_stocks,
+                "range": warehouse_range,
+                "expanded": bool(
+                    warehouse_range.get("ready")
+                    and applied_max_board_stocks > base_max_board_stocks
+                ),
+            },
             "source_policy": f"行业成分优先 Tushare，免费降级依次为新浪和东方财富；{daily_source_policy}",
             "config_path": resolved_config,
         },
@@ -1344,10 +2145,12 @@ def bankuai_xuangu(
         "warnings": list(dict.fromkeys(board_meta.get("warnings", []) + fetch_warnings))[:40],
         "fetch_errors": fetch_errors[:30],
         "methodology": {
-            "model": "HistGradientBoostingRegressor，T+1/T+2/T+3 分别训练",
+            "model": "日K因子的HistGradientBoostingRegressor + 稳健缩放Ridge小型集成，T+1/T+2/T+3分别训练",
+            "ensemble_weighting": "验证预测只使用训练期尾部校准的权重；生产权重再由完整样本外预测选择，禁止用同一外层验证真实值反向优化其自身预测",
             "validation": "按交易日期顺序切分并清除跨越切分点样本；同时要求Top-N扣成本收益为正且优于当日候选池；验证后用全部已知标签重训",
             "target": "T日收盘后生成信号，下一市场交易日开盘入场；预测入场后第1/2/3个可卖出交易日收盘相对入场开盘的收益",
             "calendar_alignment": "入口和出口按板块共同市场日期定位；股票在必需日期停牌或缺行情时不生成该样本",
+            "daily_factor_scope": "同日历史估值精确匹配，叠加上证/沪深300/中证1000日K、板块宽度、相对强弱和流通市值中性化因子",
             "ranking": "只对通过验证的周期归一化加权成本后预测收益，再除以持有期波动率、ATR占比和1%下限中的最大值",
             "survivorship_bias": "模型使用当前板块成分回看历史，验证结果仍可能含当前成分股带来的幸存者偏差",
         },
@@ -1357,7 +2160,7 @@ def bankuai_xuangu(
             "max_holding": "最多输出入场后第3个可卖出交易日；系统不会输出更远预测",
             "price_limits": "不输出目标收盘价；仅展示模型未约束参考价和从信号收盘逐日推导、按0.01元取整的合法价格区间，实际T+1开盘确定后必须重算",
         },
-        "scope_note": "预测是带有验证指标和成本假设的研究结果，不是价格承诺，也不回答用户应采取何种交易动作。验证质量低只表示证据较弱。",
+        "scope_note": "产品永久只做日K分析与三交易日内预测；结果带验证指标和成本假设，不是价格承诺。验证质量低只表示证据较弱。",
         "execution_policy": "analysis_only：只输出分析候选和预测，永不连接券商、永不提交订单、永不自动交易。",
     }
     if not validated_candidates:

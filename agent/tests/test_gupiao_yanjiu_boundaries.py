@@ -31,6 +31,16 @@ def _flat_history(rows: int = 30) -> pd.DataFrame:
     )
 
 
+def test_quant_config_hard_rejects_minute_bars(tmp_path: Path) -> None:
+    config = json.loads(gupiao_yanjiu.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    config["shuju"]["minute_bars_enabled"] = True
+    path = tmp_path / "minute_config.json"
+    path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="分钟K不属于产品范围"):
+        gupiao_yanjiu.jiazai_lianghua_peizhi(str(path))
+
+
 def test_short_history_keeps_unformed_ma60_and_macd_neutral() -> None:
     summary = gupiao_yanjiu.zongjie_jishu(_flat_history())
 

@@ -342,6 +342,9 @@ def cmd_settings() -> int:
     _ensure_dotenv()
     provider = _provider_name()
     oauth_status = codex_auth_status()
+    from src.ashare.riping_cangku import daily_warehouse_status
+
+    warehouse = daily_warehouse_status()
 
     console.print(
         Panel(
@@ -355,6 +358,11 @@ def cmd_settings() -> int:
                     f"OpenAI API key: {'set' if os.getenv('OPENAI_API_KEY') else 'not set'}",
                     f"ChatGPT OAuth: {'ready' if oauth_status['configured'] else 'not logged in'}",
                     f"Tushare token: {'set' if os.getenv('TUSHARE_TOKEN') else 'not set'}",
+                    (
+                        f"Daily warehouse: {warehouse.get('status')} | "
+                        f"complete sessions: {warehouse.get('complete_sessions', 0)} | "
+                        f"full-market ready: {warehouse.get('full_market_training_ready', False)}"
+                    ),
                 ]
             ),
             title="Settings",
@@ -492,6 +500,47 @@ def cmd_bankuai(
     return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
 
 
+def cmd_warehouse_status(*, json_mode: bool = False) -> int:
+    from src.ashare.riping_cangku import daily_warehouse_status
+
+    result = daily_warehouse_status()
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+    return EXIT_SUCCESS
+
+
+def cmd_warehouse_sync(
+    *,
+    start_date: str,
+    end_date: str | None,
+    max_sessions: int,
+    newest_first: bool,
+    force: bool,
+    pause_seconds: float,
+    json_mode: bool,
+) -> int:
+    from src.ashare.riping_cangku import sync_daily_warehouse
+
+    try:
+        result = sync_daily_warehouse(
+            start_date=start_date,
+            end_date=end_date,
+            max_sessions=max_sessions,
+            newest_first=newest_first,
+            force=force,
+            pause_seconds=pause_seconds,
+        )
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A 股 T+3 量化研究员")
     sub = parser.add_subparsers(dest="command")
@@ -519,7 +568,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="auto",
         help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
     )
-    gupiao.add_argument("--history-calendar-days", type=int, default=1080)
+    gupiao.add_argument("--history-calendar-days", type=int, default=1440)
     gupiao.add_argument("--holding-days", type=int, choices=[1, 2, 3], default=2)
     gupiao.add_argument("--budget-yuan", type=float, help="用于整手和最低佣金估算；不填写则使用成本配置默认资金")
     gupiao.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
@@ -533,7 +582,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="auto",
         help="股票名称解析和日线行情来源",
     )
-    yuce.add_argument("--history-calendar-days", type=int, default=1080)
+    yuce.add_argument("--history-calendar-days", type=int, default=1440)
     yuce.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     yuce.add_argument("--json", action="store_true")
 
@@ -551,6 +600,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     bankuai.add_argument("--config", dest="config_path", help="Path to lianghua_peizhi.json")
     bankuai.add_argument("--json", action="store_true")
+
+    warehouse = sub.add_parser("warehouse", help="管理全A股日频PIT仓库")
+    warehouse_sub = warehouse.add_subparsers(dest="warehouse_command", required=True)
+    warehouse_status = warehouse_sub.add_parser("status", help="查看日频仓库覆盖范围和可用状态")
+    warehouse_status.add_argument("--json", action="store_true")
+    warehouse_sync = warehouse_sub.add_parser("sync", help="按交易日增量同步全市场日频数据")
+    warehouse_sync.add_argument("--start", dest="start_date", required=True, help="开始日期，例如2022-01-01")
+    warehouse_sync.add_argument("--end", dest="end_date", help="结束日期；默认今天")
+    warehouse_sync.add_argument(
+        "--max-sessions",
+        type=int,
+        default=20,
+        help="本次最多处理多少个待同步交易日；默认20，0表示全部",
+    )
+    warehouse_sync.add_argument(
+        "--oldest-first",
+        action="store_true",
+        help="从最早缺口开始；默认优先补最近交易日",
+    )
+    warehouse_sync.add_argument("--force", action="store_true", help="重新拉取已经完成的交易日")
+    warehouse_sync.add_argument("--pause-seconds", type=float, default=0.08, help="交易日之间的请求间隔")
+    warehouse_sync.add_argument("--json", action="store_true")
 
     sub.add_parser("settings", help="查看当前运行配置")
     openai_login = sub.add_parser("openai-login", help="使用 ChatGPT OAuth 登录 OpenAI Provider")
@@ -597,6 +668,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.source,
             args.config_path,
             args.json,
+        )
+    if args.command == "warehouse":
+        if args.warehouse_command == "status":
+            return cmd_warehouse_status(json_mode=args.json)
+        return cmd_warehouse_sync(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            max_sessions=args.max_sessions,
+            newest_first=not args.oldest_first,
+            force=args.force,
+            pause_seconds=args.pause_seconds,
+            json_mode=args.json,
         )
     if args.command == "settings":
         return cmd_settings()

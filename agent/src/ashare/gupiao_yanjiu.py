@@ -30,11 +30,13 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_PATH = ROOT_DIR / "lianghua_peizhi.json"
 AK_STOCK_NAMES_CACHE = STOCK_BASIC_CACHE.parent / "akshare_stock_names.csv"
 AK_STOCK_NAMES_CACHE_TTL_SECONDS = 24 * 60 * 60
+DAILY_BAR_CACHE_DIR = STOCK_BASIC_CACHE.parent / "daily_bar_cache"
+DAILY_BAR_CACHE_TTL_SECONDS = 12 * 60 * 60
 MARKET_DATA_STALE_WARNING_BUSINESS_DAYS = 2
 MARKET_DATA_STALE_ERROR_BUSINESS_DAYS = 7
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 5
-SINGLE_STOCK_TOOL_CONTRACT_VERSION = 3
+SINGLE_STOCK_TOOL_CONTRACT_VERSION = 4
 
 FEATURE_COLUMNS = [
     "ret_1",
@@ -98,18 +100,27 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("shuju 必须是 JSON 对象")
     data_history_days = int(finite_number(data_settings, "history_calendar_days", 540, "shuju"))
     max_board_stocks = int(finite_number(data_settings, "max_board_stocks", 20, "shuju"))
+    warehouse_max_board_stocks = int(
+        finite_number(data_settings, "warehouse_max_board_stocks", 80, "shuju")
+    )
     minimum_history_rows = int(finite_number(data_settings, "minimum_history_rows", 120, "shuju"))
     data_pause = finite_number(data_settings, "request_pause_seconds", 0.15, "shuju")
     if not 180 <= data_history_days <= 3650:
         raise ValueError("shuju.history_calendar_days 必须在 180 到 3650 之间")
     if not 1 <= max_board_stocks <= 100:
         raise ValueError("shuju.max_board_stocks 必须在 1 到 100 之间")
+    if not max_board_stocks <= warehouse_max_board_stocks <= 200:
+        raise ValueError("shuju.warehouse_max_board_stocks 必须不小于普通上限且不大于200")
     if not 60 <= minimum_history_rows <= 2000:
         raise ValueError("shuju.minimum_history_rows 必须在 60 到 2000 之间")
     if not 0 <= data_pause <= 10:
         raise ValueError("shuju.request_pause_seconds 必须在 0 到 10 之间")
     if not isinstance(data_settings.get("akshare_bypass_proxy", True), bool):
         raise ValueError("shuju.akshare_bypass_proxy 必须是 true 或 false")
+    if data_settings.get("frequency", "daily_only") != "daily_only":
+        raise ValueError("shuju.frequency 必须为 daily_only；本产品永久只做日K")
+    if data_settings.get("minute_bars_enabled", False) is not False:
+        raise ValueError("shuju.minute_bars_enabled 必须为 false；分钟K不属于产品范围")
 
     filters = value.get("guolv", {})
     if not isinstance(filters, dict):
@@ -143,6 +154,14 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             "min_rank_ic_days": 10,
             "validation_top_n": 3,
             "min_top_n_days": 10,
+            "ensemble_min_calibration_samples": 80,
+            "ensemble_min_calibration_dates": 20,
+            "factor_stability_slices": 3,
+            "factor_min_valid_slices": 2,
+            "factor_min_features": 12,
+            "direction_logistic_max_iter": 500,
+            "probability_calibration_min_samples": 120,
+            "conformal_min_samples": 80,
         }
         positive_integer_fields = {
             key: int(model.get(key, default)) for key, default in integer_defaults.items()
@@ -150,6 +169,23 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         min_direction = float(model.get("min_direction_accuracy", 0.52))
         min_rank_ic = float(model.get("min_mean_daily_rank_ic", 0.01))
         min_skill = float(model.get("min_skill_vs_baseline", 0.01))
+        ridge_alpha = float(model.get("ridge_alpha", 10.0))
+        ensemble_default_tree_weight = float(model.get("ensemble_default_tree_weight", 0.75))
+        ensemble_calibration_ratio = float(model.get("ensemble_calibration_ratio", 0.15))
+        ensemble_weight_grid = [
+            float(item)
+            for item in model.get("ensemble_tree_weight_grid", [0.0, 0.25, 0.5, 0.75, 1.0])
+        ]
+        feature_winsor_quantiles = [
+            float(item) for item in model.get("feature_winsor_quantiles", [0.01, 0.99])
+        ]
+        model_feature_coverage = float(model.get("min_feature_coverage", 0.20))
+        factor_min_sign_agreement = float(model.get("factor_min_sign_agreement", 0.67))
+        factor_min_abs_ic = float(model.get("factor_min_abs_mean_rank_ic", 0.005))
+        direction_logistic_c = float(model.get("direction_logistic_c", 0.5))
+        calibration_evaluation_ratio = float(model.get("probability_calibration_evaluation_ratio", 0.30))
+        calibration_min_improvement = float(model.get("probability_calibration_min_brier_improvement", 0.0005))
+        conformal_coverage = float(model.get("conformal_coverage", 0.80))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"moxing 数值配置无效：{exc}") from exc
     if not 0.05 <= validation_ratio <= 0.4:
@@ -164,10 +200,46 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.horizon_weights 必须为 T+1/T+2/T+3 提供非负权重且总和大于0")
     if any(item <= 0 for item in positive_integer_fields.values()):
         raise ValueError("moxing 的样本数、验证天数和 Top-N 配置必须为正整数")
+    if positive_integer_fields["factor_min_valid_slices"] > positive_integer_fields["factor_stability_slices"]:
+        raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
     if not 0.5 <= min_direction <= 1:
         raise ValueError("moxing.min_direction_accuracy 必须在 0.5 到 1 之间")
     if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1:
         raise ValueError("moxing 的 Rank IC 和基线提升门槛必须在 -1 到 1 之间")
+    if not isinstance(model.get("ensemble_enabled", True), bool):
+        raise ValueError("moxing.ensemble_enabled 必须是 true 或 false")
+    if not isinstance(model.get("factor_stability_enabled", True), bool):
+        raise ValueError("moxing.factor_stability_enabled 必须是 true 或 false")
+    if not 0 < model_feature_coverage <= 1:
+        raise ValueError("moxing.min_feature_coverage 必须在 0 到 1 之间")
+    if not 0.5 <= factor_min_sign_agreement <= 1:
+        raise ValueError("moxing.factor_min_sign_agreement 必须在 0.5 到 1 之间")
+    if not 0 <= factor_min_abs_ic <= 1:
+        raise ValueError("moxing.factor_min_abs_mean_rank_ic 必须在 0 到 1 之间")
+    if not math.isfinite(direction_logistic_c) or direction_logistic_c <= 0:
+        raise ValueError("moxing.direction_logistic_c 必须是正有限数")
+    if not 0.1 <= calibration_evaluation_ratio <= 0.5:
+        raise ValueError("moxing.probability_calibration_evaluation_ratio 必须在 0.1 到 0.5 之间")
+    if not 0 <= calibration_min_improvement <= 0.2:
+        raise ValueError("moxing.probability_calibration_min_brier_improvement 必须在 0 到 0.2 之间")
+    if not 0.5 < conformal_coverage < 1:
+        raise ValueError("moxing.conformal_coverage 必须在 0.5 到 1 之间")
+    if not math.isfinite(ridge_alpha) or ridge_alpha <= 0:
+        raise ValueError("moxing.ridge_alpha 必须是正有限数")
+    if not 0 <= ensemble_default_tree_weight <= 1:
+        raise ValueError("moxing.ensemble_default_tree_weight 必须在 0 到 1 之间")
+    if not 0.05 <= ensemble_calibration_ratio <= 0.4:
+        raise ValueError("moxing.ensemble_calibration_ratio 必须在 0.05 到 0.4 之间")
+    if (
+        not ensemble_weight_grid
+        or any(not math.isfinite(item) or not 0 <= item <= 1 for item in ensemble_weight_grid)
+    ):
+        raise ValueError("moxing.ensemble_tree_weight_grid 必须是非空的 0 到 1 数值数组")
+    if (
+        len(feature_winsor_quantiles) != 2
+        or not 0 <= feature_winsor_quantiles[0] < feature_winsor_quantiles[1] <= 1
+    ):
+        raise ValueError("moxing.feature_winsor_quantiles 必须是两个递增的 0 到 1 数值")
     learning_rate = finite_number(model, "learning_rate", 0.05, "moxing")
     l2_regularization = finite_number(model, "l2_regularization", 1.0, "moxing")
     model_integer_fields = {
@@ -200,9 +272,11 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
     if not isinstance(single, dict):
         raise ValueError("dangu 必须是 JSON 对象")
     try:
-        single_history_days = int(single.get("history_calendar_days", 1080))
-        maximum_peers = int(single.get("max_peer_stocks", 18))
-        same_industry_peers = int(single.get("same_industry_stocks", 14))
+        single_history_days = int(single.get("history_calendar_days", 1440))
+        maximum_peers = int(single.get("max_peer_stocks", 20))
+        same_industry_peers = int(single.get("same_industry_stocks", 16))
+        warehouse_maximum_peers = int(single.get("warehouse_max_peer_stocks", 60))
+        warehouse_same_industry_peers = int(single.get("warehouse_same_industry_stocks", 45))
         minimum_peers = int(single.get("minimum_peer_stocks", 8))
         walk_forward_folds = int(single.get("walk_forward_folds", 3))
         minimum_passed_folds = int(single.get("min_passed_folds", 2))
@@ -225,6 +299,12 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("dangu.max_peer_stocks 必须在 8 到 40 之间")
     if not 4 <= same_industry_peers < maximum_peers:
         raise ValueError("dangu.same_industry_stocks 必须至少为4且小于 max_peer_stocks")
+    if not maximum_peers <= warehouse_maximum_peers <= 200:
+        raise ValueError("dangu.warehouse_max_peer_stocks 必须不小于普通上限且不大于200")
+    if not same_industry_peers <= warehouse_same_industry_peers < warehouse_maximum_peers:
+        raise ValueError(
+            "dangu.warehouse_same_industry_stocks 必须不小于普通同行数且小于仓库同行上限"
+        )
     if not 5 <= minimum_peers <= maximum_peers:
         raise ValueError("dangu.minimum_peer_stocks 必须在5到 max_peer_stocks 之间")
     if walk_forward_folds < 2 or not 1 <= minimum_passed_folds <= walk_forward_folds:
@@ -607,12 +687,95 @@ def _apply_qfq(pro: Any, code: str, start_date: str, end_date: str, data: pd.Dat
         return data, "raw_unadjusted", reason
 
 
+def _daily_bar_cache_path(code: str, source: str) -> Path:
+    return DAILY_BAR_CACHE_DIR / f"{code.replace('.', '_')}_{source}.csv"
+
+
+def _load_daily_bar_cache(
+    *,
+    code: str,
+    source: str,
+    start: str,
+    end: str,
+) -> XingqingJieguo | None:
+    path = _daily_bar_cache_path(code, source)
+    meta_path = path.with_suffix(".json")
+    if not path.is_file() or not meta_path.is_file():
+        return None
+    try:
+        age_seconds = max(0.0, time.time() - path.stat().st_mtime)
+        if age_seconds > DAILY_BAR_CACHE_TTL_SECONDS:
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        requested_start = pd.to_datetime(meta.get("requested_start"), errors="coerce")
+        requested_end = pd.to_datetime(meta.get("requested_end"), errors="coerce")
+        wanted_start = pd.to_datetime(start, errors="coerce")
+        wanted_end = pd.to_datetime(end, errors="coerce")
+        if (
+            pd.isna(requested_start)
+            or pd.isna(requested_end)
+            or pd.isna(wanted_start)
+            or pd.isna(wanted_end)
+            or pd.Timestamp(requested_start) > pd.Timestamp(wanted_start)
+            or pd.Timestamp(requested_end) < pd.Timestamp(wanted_end)
+        ):
+            return None
+        data = _normalize_history(pd.read_csv(path), tushare=False)
+        data = data[
+            (data["trade_date"] >= pd.Timestamp(wanted_start))
+            & (data["trade_date"] <= pd.Timestamp(wanted_end))
+        ].reset_index(drop=True)
+        if data.empty:
+            return None
+        provider = str(meta.get("provider") or source)
+        adjustment = str(meta.get("adjustment") or "unknown")
+        return XingqingJieguo(
+            data=data,
+            source=provider,
+            adjustment=adjustment,
+            warnings=(f"日K使用12小时内的本地缓存（{provider}）",),
+            errors=(),
+        )
+    except Exception:
+        return None
+
+
+def _save_daily_bar_cache(
+    *,
+    code: str,
+    source_policy: str,
+    start: str,
+    end: str,
+    result: XingqingJieguo,
+) -> None:
+    if result.data.empty or result.adjustment in {"unknown", "raw_unadjusted"}:
+        return
+    path = _daily_bar_cache_path(code, source_policy)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result.data.to_csv(path, index=False, encoding="utf-8-sig")
+    path.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "provider": result.source,
+                "adjustment": result.adjustment,
+                "requested_start": pd.Timestamp(start).strftime("%Y-%m-%d"),
+                "requested_end": pd.Timestamp(end).strftime("%Y-%m-%d"),
+                "rows": int(len(result.data)),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def huoqu_rili_xingqing(
     code: str,
     *,
     start_date: str,
     end_date: str,
     source: str = "auto",
+    use_cache: bool = False,
 ) -> XingqingJieguo:
     """Fetch one stock's daily bars with Tushare-first fallback semantics."""
     normalized = biaozhunhua_daima(code)
@@ -621,6 +784,53 @@ def huoqu_rili_xingqing(
         raise ValueError("source 必须是 auto、tushare 或 akshare")
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
+    if use_cache:
+        cached = _load_daily_bar_cache(
+            code=normalized,
+            source=source,
+            start=start,
+            end=end,
+        )
+        if cached is not None:
+            return cached
+        if source in {"auto", "tushare"}:
+            try:
+                from src.ashare.riping_cangku import load_qfq_history_from_warehouse
+
+                warehouse_data, warehouse_meta = load_qfq_history_from_warehouse(
+                    normalized,
+                    start_date=start,
+                    end_date=end,
+                )
+                if not warehouse_data.empty and warehouse_meta.get("status") == "ok":
+                    return XingqingJieguo(
+                        data=_normalize_history(warehouse_data, tushare=False),
+                        source=str(warehouse_meta.get("source") or "tushare_daily_warehouse"),
+                        adjustment=str(
+                            warehouse_meta.get("adjustment") or "qfq_by_warehouse_adj_factor"
+                        ),
+                        warnings=(
+                            f"日K来自全市场本地仓库，区间同步覆盖率{warehouse_meta.get('sync_coverage')}",
+                        ),
+                        errors=(),
+                    )
+            except Exception:
+                pass
+
+    def finish(result: XingqingJieguo) -> XingqingJieguo:
+        if use_cache:
+            try:
+                _save_daily_bar_cache(
+                    code=normalized,
+                    source_policy=source,
+                    start=start,
+                    end=end,
+                    result=result,
+                )
+            except Exception:
+                pass
+        return result
+
     errors: list[str] = []
     warnings: list[str] = []
     raw_tushare_fallback: XingqingJieguo | None = None
@@ -640,11 +850,11 @@ def huoqu_rili_xingqing(
                 raw_tushare_fallback = tushare_result
                 warnings.append("自动模式要求复权口径，继续尝试 AKShare 前复权行情")
             else:
-                return tushare_result
+                return finish(tushare_result)
         except Exception as exc:
             errors.append(f"Tushare 日线失败：{exc}")
             if source == "tushare":
-                return XingqingJieguo(pd.DataFrame(), "tushare", "unknown", tuple(warnings), tuple(errors))
+                return finish(XingqingJieguo(pd.DataFrame(), "tushare", "unknown", tuple(warnings), tuple(errors)))
 
     try:
         import akshare as ak
@@ -685,20 +895,20 @@ def huoqu_rili_xingqing(
             if source == "auto"
             else "行情使用 AKShare 免费聚合接口"
         )
-        return XingqingJieguo(data, "akshare", "qfq", tuple(warnings), tuple(errors))
+        return finish(XingqingJieguo(data, "akshare", "qfq", tuple(warnings), tuple(errors)))
     except Exception as exc:
         errors.append(f"AKShare 日线失败：{exc}")
         if raw_tushare_fallback is not None:
             fallback_warnings = list(raw_tushare_fallback.warnings)
             fallback_warnings.append("AKShare 前复权降级失败，只能使用 Tushare 未复权行情")
-            return XingqingJieguo(
+            return finish(XingqingJieguo(
                 raw_tushare_fallback.data,
                 raw_tushare_fallback.source,
                 raw_tushare_fallback.adjustment,
                 tuple(fallback_warnings),
                 tuple(errors),
-            )
-        return XingqingJieguo(pd.DataFrame(), "akshare", "unknown", tuple(warnings), tuple(errors))
+            ))
+        return finish(XingqingJieguo(pd.DataFrame(), "akshare", "unknown", tuple(warnings), tuple(errors)))
 
 
 def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
@@ -1299,7 +1509,7 @@ def fenxi_gupiao(
         raise ValueError("holding_days 必须是 1、2 或 3 个交易日")
     if budget_yuan is not None and (not math.isfinite(float(budget_yuan)) or float(budget_yuan) <= 0):
         raise ValueError("budget_yuan 必须是大于0的有限数值")
-    configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1080))
+    configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1440))
     history_calendar_days = configured_history_days if history_calendar_days is None else int(history_calendar_days)
     history_calendar_days = max(540, min(history_calendar_days, 1800))
     code, resolved, resolve_warnings = jiexi_gupiao(gupiao, source=source)

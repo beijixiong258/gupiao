@@ -15,17 +15,26 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import brier_score_loss, mean_absolute_error
 
 from src.ashare.bankuai_yuce import (
     _apply_cost,
-    _build_model_pipeline,
+    _blend_component_predictions,
+    _calibrate_direction_probability,
     _daily_rank_ic,
+    _experiment_fingerprint,
+    _fit_direction_probabilities,
+    _fit_model_components,
+    _fold_stability,
     _load_cost_assumption,
     _price_limit_bounds,
     _quality_label,
     _quality_score,
+    _regime_stability,
+    _rolling_conformal_interval,
+    _select_stable_features,
     _round_price_tick,
+    _select_ensemble_weight,
     _stock_roundtrip_cost,
     _top_n_validation_metrics,
     goujian_moxing_shuju,
@@ -43,6 +52,7 @@ from src.ashare.gupiao_yanjiu import (
     shi_a_gu,
 )
 from src.ashare.shuju_yuan import _load_or_fetch_stock_basic, _price_limit_rule, _tushare_pro
+from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
 
 
 SINGLE_STOCK_EXTRA_FEATURES = [
@@ -66,7 +76,7 @@ SINGLE_STOCK_EXTRA_FEATURES = [
     "rank_volatility_20",
     "rank_log_amount",
 ]
-SINGLE_STOCK_FEATURE_COLUMNS = FEATURE_COLUMNS + SINGLE_STOCK_EXTRA_FEATURES
+SINGLE_STOCK_FEATURE_COLUMNS = FEATURE_COLUMNS + SINGLE_STOCK_EXTRA_FEATURES + DAILY_FACTOR_FEATURE_COLUMNS
 
 
 def shichang_shizhong(reference: datetime | None = None) -> dict[str, Any]:
@@ -409,10 +419,40 @@ def xuanze_tonghang_yangben(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build a liquid current peer universe, preferring the same industry."""
     settings = config.get("dangu", {})
-    maximum = max(8, int(settings.get("max_peer_stocks", 18)))
-    same_industry_limit = max(4, min(maximum - 1, int(settings.get("same_industry_stocks", 14))))
+    base_maximum = max(8, int(settings.get("max_peer_stocks", 20)))
+    maximum = base_maximum
+    base_same_industry = int(settings.get("same_industry_stocks", 16))
     min_amount = float(settings.get("min_amount_yuan", 30_000_000))
     signal = pd.Timestamp(signal_date).normalize()
+    warehouse_range: dict[str, Any] = {
+        "status": "not_checked",
+        "ready": False,
+        "coverage": 0.0,
+    }
+    try:
+        from src.ashare.riping_cangku import warehouse_range_coverage
+
+        history_days = int(settings.get("history_calendar_days", 1440))
+        warehouse_range = warehouse_range_coverage(
+            start_date=(signal - timedelta(days=history_days)).strftime("%Y%m%d"),
+            end_date=signal.strftime("%Y%m%d"),
+        )
+        if warehouse_range.get("ready"):
+            maximum = max(
+                maximum,
+                int(settings.get("warehouse_max_peer_stocks", 60)),
+            )
+            base_same_industry = int(
+                settings.get("warehouse_same_industry_stocks", max(16, maximum * 3 // 4))
+            )
+    except Exception as exc:
+        warehouse_range = {
+            "status": "check_failed",
+            "ready": False,
+            "coverage": 0.0,
+            "error": str(exc),
+        }
+    same_industry_limit = max(4, min(maximum - 1, base_same_industry))
     warnings: list[str] = []
     try:
         universe, as_of, source_warnings = _latest_tushare_cross_section(signal)
@@ -485,6 +525,10 @@ def xuanze_tonghang_yangben(
         "selected_stocks": int(len(selected)),
         "role_counts": dict(role_counts),
         "minimum_amount_yuan": min_amount,
+        "configured_peer_limit_without_warehouse": base_maximum,
+        "applied_peer_limit": maximum,
+        "warehouse_range": warehouse_range,
+        "warehouse_expansion_applied": bool(warehouse_range.get("ready") and maximum > base_maximum),
         "selection_method": "当前同行优先，再用全市场高流动性股票补足；目标股票始终保留",
         "known_bias": "使用当前上市股票、当前行业标签和当前流动性构造历史面板，仍存在幸存者与当前成分偏差",
         "warnings": warnings,
@@ -566,6 +610,7 @@ def _fetch_peer_histories(
                 start_date=pd.Timestamp(start).strftime("%Y%m%d"),
                 end_date=signal.strftime("%Y%m%d"),
                 source=source,
+                use_cache=True,
             )
             if source == "auto" and fetched.adjustment == "raw_unadjusted":
                 ak_fallback = huoqu_rili_xingqing(
@@ -573,6 +618,7 @@ def _fetch_peer_histories(
                     start_date=pd.Timestamp(start).strftime("%Y%m%d"),
                     end_date=signal.strftime("%Y%m%d"),
                     source="akshare",
+                    use_cache=True,
                 )
                 if not ak_fallback.data.empty and ak_fallback.adjustment != "raw_unadjusted":
                     fetched = ak_fallback
@@ -592,11 +638,16 @@ def _fetch_peer_histories(
         else:
             data["data_source"] = data_source
             data["adjustment"] = adjustment
+            data["peer_role"] = str(row.get("peer_role") or "market_reference")
             histories[peer_code] = data
             names[peer_code] = peer_name
             sources[str(data_source)] += 1
             warnings.extend(f"{peer_code}: {value}" for value in source_warnings)
-        if peer_code != target_code and pause_seconds > 0:
+        if (
+            peer_code != target_code
+            and pause_seconds > 0
+            and "warehouse" not in str(data_source)
+        ):
             time.sleep(pause_seconds)
     return histories, names, {
         "usable_stocks": int(len(histories)),
@@ -681,6 +732,13 @@ def _fit_single_stock_models(
     config: dict[str, Any],
     budget_yuan: float,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    panel = panel.copy()
+    latest = latest.copy()
+    for column in SINGLE_STOCK_FEATURE_COLUMNS:
+        if column not in panel.columns:
+            panel[column] = np.nan
+        if column not in latest.columns:
+            latest[column] = np.nan
     model_config = config["moxing"]
     single_config = config.get("dangu", {})
     minimum_coverage = float(single_config.get("min_feature_coverage", 0.20))
@@ -695,6 +753,7 @@ def _fit_single_stock_models(
         "features": feature_columns,
         "feature_coverage": {column: round(float(coverage[column]), 4) for column in feature_columns},
         "latest_missing_features": [column for column in feature_columns if latest[column].isna().any()],
+        "feature_preprocessing": "每个滚动训练窗口独立做因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放",
         "horizons": {},
     }
     horizons = [int(value) for value in model_config["horizons"]]
@@ -721,6 +780,14 @@ def _fit_single_stock_models(
         boundaries = _walk_forward_boundaries(dates, config)
         fold_records: list[dict[str, Any]] = []
         oof_frames: list[pd.DataFrame] = []
+        prior_actual: list[np.ndarray] = []
+        prior_tree_prediction: list[np.ndarray] = []
+        prior_linear_prediction: list[np.ndarray] = []
+        regime_column = (
+            "market_csi300_ret_20"
+            if "market_csi300_ret_20" in usable.columns and usable["market_csi300_ret_20"].notna().any()
+            else "universe_mean_ret_20"
+        )
 
         for fold_number, (validation_start, validation_end) in enumerate(boundaries, start=1):
             fold_role = "final_holdout" if fold_number == len(boundaries) else "walk_forward_validation"
@@ -742,10 +809,48 @@ def _fit_single_stock_models(
             y_train_raw = train[target_column].astype(float).to_numpy()
             clip_low = float(np.nanquantile(y_train_raw, lower_q))
             clip_high = float(np.nanquantile(y_train_raw, upper_q))
-            pipeline = _build_model_pipeline(model_config)
-            pipeline.fit(train[feature_columns], np.clip(y_train_raw, clip_low, clip_high))
+            fold_features, factor_selection = _select_stable_features(
+                train,
+                feature_columns,
+                target_column,
+                model_config,
+            )
+            if not fold_features:
+                fold_records.append({
+                    "fold": fold_number,
+                    "role": fold_role,
+                    "status": "no_stable_features",
+                    "train_samples": int(len(train)),
+                    "validation_samples": int(len(validation_frame)),
+                    "factor_selection": factor_selection,
+                })
+                continue
+            tree_weight, ensemble_diagnostics = _select_ensemble_weight(
+                np.concatenate(prior_actual) if prior_actual else np.array([]),
+                np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
+                np.concatenate(prior_linear_prediction) if prior_linear_prediction else np.array([]),
+                model_config,
+            )
+            tree_prediction, linear_prediction = _fit_model_components(
+                train_features=train[fold_features],
+                train_target=np.clip(y_train_raw, clip_low, clip_high),
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
+            raw_direction_probability, direction_model = _fit_direction_probabilities(
+                train_features=train[fold_features],
+                train_target=y_train_raw,
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
+            tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
+            linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
             actual = validation_frame[target_column].astype(float).to_numpy()
-            predicted = np.clip(pipeline.predict(validation_frame[feature_columns]), clip_low, clip_high)
+            predicted = np.clip(
+                _blend_component_predictions(tree_prediction, linear_prediction, tree_weight),
+                clip_low,
+                clip_high,
+            )
             baseline_value = float(np.median(y_train_raw))
             baseline = np.full(len(actual), baseline_value)
             mae = float(mean_absolute_error(actual, predicted))
@@ -782,29 +887,100 @@ def _fit_single_stock_models(
                 "direction_accuracy": round(direction, 6),
                 "mean_daily_rank_ic": round(rank_ic, 6),
                 "rank_ic_days": int(rank_days),
+                "factor_selection": factor_selection,
+                "direction_model": {
+                    **direction_model,
+                    "brier_score": round(
+                        float(brier_score_loss((actual > 0).astype(int), raw_direction_probability)),
+                        6,
+                    ),
+                    "classification_accuracy": round(
+                        float(np.mean((raw_direction_probability >= 0.5) == (actual > 0))),
+                        6,
+                    ),
+                },
+                "model_ensemble": {
+                    **ensemble_diagnostics,
+                    "weight_uses_only_prior_folds": True,
+                    "mean_absolute_component_disagreement": round(
+                        float(np.mean(np.abs(tree_prediction - linear_prediction))),
+                        6,
+                    ),
+                },
                 **top_n,
                 "fold_passed": fold_passed,
             })
-            oof = validation_frame[["trade_date", "ts_code", entry_open_column]].copy()
+            oof_columns = ["trade_date", "ts_code", entry_open_column]
+            if regime_column in validation_frame.columns:
+                oof_columns.append(regime_column)
+            oof = validation_frame[oof_columns].copy()
             oof["actual"] = actual
             oof["predicted"] = predicted
             oof["baseline"] = baseline
+            oof["tree_prediction"] = tree_prediction
+            oof["linear_prediction"] = linear_prediction
+            oof["raw_direction_probability"] = raw_direction_probability
             oof_frames.append(oof)
+            prior_actual.append(actual)
+            prior_tree_prediction.append(tree_prediction)
+            prior_linear_prediction.append(linear_prediction)
 
         latest_prediction = None
+        production_ensemble: dict[str, Any] | None = None
+        latest_component_predictions: dict[str, float] | None = None
         final_clip_low = None
         final_clip_high = None
+        latest_raw_direction_probability = None
+        production_factor_selection: dict[str, Any] | None = None
+        production_features: list[str] = []
         if len(usable) >= minimum_train:
             full_y = usable[target_column].astype(float).to_numpy()
             final_clip_low = float(np.nanquantile(full_y, lower_q))
             final_clip_high = float(np.nanquantile(full_y, upper_q))
-            final_model = _build_model_pipeline(model_config)
-            final_model.fit(usable[feature_columns], np.clip(full_y, final_clip_low, final_clip_high))
+            production_tree_weight, production_ensemble = _select_ensemble_weight(
+                np.concatenate(prior_actual) if prior_actual else np.array([]),
+                np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
+                np.concatenate(prior_linear_prediction) if prior_linear_prediction else np.array([]),
+                model_config,
+            )
+            production_features, production_factor_selection = _select_stable_features(
+                usable,
+                feature_columns,
+                target_column,
+                model_config,
+            )
+            latest_tree_prediction, latest_linear_prediction = _fit_model_components(
+                train_features=usable[production_features],
+                train_target=np.clip(full_y, final_clip_low, final_clip_high),
+                predict_features=latest[production_features],
+                model_config=model_config,
+            )
+            latest_direction_array, production_direction_model = _fit_direction_probabilities(
+                train_features=usable[production_features],
+                train_target=full_y,
+                predict_features=latest[production_features],
+                model_config=model_config,
+            )
+            latest_raw_direction_probability = float(latest_direction_array[0])
+            latest_tree_prediction = np.clip(
+                latest_tree_prediction, final_clip_low, final_clip_high
+            )
+            latest_linear_prediction = np.clip(
+                latest_linear_prediction, final_clip_low, final_clip_high
+            )
             latest_prediction = float(np.clip(
-                final_model.predict(latest[feature_columns])[0],
+                _blend_component_predictions(
+                    latest_tree_prediction,
+                    latest_linear_prediction,
+                    production_tree_weight,
+                )[0],
                 final_clip_low,
                 final_clip_high,
             ))
+            latest_component_predictions = {
+                "tree": round(float(latest_tree_prediction[0]), 6),
+                "linear": round(float(latest_linear_prediction[0]), 6),
+            }
             predictions[f"pred_t{horizon}"] = latest_prediction
         else:
             predictions[f"pred_t{horizon}"] = np.nan
@@ -828,6 +1004,24 @@ def _fit_single_stock_models(
             "final_training_end": usable[target_date_column].max().strftime("%Y-%m-%d") if not usable.empty else None,
             "final_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)] if final_clip_low is not None else None,
             "retrained_on_all_labeled_data": latest_prediction is not None,
+            "production_factor_selection": production_factor_selection,
+            "experiment_fingerprint": _experiment_fingerprint(
+                feature_columns=production_features,
+                target_definition=f"next_session_open_to_{horizon}th_sellable_close_return",
+                split_method="purged_expanding_walk_forward_with_final_holdout",
+                model_config=model_config,
+            ) if production_features else None,
+            "production_model_ensemble": {
+                "components": ["HistGradientBoostingRegressor", "Ridge"],
+                "weight_selection": production_ensemble,
+                "latest_component_predictions": latest_component_predictions,
+            },
+            "production_direction_model": {
+                **(production_direction_model if latest_raw_direction_probability is not None else {}),
+                "latest_raw_positive_probability": round(latest_raw_direction_probability, 6)
+                if latest_raw_direction_probability is not None
+                else None,
+            },
         }
         if oof_frames and latest_prediction is not None:
             oof = pd.concat(oof_frames, ignore_index=True)
@@ -855,6 +1049,20 @@ def _fit_single_stock_models(
             nearest_actual = actual[nearest_index]
             positive_probability = float(np.mean(nearest_actual > 0)) if nearest_count else None
             empirical_low, empirical_high = np.nanquantile(nearest_actual, [0.10, 0.90])
+            calibrated_probability, probability_calibration = _calibrate_direction_probability(
+                actual=actual,
+                raw_probability=oof["raw_direction_probability"].to_numpy(dtype=float),
+                dates=oof["trade_date"],
+                latest_raw_probability=float(latest_raw_direction_probability),
+                model_config=model_config,
+            )
+            conformal_interval, conformal_diagnostics = _rolling_conformal_interval(
+                actual=actual,
+                predicted=predicted,
+                dates=oof["trade_date"],
+                latest_prediction=float(latest_prediction),
+                model_config=model_config,
+            )
             quality = _quality_score(
                 train_count=len(usable),
                 direction_accuracy=direction,
@@ -892,11 +1100,20 @@ def _fit_single_stock_models(
                 "latest_empirical_positive_probability": round(positive_probability, 6) if positive_probability is not None else None,
                 "probability_calibration_samples": int(nearest_count),
                 "probability_method": "与当前预测最接近的滚动样本外预测，其实际毛收益为正的比例",
+                "latest_direction_positive_probability": round(float(calibrated_probability), 6),
+                "direction_probability_method": probability_calibration.get("method"),
+                "direction_probability_calibration": probability_calibration,
                 "prediction_interval_80": [
                     round(float(empirical_low), 6),
                     round(float(empirical_high), 6),
                 ],
                 "prediction_interval_method": "与正收益比例相同的近邻滚动样本外实际收益的10%至90%经验分位数",
+                "conformal_prediction_interval_80": [round(float(value), 6) for value in conformal_interval]
+                if conformal_interval
+                else None,
+                "conformal_diagnostics": conformal_diagnostics,
+                "fold_stability": _fold_stability(fold_records),
+                "market_regime_stability": _regime_stability(oof, regime_column=regime_column),
                 "quality_score": round(quality, 4),
                 "quality_label": _quality_label(quality),
                 "validation_passed": validation_passed,
@@ -938,6 +1155,13 @@ def _fit_future_session_models(
     config: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Predict the next one to three market-session closes from the signal close."""
+    panel = panel.copy()
+    latest = latest.copy()
+    for column in SINGLE_STOCK_FEATURE_COLUMNS:
+        if column not in panel.columns:
+            panel[column] = np.nan
+        if column not in latest.columns:
+            latest[column] = np.nan
     model_config = config["moxing"]
     single_config = config.get("dangu", {})
     minimum_coverage = float(single_config.get("min_feature_coverage", 0.20))
@@ -956,6 +1180,7 @@ def _fit_future_session_models(
         "forecast_basis": "最近完整收盘价到未来第1/2/3个市场交易日收盘的累计收益",
         "feature_count": int(len(feature_columns)),
         "features": feature_columns,
+        "feature_preprocessing": "每个滚动训练窗口独立做因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放",
         "horizons": {},
     }
     horizons = [int(value) for value in model_config["horizons"]]
@@ -983,6 +1208,14 @@ def _fit_future_session_models(
         boundaries = _walk_forward_boundaries(dates, config)
         fold_records: list[dict[str, Any]] = []
         oof_frames: list[pd.DataFrame] = []
+        prior_actual: list[np.ndarray] = []
+        prior_tree_prediction: list[np.ndarray] = []
+        prior_linear_prediction: list[np.ndarray] = []
+        regime_column = (
+            "market_csi300_ret_20"
+            if "market_csi300_ret_20" in usable.columns and usable["market_csi300_ret_20"].notna().any()
+            else "universe_mean_ret_20"
+        )
 
         for fold_number, (validation_start, validation_end) in enumerate(boundaries, start=1):
             role = "final_holdout" if fold_number == len(boundaries) else "walk_forward_validation"
@@ -1010,11 +1243,47 @@ def _fit_future_session_models(
             y_train_raw = train[target_column].astype(float).to_numpy()
             clip_low = float(np.nanquantile(y_train_raw, lower_q))
             clip_high = float(np.nanquantile(y_train_raw, upper_q))
-            pipeline = _build_model_pipeline(model_config)
-            pipeline.fit(train[feature_columns], np.clip(y_train_raw, clip_low, clip_high))
+            fold_features, factor_selection = _select_stable_features(
+                train,
+                feature_columns,
+                target_column,
+                model_config,
+            )
+            if not fold_features:
+                fold_records.append(
+                    {
+                        "fold": fold_number,
+                        "role": role,
+                        "status": "no_stable_features",
+                        "train_samples": int(len(train)),
+                        "validation_samples": int(len(validation_frame)),
+                        "factor_selection": factor_selection,
+                    }
+                )
+                continue
+            tree_weight, ensemble_diagnostics = _select_ensemble_weight(
+                np.concatenate(prior_actual) if prior_actual else np.array([]),
+                np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
+                np.concatenate(prior_linear_prediction) if prior_linear_prediction else np.array([]),
+                model_config,
+            )
+            tree_prediction, linear_prediction = _fit_model_components(
+                train_features=train[fold_features],
+                train_target=np.clip(y_train_raw, clip_low, clip_high),
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
+            raw_direction_probability, direction_model = _fit_direction_probabilities(
+                train_features=train[fold_features],
+                train_target=y_train_raw,
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
+            tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
+            linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
             actual = validation_frame[target_column].astype(float).to_numpy()
             predicted = np.clip(
-                pipeline.predict(validation_frame[feature_columns]),
+                _blend_component_predictions(tree_prediction, linear_prediction, tree_weight),
                 clip_low,
                 clip_high,
             )
@@ -1041,34 +1310,102 @@ def _fit_future_session_models(
                     "direction_accuracy": round(direction, 6),
                     "mean_daily_rank_ic": round(rank_ic, 6),
                     "rank_ic_days": int(rank_days),
+                    "factor_selection": factor_selection,
+                    "direction_model": {
+                        **direction_model,
+                        "brier_score": round(
+                            float(brier_score_loss((actual > 0).astype(int), raw_direction_probability)),
+                            6,
+                        ),
+                        "classification_accuracy": round(
+                            float(np.mean((raw_direction_probability >= 0.5) == (actual > 0))),
+                            6,
+                        ),
+                    },
+                    "model_ensemble": {
+                        **ensemble_diagnostics,
+                        "weight_uses_only_prior_folds": True,
+                        "mean_absolute_component_disagreement": round(
+                            float(np.mean(np.abs(tree_prediction - linear_prediction))),
+                            6,
+                        ),
+                    },
                     "fold_passed": fold_passed,
                 }
             )
-            oof = validation_frame[["trade_date", "ts_code"]].copy()
+            oof_columns = ["trade_date", "ts_code"]
+            if regime_column in validation_frame.columns:
+                oof_columns.append(regime_column)
+            oof = validation_frame[oof_columns].copy()
             oof["actual"] = actual
             oof["predicted"] = predicted
             oof["baseline"] = baseline
+            oof["tree_prediction"] = tree_prediction
+            oof["linear_prediction"] = linear_prediction
+            oof["raw_direction_probability"] = raw_direction_probability
             oof_frames.append(oof)
+            prior_actual.append(actual)
+            prior_tree_prediction.append(tree_prediction)
+            prior_linear_prediction.append(linear_prediction)
 
         latest_prediction = None
+        production_ensemble: dict[str, Any] | None = None
+        latest_component_predictions: dict[str, float] | None = None
         final_clip_low = None
         final_clip_high = None
+        latest_raw_direction_probability = None
+        production_factor_selection: dict[str, Any] | None = None
+        production_features: list[str] = []
         if len(usable) >= minimum_train:
             full_y = usable[target_column].astype(float).to_numpy()
             final_clip_low = float(np.nanquantile(full_y, lower_q))
             final_clip_high = float(np.nanquantile(full_y, upper_q))
-            final_model = _build_model_pipeline(model_config)
-            final_model.fit(
-                usable[feature_columns],
-                np.clip(full_y, final_clip_low, final_clip_high),
+            production_tree_weight, production_ensemble = _select_ensemble_weight(
+                np.concatenate(prior_actual) if prior_actual else np.array([]),
+                np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
+                np.concatenate(prior_linear_prediction) if prior_linear_prediction else np.array([]),
+                model_config,
+            )
+            production_features, production_factor_selection = _select_stable_features(
+                usable,
+                feature_columns,
+                target_column,
+                model_config,
+            )
+            latest_tree_prediction, latest_linear_prediction = _fit_model_components(
+                train_features=usable[production_features],
+                train_target=np.clip(full_y, final_clip_low, final_clip_high),
+                predict_features=latest[production_features],
+                model_config=model_config,
+            )
+            latest_direction_array, production_direction_model = _fit_direction_probabilities(
+                train_features=usable[production_features],
+                train_target=full_y,
+                predict_features=latest[production_features],
+                model_config=model_config,
+            )
+            latest_raw_direction_probability = float(latest_direction_array[0])
+            latest_tree_prediction = np.clip(
+                latest_tree_prediction, final_clip_low, final_clip_high
+            )
+            latest_linear_prediction = np.clip(
+                latest_linear_prediction, final_clip_low, final_clip_high
             )
             latest_prediction = float(
                 np.clip(
-                    final_model.predict(latest[feature_columns])[0],
+                    _blend_component_predictions(
+                        latest_tree_prediction,
+                        latest_linear_prediction,
+                        production_tree_weight,
+                    )[0],
                     final_clip_low,
                     final_clip_high,
                 )
             )
+            latest_component_predictions = {
+                "tree": round(float(latest_tree_prediction[0]), 6),
+                "linear": round(float(latest_linear_prediction[0]), 6),
+            }
             predictions[f"future_pred_t{horizon}"] = latest_prediction
         else:
             predictions[f"future_pred_t{horizon}"] = np.nan
@@ -1097,6 +1434,24 @@ def _fit_future_session_models(
                 if final_clip_low is not None
                 else None
             ),
+            "production_factor_selection": production_factor_selection,
+            "experiment_fingerprint": _experiment_fingerprint(
+                feature_columns=production_features,
+                target_definition=f"signal_close_to_future_market_session_{horizon}_close_return",
+                split_method="purged_expanding_walk_forward_with_final_holdout",
+                model_config=model_config,
+            ) if production_features else None,
+            "production_model_ensemble": {
+                "components": ["HistGradientBoostingRegressor", "Ridge"],
+                "weight_selection": production_ensemble,
+                "latest_component_predictions": latest_component_predictions,
+            },
+            "production_direction_model": {
+                **(production_direction_model if latest_raw_direction_probability is not None else {}),
+                "latest_raw_positive_probability": round(latest_raw_direction_probability, 6)
+                if latest_raw_direction_probability is not None
+                else None,
+            },
         }
 
         if oof_frames and latest_prediction is not None:
@@ -1118,6 +1473,20 @@ def _fit_future_session_models(
                 float(np.mean(nearest_actual > 0)) if nearest_count else None
             )
             empirical_low, empirical_high = np.nanquantile(nearest_actual, [0.10, 0.90])
+            calibrated_probability, probability_calibration = _calibrate_direction_probability(
+                actual=actual,
+                raw_probability=oof["raw_direction_probability"].to_numpy(dtype=float),
+                dates=oof["trade_date"],
+                latest_raw_probability=float(latest_raw_direction_probability),
+                model_config=model_config,
+            )
+            conformal_interval, conformal_diagnostics = _rolling_conformal_interval(
+                actual=actual,
+                predicted=predicted,
+                dates=oof["trade_date"],
+                latest_prediction=float(latest_prediction),
+                model_config=model_config,
+            )
             quality = _quality_score(
                 train_count=len(usable),
                 direction_accuracy=direction,
@@ -1150,11 +1519,20 @@ def _fit_future_session_models(
                     ),
                     "probability_calibration_samples": int(nearest_count),
                     "probability_method": "与当前预测最接近的滚动样本外预测，其实际累计收益为正的比例",
+                    "latest_direction_positive_probability": round(float(calibrated_probability), 6),
+                    "direction_probability_method": probability_calibration.get("method"),
+                    "direction_probability_calibration": probability_calibration,
                     "prediction_interval_80": [
                         round(float(empirical_low), 6),
                         round(float(empirical_high), 6),
                     ],
                     "prediction_interval_method": "与正收益比例相同的近邻滚动样本外实际收益的10%至90%经验分位数",
+                    "conformal_prediction_interval_80": [round(float(value), 6) for value in conformal_interval]
+                    if conformal_interval
+                    else None,
+                    "conformal_diagnostics": conformal_diagnostics,
+                    "fold_stability": _fold_stability(fold_records),
+                    "market_regime_stability": _regime_stability(oof, regime_column=regime_column),
                     "quality_score": round(quality, 4),
                     "quality_label": _quality_label(quality),
                     "validation_passed": validation_passed,
@@ -1335,17 +1713,19 @@ def _build_analysis_assessment(
         reasons.append("按目标资金测算，无法满足该板块最低买入数量")
     else:
         net = float(requested.get("estimated_net_return_after_cost") or 0.0)
-        probability = requested.get("empirical_positive_probability")
+        probability = requested.get("direction_model_positive_probability")
+        if probability is None:
+            probability = requested.get("empirical_positive_probability")
         probability_value = float(probability) if probability is not None else 0.5
         if net <= -minimum_net or probability_value < 0.45:
             evidence_label = "证据偏负面"
-            reasons.append("通过验证的成本后期望或样本外上涨比例明显不利")
+            reasons.append("通过验证的成本后期望或样本外方向概率明显不利")
         elif net >= minimum_net and probability_value >= minimum_probability:
             evidence_label = "证据偏正面"
-            reasons.append("指定期限模型通过滚动样本外验证，成本后期望和经验上涨比例同时达到分析门槛")
+            reasons.append("指定期限模型通过滚动样本外验证，成本后期望和校准方向概率同时达到分析门槛")
         else:
             evidence_label = "证据中性"
-            reasons.append("模型有效，但成本后优势或经验上涨比例没有形成明显方向")
+            reasons.append("模型有效，但成本后优势或样本外方向概率没有形成明显方向")
 
     rsi = _round_optional(technical.get("rsi_14"))
     ret_5 = _round_optional((technical.get("returns") or {}).get("5d"))
@@ -1367,7 +1747,7 @@ def _build_analysis_assessment(
         "reasons": reasons,
         "assessment_thresholds": {
             "minimum_net_return_after_cost": minimum_net,
-            "minimum_empirical_positive_probability": minimum_probability,
+            "minimum_oos_direction_positive_probability": minimum_probability,
             "model_validation_must_pass": True,
             "execution_constraints_must_be_clear": True,
         },
@@ -1465,6 +1845,11 @@ def yanjiu_dangu_yuce(
 
     panel = goujian_moxing_shuju(histories, names, [1, 2, 3])
     panel = _add_single_stock_features(panel)
+    panel, daily_factor_meta = enrich_daily_factor_panel(
+        panel,
+        source=source,
+        include_historical_valuation=True,
+    )
     target_rows = panel[
         (panel["ts_code"] == code)
         & (pd.to_datetime(panel["trade_date"], errors="coerce").dt.normalize() == pd.Timestamp(signal_date).normalize())
@@ -1507,17 +1892,25 @@ def yanjiu_dangu_yuce(
         metrics = validation["horizons"].get(f"T+{horizon}", {})
         net = _apply_cost(float(gross), stock_cost_rate) if gross is not None and stock_cost_rate is not None else None
         interval = metrics.get("prediction_interval_80")
+        conformal_interval = metrics.get("conformal_prediction_interval_80")
         net_interval = [
             round(_apply_cost(float(value), stock_cost_rate), 6) for value in interval
         ] if interval and stock_cost_rate is not None else None
+        conformal_net_interval = [
+            round(_apply_cost(float(value), stock_cost_rate), 6) for value in conformal_interval
+        ] if conformal_interval and stock_cost_rate is not None else None
         forecast[f"T+{horizon}"] = {
             "entry_to_exit_gross_return": round(float(gross), 6) if gross is not None else None,
             "entry_to_exit_gross_return_pct": round(float(gross) * 100.0, 3) if gross is not None else None,
             "estimated_net_return_after_cost": round(float(net), 6) if net is not None else None,
             "estimated_net_return_after_cost_pct": round(float(net) * 100.0, 3) if net is not None else None,
             "empirical_positive_probability": metrics.get("latest_empirical_positive_probability"),
+            "direction_model_positive_probability": metrics.get("latest_direction_positive_probability"),
+            "direction_probability_method": metrics.get("direction_probability_method"),
             "empirical_return_interval_80": interval,
             "empirical_net_return_interval_80": net_interval,
+            "conformal_return_interval_80": conformal_interval,
+            "conformal_net_return_interval_80": conformal_net_interval,
             "validation_passed": bool(metrics.get("validation_passed")),
             "model_quality": metrics.get("quality_label", "low"),
             "position_and_cost": position_cost,
@@ -1539,14 +1932,16 @@ def yanjiu_dangu_yuce(
             predicted_return = _round_optional(future_row.get(f"future_pred_t{horizon}"))
             metrics = future_validation.get("horizons", {}).get(f"T+{horizon}", {})
             interval = metrics.get("prediction_interval_80")
+            conformal_interval = metrics.get("conformal_prediction_interval_80")
+            preferred_interval = conformal_interval or interval
             lower_price, upper_price = _price_limit_bounds(signal_close, limit_rate, horizon)
             predicted_close = None
             predicted_close_interval = None
             if predicted_return is not None:
                 raw_close = signal_close * (1.0 + predicted_return)
                 predicted_close = _round_price_tick(min(max(raw_close, lower_price), upper_price))
-            if interval and len(interval) == 2:
-                interval_prices = [signal_close * (1.0 + float(value)) for value in interval]
+            if preferred_interval and len(preferred_interval) == 2:
+                interval_prices = [signal_close * (1.0 + float(value)) for value in preferred_interval]
                 predicted_close_interval = [
                     _round_price_tick(min(max(value, lower_price), upper_price))
                     for value in interval_prices
@@ -1561,8 +1956,14 @@ def yanjiu_dangu_yuce(
                 ),
                 "predicted_close_reference": predicted_close,
                 "predicted_close_interval_80": predicted_close_interval,
+                "predicted_close_interval_method": (
+                    "rolling_split_conformal" if conformal_interval else "nearest_oos_empirical"
+                ),
                 "empirical_return_interval_80": interval,
+                "conformal_return_interval_80": conformal_interval,
                 "empirical_positive_probability": metrics.get("latest_empirical_positive_probability"),
+                "direction_model_positive_probability": metrics.get("latest_direction_positive_probability"),
+                "direction_probability_method": metrics.get("direction_probability_method"),
                 "validation_passed": bool(metrics.get("validation_passed")),
                 "model_quality": metrics.get("quality_label", "low"),
                 "direction": (
@@ -1604,6 +2005,7 @@ def yanjiu_dangu_yuce(
             "history_fetch": history_meta,
             "relative_snapshot": peer_snapshot,
         },
+        "daily_factor_data": daily_factor_meta,
         "forecast": forecast,
         "future_3_trading_days": future_three_days,
         "validation": validation,
@@ -1616,17 +2018,18 @@ def yanjiu_dangu_yuce(
             "config_errors": cost_errors,
         },
         "methodology": {
-            "model": "HistGradientBoostingRegressor",
+            "model": "HistGradientBoostingRegressor + 稳健缩放Ridge的小型集成",
+            "ensemble_weighting": "每个滚动折只使用更早折的样本外预测选权重；最终生产权重使用全部滚动样本外预测",
             "training_universe": "目标股票的当前同行优先，加少量全市场高流动性参考股票",
             "validation": "三段扩展窗口、标签跨界清除的滚动样本外验证，最后一段作为最终保留测试窗口",
-            "signal": "只使用已确认收盘的日线和当日可得横截面特征",
+            "signal": "只使用已确认收盘的日线、同日精确匹配的历史估值、市场指数日K和当日横截面特征",
             "execution_scenario": "假设下一交易日开盘作为收益测算基准，并按A股T+1比较指定T+1/T+2/T+3收盘",
             "future_forecast": "另行预测从最近完整收盘到未来第1/2/3个交易日收盘，两类结果都只用于分析",
             "llm_boundary": "数值、验证与证据标签均由程序生成；LLM只能解释，不能改写或作交易决定",
         },
         "limitations": [
             "当前同行池用于历史训练，仍存在当前成分与幸存者偏差",
-            "日线模型不能模拟集合竞价排队、盘口深度和突发公告冲击",
+            "产品永久只做日K；不能模拟集合竞价排队、盘口深度和突发公告冲击",
             "经验区间和上涨比例来自历史样本外相似预测，不是收益保证",
         ],
     }

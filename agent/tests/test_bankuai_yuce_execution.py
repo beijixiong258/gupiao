@@ -10,16 +10,27 @@ import pandas as pd
 import pytest
 
 from src.ashare import bankuai_yuce
+from src.ashare import riping_yinzi
 from src.ashare.bankuai_yuce import (
+    _calibrate_direction_probability,
     _fetch_histories,
     _best_name,
     _paginate_candidates,
     _position_for_budget,
     _prediction_rows,
+    _rolling_conformal_interval,
+    _select_stable_features,
+    _select_ensemble_weight,
+    _TrainingQuantileClipper,
     goujian_moxing_shuju,
     xunlian_yuce_moxing,
 )
 from src.ashare.gupiao_yanjiu import FEATURE_COLUMNS, jiazai_lianghua_peizhi
+from src.ashare.dangu_yuce import (
+    SINGLE_STOCK_FEATURE_COLUMNS,
+    _fit_future_session_models,
+    _fit_single_stock_models,
+)
 
 
 def _price_frame(dates: list[str], opens: list[float], closes: list[float]) -> pd.DataFrame:
@@ -100,6 +111,57 @@ def test_position_sizing_obeys_board_buy_units_and_budget() -> None:
     assert star["buy_share_increment"] == 1
     assert unaffordable["estimated_buy_shares"] == 0
     assert unaffordable["execution_feasible"] is False
+
+
+def test_ensemble_weight_is_selected_only_from_supplied_oos_predictions() -> None:
+    actual = np.array([-0.02, -0.01, 0.01, 0.03, 0.04])
+    tree_prediction = np.array([0.04, 0.03, -0.02, -0.01, 0.00])
+    linear_prediction = actual.copy()
+    config = {
+        "ensemble_enabled": True,
+        "ensemble_default_tree_weight": 0.75,
+        "ensemble_min_calibration_samples": 5,
+        "ensemble_tree_weight_grid": [0.0, 0.5, 1.0],
+    }
+
+    tree_weight, diagnostics = _select_ensemble_weight(
+        actual,
+        tree_prediction,
+        linear_prediction,
+        config,
+    )
+
+    assert tree_weight == 0.0
+    assert diagnostics["status"] == "selected_from_oos_predictions"
+    assert diagnostics["linear_mae"] == 0.0
+    assert diagnostics["ensemble_mae"] == 0.0
+
+
+def test_feature_clipper_uses_training_bounds_for_unseen_extremes() -> None:
+    clipper = _TrainingQuantileClipper(0.25, 0.75).fit(
+        np.array([[0.0], [1.0], [2.0], [100.0]])
+    )
+
+    transformed = clipper.transform(np.array([[-999.0], [999.0]]))
+
+    assert transformed[0, 0] == pytest.approx(clipper.lower_bounds_[0])
+    assert transformed[1, 0] == pytest.approx(clipper.upper_bounds_[0])
+
+
+def test_ensemble_uses_configured_default_before_enough_oos_samples() -> None:
+    tree_weight, diagnostics = _select_ensemble_weight(
+        np.array([0.01, -0.01]),
+        np.array([0.02, -0.02]),
+        np.array([0.0, 0.0]),
+        {
+            "ensemble_enabled": True,
+            "ensemble_default_tree_weight": 0.75,
+            "ensemble_min_calibration_samples": 5,
+        },
+    )
+
+    assert tree_weight == 0.75
+    assert diagnostics["status"] == "insufficient_oos_calibration_samples"
 
 
 def test_selection_batches_are_capped_ranked_and_do_not_repeat() -> None:
@@ -330,3 +392,202 @@ def test_validation_reports_top_n_cost_metrics_and_refits_all_labeled_rows() -> 
         assert "top_n_mean_excess_vs_universe" in metrics
         assert metrics["final_train_samples"] > metrics["train_samples"]
         assert metrics["retrained_on_all_labeled_data"] is True
+        assert metrics["model_ensemble"]["components"] == ["HistGradientBoostingRegressor", "Ridge"]
+        assert metrics["model_ensemble"]["production_weight"]["status"] == "selected_from_oos_predictions"
+
+
+def test_single_stock_holding_and_future_models_use_prior_oos_ensemble_weights() -> None:
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-02", periods=150)
+    rows: list[dict[str, object]] = []
+    for code_index in range(5):
+        for date in dates:
+            row: dict[str, object] = {
+                "ts_code": f"6001{code_index:02d}.SH",
+                "name": f"同行{code_index}",
+                "trade_date": date,
+                "close": 10.0 + code_index,
+            }
+            for feature in SINGLE_STOCK_FEATURE_COLUMNS:
+                row[feature] = float(rng.normal())
+            signal = float(row[SINGLE_STOCK_FEATURE_COLUMNS[0]])
+            for horizon in [1, 2, 3]:
+                row[f"entry_date_t{horizon}"] = date + pd.offsets.BDay(1)
+                row[f"entry_open_t{horizon}"] = 10.0 + code_index
+                row[f"target_date_t{horizon}"] = date + pd.offsets.BDay(horizon + 1)
+                row[f"target_t{horizon}"] = 0.003 * signal + float(rng.normal(0, 0.004))
+                row[f"future_date_t{horizon}"] = date + pd.offsets.BDay(horizon)
+                row[f"future_return_t{horizon}"] = 0.002 * signal + float(rng.normal(0, 0.004))
+            rows.append(row)
+    panel = pd.DataFrame(rows)
+    latest = panel[(panel["ts_code"] == "600100.SH") & (panel["trade_date"] == dates[-1])].copy()
+    config, _ = jiazai_lianghua_peizhi()
+    config = copy.deepcopy(config)
+    config["dangu"].update(
+        {
+            "walk_forward_folds": 3,
+            "validation_window_days": 20,
+            "minimum_training_dates": 80,
+            "min_fold_training_samples": 200,
+            "min_fold_validation_samples": 80,
+        }
+    )
+    config["moxing"].update({"max_iter": 8, "min_samples_leaf": 10})
+
+    holding_predictions, holding_validation = _fit_single_stock_models(
+        panel=panel,
+        latest=latest,
+        config=config,
+        budget_yuan=50_000.0,
+    )
+    future_predictions, future_validation = _fit_future_session_models(
+        panel=panel,
+        latest=latest,
+        config=config,
+    )
+
+    assert {"pred_t1", "pred_t2", "pred_t3"}.issubset(holding_predictions.columns)
+    assert {"future_pred_t1", "future_pred_t2", "future_pred_t3"}.issubset(future_predictions.columns)
+    for validation in [holding_validation, future_validation]:
+        for metrics in validation["horizons"].values():
+            folds = [fold for fold in metrics["folds"] if fold.get("status") == "ok"]
+            assert folds[0]["model_ensemble"]["status"] == "insufficient_oos_calibration_samples"
+            assert folds[0]["model_ensemble"]["weight_uses_only_prior_folds"] is True
+            assert folds[1]["model_ensemble"]["status"] == "selected_from_oos_predictions"
+            assert metrics["production_model_ensemble"]["weight_selection"]["status"] == "selected_from_oos_predictions"
+
+
+def test_daily_factor_panel_uses_exact_date_valuation_and_size_neutralization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = pd.bdate_range("2025-01-02", periods=25)
+    codes = [f"6002{index:02d}.SH" for index in range(6)]
+    rows: list[dict[str, object]] = []
+    for date_index, date in enumerate(dates):
+        for code_index, code in enumerate(codes):
+            rows.append(
+                {
+                    "ts_code": code,
+                    "trade_date": date,
+                    "peer_role": "target" if code_index == 0 else "same_industry" if code_index < 4 else "market_reference",
+                    "ret_1": 0.001 * (date_index + code_index),
+                    "ret_5": 0.002 * (date_index + code_index),
+                    "ret_20": 0.003 * (date_index + code_index),
+                    "ma_gap_20": 0.01 * (code_index - 2),
+                    "volume_ratio_5_20": 1.0 + 0.1 * code_index,
+                    "volatility_20": 0.2 + 0.02 * code_index,
+                    "amount_yuan": 10_000_000.0 * (code_index + 1),
+                }
+            )
+    panel = pd.DataFrame(rows)
+    daily_basic = pd.DataFrame(
+        [
+            {
+                "ts_code": code,
+                "trade_date": dates[0],
+                "turnover_rate": 1.0 + index,
+                "pe_ttm": 10.0 + index,
+                "pb": 2.0 + index,
+                "total_mv": 100_000.0 + index,
+                "circ_mv": 50_000.0 * (index + 1),
+            }
+            for index, code in enumerate(codes)
+        ]
+    )
+    monkeypatch.setattr(
+        riping_yinzi,
+        "_historical_daily_basic",
+        lambda **_kwargs: (
+            daily_basic,
+            {"status": "ok", "warnings": [], "merge_rule": "exact"},
+        ),
+    )
+    benchmark = pd.DataFrame({"trade_date": dates})
+    for column in riping_yinzi.BENCHMARK_FEATURE_COLUMNS:
+        benchmark[column] = 0.001
+    monkeypatch.setattr(
+        riping_yinzi,
+        "_benchmark_features",
+        lambda **_kwargs: (benchmark, {"status": "ok", "warnings": []}),
+    )
+
+    enriched, metadata = riping_yinzi.enrich_daily_factor_panel(panel, source="auto")
+
+    first_day = enriched[enriched["trade_date"] == dates[0]]
+    second_day = enriched[enriched["trade_date"] == dates[1]]
+    assert first_day["log_circ_mv"].notna().all()
+    assert second_day["log_circ_mv"].isna().all()
+    assert first_day["size_neutral_ret_5"].notna().all()
+    assert abs(first_day[["size_neutral_ret_5", "log_circ_mv"]].corr().iloc[0, 1]) < 1e-10
+    target = first_day[first_day["peer_role"] == "target"].iloc[0]
+    expected_industry_mean = first_day[first_day["peer_role"].isin(["target", "same_industry"])]["ret_5"].mean()
+    assert target["industry_mean_ret_5"] == pytest.approx(expected_industry_mean)
+    assert metadata["frequency"] == "daily_k_only"
+
+
+def test_factor_stability_selection_uses_training_slices_only() -> None:
+    rng = np.random.default_rng(23)
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    target = rng.normal(size=len(dates))
+    unstable = target.copy()
+    unstable[40:80] *= -1
+    frame = pd.DataFrame(
+        {
+            "trade_date": dates,
+            "target": target,
+            "stable": target + rng.normal(0, 0.02, len(dates)),
+            "unstable": unstable,
+            "noise": rng.normal(size=len(dates)),
+        }
+    )
+    selected, diagnostics = _select_stable_features(
+        frame,
+        ["stable", "unstable", "noise"],
+        "target",
+        {
+            "factor_stability_enabled": True,
+            "factor_stability_slices": 3,
+            "factor_min_valid_slices": 3,
+            "factor_min_sign_agreement": 0.8,
+            "factor_min_abs_mean_rank_ic": 0.05,
+            "factor_min_features": 1,
+            "min_feature_coverage": 0.9,
+        },
+    )
+
+    assert "stable" in selected
+    assert "unstable" not in selected
+    assert diagnostics["selection_scope"] == "training_window_only"
+
+
+def test_direction_probability_calibration_and_rolling_conformal_are_time_ordered() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=180)
+    raw_probability = np.tile(np.linspace(0.1, 0.9, 30), 6)
+    positive = raw_probability > 0.5
+    actual = np.where(positive, 0.01, -0.01)
+    calibrated, calibration = _calibrate_direction_probability(
+        actual=actual,
+        raw_probability=raw_probability,
+        dates=pd.Series(dates),
+        latest_raw_probability=0.8,
+        model_config={
+            "probability_calibration_min_samples": 120,
+            "probability_calibration_evaluation_ratio": 0.3,
+            "probability_calibration_min_brier_improvement": 0.0001,
+        },
+    )
+    predicted = actual * 0.5
+    interval, conformal = _rolling_conformal_interval(
+        actual=actual,
+        predicted=predicted,
+        dates=pd.Series(dates),
+        latest_prediction=0.006,
+        model_config={"conformal_coverage": 0.8, "conformal_min_samples": 80},
+    )
+
+    assert calibration["status"] == "calibrated"
+    assert calibration["time_ordered_evaluation"]["improvement"] > 0
+    assert calibrated > 0.8
+    assert interval is not None and interval[0] < 0.006 < interval[1]
+    assert conformal["method"] == "rolling_split_conformal_absolute_residual"
+    assert conformal["rolling_evaluation_samples"] == 100

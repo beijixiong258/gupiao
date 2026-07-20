@@ -27,6 +27,9 @@ def _full_result() -> dict:
         "risks": ["样本仅用于测试"],
         "quantitative_analysis": {
             "status": "ok",
+            "peer_universe": {"selected_stock_count": 12, "relative_snapshot": {"rank_ret_5": 0.62}},
+            "methodology": {"model": "HistGradientBoostingRegressor"},
+            "limitations": ["同行样本存在当前成分偏差"],
             "cost_assumption": {
                 "scenario": "normal_cost",
                 "estimated_roundtrip_cost_rate": 0.001,
@@ -40,6 +43,11 @@ def _full_result() -> dict:
                         "direction_accuracy": 0.58,
                         "skill_vs_median_baseline": 0.06,
                         "oos_samples": 120,
+                        "production_model_ensemble": {
+                            "components": ["HistGradientBoostingRegressor", "Ridge"],
+                            "weight_selection": {"tree_weight": 0.5, "linear_weight": 0.5},
+                            "latest_component_predictions": {"tree": 0.04, "linear": 0.06},
+                        },
                     }
                 }
             },
@@ -69,6 +77,11 @@ def _full_result() -> dict:
                         "direction_accuracy": 0.57,
                         "skill_vs_median_baseline": 0.05,
                         "oos_samples": 118,
+                        "production_model_ensemble": {
+                            "components": ["HistGradientBoostingRegressor", "Ridge"],
+                            "weight_selection": {"tree_weight": 0.5, "linear_weight": 0.5},
+                            "latest_component_predictions": {"tree": 0.04, "linear": 0.06},
+                        },
                     }
                 }
             },
@@ -104,6 +117,7 @@ def test_first_stage_hides_forecasts_and_returns_analysis_id(monkeypatch: pytest
     assert result["tool_contract_version"] == 4
     assert result["analysis_id"].startswith("fx_")
     assert result["analysis_stage"]["status"] == "completed"
+    assert result["peer_analysis"]["peer_universe"]["selected_stock_count"] == 12
     assert "quantitative_analysis" not in result
     assert "future_3_trading_days" not in result
     assert "analysis_assessment" not in result
@@ -129,6 +143,8 @@ def test_second_stage_publishes_only_validated_horizon_and_position_costs(
     assert result["forecast_status"] == "validated"
     assert result["forecast"]["historical_similar_sample_positive_rate"] == 0.63
     assert result["forecast"]["estimated_return_after_roundtrip_cost"] == pytest.approx(0.04895)
+    assert result["model_ensemble"]["weight_selection"]["tree_weight"] == 0.5
+    assert "latest_component_predictions" not in result["model_ensemble"]
     assert result["position_return_analysis"]["status"] == "ok"
     assert result["position_return_analysis"]["buy_cost"]["commission_yuan"] == 5.0
     assert result["position_return_analysis"]["current_exit_estimate"]["net_profit_yuan"] > 0

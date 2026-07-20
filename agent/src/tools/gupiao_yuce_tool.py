@@ -7,7 +7,6 @@ import math
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.ashare.bankuai_yuce import _load_cost_assumption, _position_for_budget
 from src.ashare.chengben_huadian import CostScenario
 from src.tools.gupiao_analysis_cache import get_analysis
 
@@ -63,6 +62,8 @@ def _position_return(
     if parsed_shares is None:
         budget = _finite_positive(position_value_yuan)
         if budget is not None:
+            from src.ashare.bankuai_yuce import _position_for_budget
+
             sizing = _position_for_budget(ts_code, parsed_buy, budget)
             if sizing.get("execution_feasible"):
                 parsed_shares = int(sizing["estimated_buy_shares"])
@@ -174,8 +175,14 @@ def build_requested_forecast(
                 "estimated_return_after_roundtrip_cost_pct": round(net * 100.0, 3) if net is not None else None,
                 "predicted_close_reference": projected_price,
                 "predicted_close_interval_80": raw_forecast.get("predicted_close_interval_80"),
+                "predicted_close_interval_method": raw_forecast.get("predicted_close_interval_method"),
+                "calibrated_direction_positive_probability": raw_forecast.get(
+                    "direction_model_positive_probability"
+                ),
+                "direction_probability_method": raw_forecast.get("direction_probability_method"),
                 "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
                 "empirical_return_interval_80": raw_forecast.get("empirical_return_interval_80"),
+                "conformal_return_interval_80": raw_forecast.get("conformal_return_interval_80"),
             }
         else:
             published_forecast = {
@@ -185,12 +192,19 @@ def build_requested_forecast(
                 "entry_to_exit_gross_return_pct": raw_forecast.get("entry_to_exit_gross_return_pct"),
                 "estimated_net_return_after_cost": raw_forecast.get("estimated_net_return_after_cost"),
                 "estimated_net_return_after_cost_pct": raw_forecast.get("estimated_net_return_after_cost_pct"),
+                "calibrated_direction_positive_probability": raw_forecast.get(
+                    "direction_model_positive_probability"
+                ),
+                "direction_probability_method": raw_forecast.get("direction_probability_method"),
                 "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
                 "empirical_net_return_interval_80": raw_forecast.get("empirical_net_return_interval_80"),
+                "conformal_net_return_interval_80": raw_forecast.get("conformal_net_return_interval_80"),
                 "position_and_cost": raw_forecast.get("position_and_cost"),
             }
 
     scenario_name = str((quantitative.get("cost_assumption") or {}).get("scenario") or "normal_cost")
+    from src.ashare.bankuai_yuce import _load_cost_assumption
+
     _, scenario, cost_path, cost_errors = _load_cost_assumption(scenario_name)
     quote = full_result.get("current_quote") or {}
     technical = full_result.get("technical_analysis") or {}
@@ -204,10 +218,20 @@ def build_requested_forecast(
         projected_price=projected_price,
         scenario=scenario,
     )
+    raw_ensemble = diagnostics.get("production_model_ensemble") or diagnostics.get("model_ensemble")
+    public_ensemble = (
+        {
+            key: value
+            for key, value in raw_ensemble.items()
+            if key != "latest_component_predictions"
+        }
+        if isinstance(raw_ensemble, dict)
+        else None
+    )
 
     return {
         "status": "ok" if forecast_status == "validated" else "unavailable",
-        "tool_contract_version": 1,
+        "tool_contract_version": 2,
         "analysis_id": analysis_id,
         "analysis_stage_required": "gupiao_fenxi completed",
         "stock": stock,
@@ -229,8 +253,14 @@ def build_requested_forecast(
                 "walk_forward_folds_passed",
                 "final_holdout_passed",
                 "oos_samples",
+                "experiment_fingerprint",
+                "fold_stability",
+                "market_regime_stability",
+                "conformal_diagnostics",
+                "direction_probability_calibration",
             ]
         },
+        "model_ensemble": public_ensemble,
         "position_return_analysis": position,
         "cost_assumption": {
             "scenario": scenario.name,

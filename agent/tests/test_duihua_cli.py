@@ -66,6 +66,42 @@ def test_no_subcommand_starts_chat(monkeypatch) -> None:
     assert calls == [(50, None, False), (7, None, True)]
 
 
+def test_warehouse_subcommands_dispatch(monkeypatch) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    def fake_status(*, json_mode=False):
+        calls.append(("status", {"json_mode": json_mode}))
+        return 0
+
+    def fake_sync(**kwargs):
+        calls.append(("sync", kwargs))
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_warehouse_status", fake_status)
+    monkeypatch.setattr(cli, "cmd_warehouse_sync", fake_sync)
+
+    assert cli.main(["warehouse", "status", "--json"]) == 0
+    assert cli.main(
+        [
+            "warehouse",
+            "sync",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+            "--max-sessions",
+            "5",
+            "--oldest-first",
+            "--json",
+        ]
+    ) == 0
+    assert calls[0] == ("status", {"json_mode": True})
+    assert calls[1][0] == "sync"
+    assert calls[1][1]["start_date"] == "2024-01-01"
+    assert calls[1][1]["max_sessions"] == 5
+    assert calls[1][1]["newest_first"] is False
+
+
 def test_clear_history_command_requires_confirmation_and_removes_saved_sessions(tmp_path, monkeypatch) -> None:
     store = DuihuaCunchu(tmp_path)
     session = store.xinjian()

@@ -34,8 +34,8 @@ class GupiaoFenxiTool(BaseTool):
                 "type": "integer",
                 "minimum": 540,
                 "maximum": 1800,
-                "default": 1080,
-                "description": "Calendar days used for the peer-panel model; default 1080.",
+                "default": 1440,
+                "description": "Calendar days used for the daily-K peer-panel model; default 1440.",
             },
             "holding_days": {
                 "type": "integer",
@@ -66,10 +66,19 @@ class GupiaoFenxiTool(BaseTool):
         analysis_id = store_analysis(full_result)
         hidden = {"quantitative_analysis", "future_3_trading_days", "analysis_assessment"}
         public_result = {key: value for key, value in full_result.items() if key not in hidden}
+        quantitative = full_result.get("quantitative_analysis") or {}
         public_result.update(
             {
                 "tool_contract_version": 4,
                 "analysis_id": analysis_id,
+                "peer_analysis": {
+                    "status": quantitative.get("status"),
+                    "peer_universe": quantitative.get("peer_universe"),
+                    "daily_factor_data": quantitative.get("daily_factor_data"),
+                    "methodology": quantitative.get("methodology"),
+                    "limitations": quantitative.get("limitations"),
+                    "error": quantitative.get("error"),
+                },
                 "analysis_stage": {
                     "status": "completed",
                     "scope": "行情时点、基本面、估值、技术面、波动、可交易约束、同行和风险已完成",
