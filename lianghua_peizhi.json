@@ -23,9 +23,8 @@
     "min_fold_validation_samples": 80,
     "min_passed_folds": 2,
     "min_feature_coverage": 0.2,
-    "decision_min_net_return": 0.003,
-    "decision_min_up_probability": 0.55,
-    "maximum_entry_gap_pct": 0.03
+    "assessment_min_net_return": 0.003,
+    "assessment_min_positive_probability": 0.55
   },
   "guolv": {
     "min_price": 2.0,

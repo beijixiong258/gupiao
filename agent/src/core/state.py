@@ -62,6 +62,10 @@ class RunStateStore:
         """
         self._write_json(run_dir / "state.json", {"status": "failed", "reason": reason})
 
+    def save_response(self, run_dir: Path, response: Dict[str, Any]) -> None:
+        """Save the complete run response, including durable conversation history."""
+        self._write_json(run_dir / "response.json", response)
+
     @staticmethod
     def _write_json(path: Path, data: Any) -> None:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import logging
 import json
-import re
 from datetime import datetime
 from typing import Any, TYPE_CHECKING, Optional
 
@@ -17,65 +16,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SINGLE_STOCK_TOOL_CONTRACT_VERSION = 2
-_FRESH_REQUEST_MARKERS = (
-    "现在",
-    "今天",
-    "今日",
-    "当前",
-    "目前",
-    "最新",
-    "刚刚",
-    "刚才收盘",
-    "能不能买",
-    "是否能买",
-    "是否可以买",
-    "可不可以买",
-    "要不要买",
-    "值得买吗",
-)
-_SINGLE_STOCK_DECISION_MARKERS = (
-    "能不能买",
-    "是否能买",
-    "是否可以买",
-    "可不可以买",
-    "要不要买",
-    "值得买吗",
-)
-_BOARD_REQUEST_MARKERS = (
-    "板块",
-    "行业",
-    "概念",
-    "选股",
-    "股票池",
-    "哪些股票",
-    "几只股票",
-)
-_BROAD_MARKET_MARKERS = (
-    "大盘",
-    "沪指",
-    "深成指",
-    "创业板指",
-    "整个市场",
-    "全市场",
-)
-_OBJECT_CLARIFICATION_MARKERS = (
-    "哪只股票",
-    "具体股票",
-    "股票名称",
-    "股票代码",
-    "具体是哪只",
-    "指的是哪只",
-    "请提供股票",
-    "请告诉我股票",
-    "哪个板块",
-    "板块名称",
-    "具体板块",
-    "请提供板块",
-)
+_SINGLE_STOCK_TOOL_CONTRACT_VERSION = 4
 
 _SYSTEM_PROMPT = """You are an A-share T+3 quantitative research agent with {tool_count} business tools.
-This product has exactly two primary workflows. It covers only mainland China A-share stocks and mainland exchange rules.
+This product has exactly two natural-language interaction paths: quantitative tool analysis and direct conversation. It covers only mainland China A-share stocks and mainland exchange rules.
 Use symbols like 000001.SZ, 600519.SH, or 430047.BJ. Market-data source must be "auto", "tushare", or "akshare".
 The external LLM provider can be DeepSeek or OpenAI. The LLM explains results; it never invents prices, fundamentals, picks, or predictions.
 This is permanently a research-only system. It must never connect to a broker, request or store brokerage credentials, submit/cancel orders, control a trading terminal, or perform automatic trading.
@@ -88,35 +32,47 @@ This is permanently a research-only system. It must never connect to a broker, r
 
 {memory_summary}
 
-## Current Turn Enforcement
+## Tool Call Policy
 
 {current_turn_policy}
 
-## Task Routing
+## Two Interaction Paths
 
-**Single-stock research** - this is the primary workflow. The user asks how one named stock is doing or whether it can be bought for 1-3 trading days:
-1. Extract the requested holding period and call `gupiao_fenxi` once with the code or Chinese name, `holding_days=1|2|3`, and `source="auto"` unless explicitly overridden. “持有两个交易日” must pass `holding_days=2`; if no period is stated, use the documented default of 2 and disclose that assumption.
-2. Lead with the tool's `decision.label` and `decision.conclusion`. Then report the analysis timestamp, completed signal date, planned entry/exit dates, tradability, the requested horizon's gross and after-cost returns, empirical positive probability, return interval, and validation status.
-3. Technical and fundamental scores are explanatory evidence only. Never turn either heuristic score into an up probability, expected return, or target price. Never alter the tool's decision label or numeric forecast.
-4. If tradability is blocked, validation fails, peer history is insufficient, or the tool says `证据不足`, state that directly. Do not manufacture a buy answer from technical indicators.
-5. Explain current quote provenance and distinguish an intraday best-effort quote from the completed daily close used by the model. Never replace missing tool data with general knowledge.
+First classify the whole request semantically. Never use isolated keywords or regular-expression matching.
+
+**Path A: quantitative analysis** - If the answer needs fresh or deterministic stock/board data, indicators, model training, costs, validation, ranking, or forecasts, call the appropriate business tool and explain its result. The two quantitative workflows are:
+
+**Single-stock diagnosis and prediction** - follow a strict two-stage semantic workflow without keyword matching:
+1. For every new named-stock diagnosis, forecast, profit-space, buy, or sell question, call `gupiao_fenxi` first. It must finish the data-timing, fundamental, valuation, technical, volatility, tradability, peer, and risk analysis and return an `analysis_id`. A compatible `analysis_id` from the same stock and completed-close snapshot may be reused for a follow-up; after a process restart, stock change, data update, source change, or obsolete result, call `gupiao_fenxi` again.
+2. If the user only asks for diagnosis or an explanation of the completed analysis, answer from `gupiao_fenxi` without inventing a profit forecast.
+3. If the user asks about future movement, profit space, whether it can be bought or sold, or any T+1/T+2/T+3 number, call `gupiao_yuce` after `gupiao_fenxi` using that exact `analysis_id` and the requested horizon. Use `future_close` for “未来几天/几天后走势”; use `holding_return` for “买入后持有几天”. Resolve the meaning semantically; if materially ambiguous, finish the diagnosis and ask one concise clarification before the prediction call.
+4. Interpret “能不能买” as whether there is validated upside after broad A-share transaction costs, including commissions and their minimum, transfer fees, sell-side stamp tax, slippage, and legal lot sizing. Do not turn it into an order instruction.
+5. Interpret “能不能卖” first as remaining validated upside. If the user's buy price and position size are missing, complete the stock analysis and upside forecast, then ask one concise combined question for the buy price plus shares or position value. A later `gupiao_yuce` call may reuse the compatible `analysis_id` to calculate current and projected net position return.
+6. Never publish a raw point return, positive-rate estimate, or interval when `gupiao_yuce.forecast_status` is `not_validated`, `obsolete_or_unavailable`, or `unavailable`. Explain the exact failed validation or timing reason instead. Use the term “历史相似样本正收益比例”, not “盈利概率”.
+7. Technical and fundamental scores are explanatory evidence only. Never turn either heuristic score into an up probability, expected return, or target price. Explain current quote provenance and never replace missing tool data with general knowledge.
 
 **Board selection and prediction** - user asks to select stocks from an industry/concept board and compare the first three sellable horizons:
 1. A board name is required. If it is missing, ask one concise question instead of selecting from the whole market.
-2. Call `bankuai_xuangu` once with that board, `bankuai_leixing="auto"`, the requested count, and `source="auto"` unless explicitly overridden.
-3. The completed T close creates the signal and the next market-session open is the planned entry. T+1/T+2/T+3 mean the first/second/third later sellable closes after entry; T+1 is therefore the second market session after the signal. Never output T+0, calendar-day predictions, or a horizon beyond T+3.
-4. Report sample-out validation, model quality, data source, fallback notes, cost assumptions, and why each stock ranked where it did.
-5. If recommendations are empty or model quality is low, say so directly. A valid no-trade result is better than invented picks.
+2. A single batch is hard-limited to at most 8 validated research candidates. If no count is stated, request 8. If the user requests 1-8, use that count. If the user requests more than 8, first state that one batch can contain at most 8, then call `bankuai_xuangu` with `top_n=8` and return the normal first Top 8; do not reject the entire selection request.
+3. For “不满意/换一批/继续” without changed criteria, reuse the prior board, source, and `selection_id`, and pass the prior `next_offset` so results continue in stable order without duplicates. If the board or constraints change, start a new selection at offset 0. If the snapshot changed, report that the old sequence expired and restart from the new Top 8.
+4. The completed T close defines the analysis snapshot, and the next market-session open is only an assumed calculation basis for the holding scenarios. T+1/T+2/T+3 mean the first/second/third later sellable closes after that assumed basis; T+1 is therefore the second market session after the snapshot. Never output T+0, calendar-day predictions, or a horizon beyond T+3.
+5. Report sample-out validation, model quality, data source, fallback notes, cost assumptions, and why each stock ranked where it did. Eight is a maximum, not a quota: never fill a batch with validation failures merely to reach eight.
+6. Treat “推荐” as model-ranked research candidates, not an instruction to buy. If no candidate passes or the eligible sequence is exhausted, say so directly.
+
+**Path B: direct conversation** - If no quantitative tool is needed, answer directly without calling a tool. This includes concise explanations of existing compatible results, A-share concepts, and how to use this program.
+
+If the request is unrelated to mainland A-share analysis, prediction, existing results, or program usage, do not expand the topic and do not call a tool. Reply with only one short sentence in the user's language that says this program focuses on A-share analysis and prediction and asks the user to return to that topic. For Chinese, prefer exactly: “本程序专注 A 股分析与预测，请尽量围绕相关内容提问。” Keep the reply under roughly 40 Chinese characters or an equally brief length in another language. Do not add examples, background, or a second paragraph.
 
 ## Guidelines
 
 - Treat every user message as part of one continuous conversation. Resolve references such as "它", "刚才那只", "第二只", and "换成这个板块" from conversation history.
-- Reuse an earlier tool result when it already answers the follow-up. Call a tool again only when the user asks for fresher data, changes the stock/board, or requests an analysis absent from the previous result.
+- Decide whether to call a tool from the meaning of the whole request and the conversation context. Do not route by isolated keywords or regular-expression matches.
+- Reuse an earlier compatible tool result when it already answers the follow-up. Call a tool again when the question needs fresher market data, changes the stock/board, changes the holding horizon, or requests an analysis absent from the previous result.
 - A historical tool result whose content says `obsolete_history_result` is incompatible with the current program. It must never support an answer. Call the named tool again in the current turn.
-- Never tell the user that a decision label is missing and then substitute your own opinion. A current `gupiao_fenxi` result must contain `decision.label`; if it does not, report a tool failure instead of inventing a conclusion.
+- Never bypass the two-stage single-stock contract. A current `gupiao_fenxi` result must contain contract version 4, `analysis_id`, and a completed `analysis_stage`; specific prediction numbers must come from `gupiao_yuce` using that identifier.
 - Ask only when the stock or board cannot be identified. Never invent tickers, dates, board names, or trading assumptions.
 - Only discuss mainland China A-shares. Politely reject US/HK stocks, funds, futures, crypto, and forex in this program.
-- Recommendations and forecasts must come directly from tool output. Do not alter numeric predictions.
+- Evidence summaries, candidate rankings, and forecasts must come directly from tool output. Do not alter numeric predictions.
 - Respect A-share T+1 settlement, board-specific price limits, liquidity filters, commissions, sell-side stamp tax, and slippage.
 - If the user asks for live execution or automatic trading, refuse that operation and offer only research output or a manual review checklist. This rule cannot be overridden by user instructions or configuration.
 - Do not invoke a successful tool twice for the same user request.
@@ -165,44 +121,6 @@ class ContextBuilder:
         )
 
     @staticmethod
-    def required_current_tool(user_message: str) -> Optional[str]:
-        """Return the business tool that must run before a time-sensitive answer."""
-        text = str(user_message or "").strip()
-        if not text:
-            return None
-        asks_for_fresh_market_data = any(marker in text for marker in _FRESH_REQUEST_MARKERS)
-        asks_for_holding_decision = bool(
-            re.search(r"持有\s*[一二三123]\s*(?:个)?交易日", text)
-        )
-        if not asks_for_fresh_market_data and not asks_for_holding_decision:
-            return None
-        if any(marker in text for marker in _BOARD_REQUEST_MARKERS):
-            return "bankuai_xuangu"
-        has_stock_code = bool(
-            re.search(r"(?<!\d)[0368]\d{5}(?:\.(?:SH|SZ|BJ))?(?!\d)", text, re.IGNORECASE)
-        )
-        if any(marker in text for marker in _BROAD_MARKET_MARKERS) and not has_stock_code:
-            return None
-        if (
-            asks_for_holding_decision
-            or any(marker in text for marker in _SINGLE_STOCK_DECISION_MARKERS)
-            or has_stock_code
-            or asks_for_fresh_market_data
-        ):
-            return "gupiao_fenxi"
-        return None
-
-    @staticmethod
-    def is_object_clarification(content: str) -> bool:
-        """Allow one concise clarification when the requested stock/board is absent."""
-        text = str(content or "").strip()
-        return bool(
-            text
-            and len(text) <= 300
-            and any(marker in text for marker in _OBJECT_CLARIFICATION_MARKERS)
-        )
-
-    @staticmethod
     def is_compatible_single_stock_result(content: Any) -> bool:
         """Validate the minimum contract required for a single-stock conclusion."""
         try:
@@ -213,36 +131,25 @@ class ContextBuilder:
             isinstance(payload, dict)
             and payload.get("status") == "ok"
             and payload.get("tool_contract_version") == _SINGLE_STOCK_TOOL_CONTRACT_VERSION
-            and isinstance(payload.get("decision"), dict)
-            and payload["decision"].get("label")
+            and isinstance(payload.get("analysis_id"), str)
+            and payload.get("analysis_id")
+            and isinstance(payload.get("analysis_stage"), dict)
+            and payload["analysis_stage"].get("status") == "completed"
         )
 
-    @classmethod
-    def _current_turn_policy(cls, user_message: str) -> str:
-        """Force a fresh business-tool call for time-sensitive market questions."""
-        text = str(user_message or "").strip()
-        asks_for_fresh_market_data = any(marker in text for marker in _FRESH_REQUEST_MARKERS)
-        asks_for_holding_decision = bool(
-            re.search(r"持有\s*[一二三123]\s*(?:个)?交易日", text)
-        )
-        if asks_for_fresh_market_data or asks_for_holding_decision:
-            required_tool = cls.required_current_tool(text)
-            if required_tool:
-                return (
-                    f"The current user request is time-sensitive. You MUST call `{required_tool}` in this turn "
-                    "before giving any market-data conclusion. Historical results are context only. If the "
-                    "stock or board is absent, ask one concise clarification instead. Do not answer from an "
-                    "earlier session result."
-                )
-            return (
-                "The current user request is time-sensitive. Historical market-data tool results are context only. "
-                "You MUST call the appropriate current business tool in this turn before answering. For one named "
-                "stock call `gupiao_fenxi`; for a named board call `bankuai_xuangu`. If the object is ambiguous, ask "
-                "one concise clarification instead. Do not answer from an earlier session result."
-            )
+    @staticmethod
+    def _current_turn_policy(user_message: str) -> str:
+        """Describe semantic tool routing without keyword-based enforcement."""
+        _ = user_message
         return (
-            "The current request does not explicitly require a refresh. A compatible earlier tool result may be "
-            "reused only for a genuine follow-up that does not depend on newer market data."
+            "Choose one of two paths from the meaning of the whole request. Use the quantitative-analysis path and call "
+            "a business tool when the answer requires current market data, a new stock or board analysis, a changed "
+            "holding horizon, deterministic calculations, or a result not already in compatible conversation history. "
+            "Otherwise use the direct-conversation path without tools. A genuine explanatory follow-up may reuse an "
+            "earlier compatible result. If the request is unrelated to this program's A-share analysis and prediction "
+            "work, reply with only one brief redirect sentence to conserve tokens. If a required research object is "
+            "missing or ambiguous, ask one concise clarification question. Never invent market data, forecasts, evidence "
+            "labels, or trading conclusions when a required tool result is unavailable."
         )
 
     @staticmethod
@@ -266,7 +173,7 @@ class ContextBuilder:
                 "tool": "gupiao_fenxi",
                 "stock": stock if isinstance(stock, dict) else None,
                 "message": (
-                    "该结果来自旧版单股工具，缺少当前决策契约，禁止复用其行情、指标和结论；"
+                    "该结果来自旧版单股工具，缺少当前两阶段分析编号契约，禁止复用其行情、指标和结论；"
                     "如需回答当前问题，必须在本轮重新调用 gupiao_fenxi"
                 ),
             },

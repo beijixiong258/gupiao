@@ -1,12 +1,13 @@
-"""Tool registry for the two supported A-share research workflows."""
+"""Tool registry for the intentionally narrow A-share research workflows."""
 
 from __future__ import annotations
 
 from src.agent.tools import ToolRegistry
 from src.tools.bankuai_xuangu_tool import BankuaiXuanguTool
 from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
+from src.tools.gupiao_yuce_tool import GupiaoYuceTool
 
-_BUSINESS_TOOLS = (GupiaoFenxiTool, BankuaiXuanguTool)
+_BUSINESS_TOOLS = (GupiaoFenxiTool, GupiaoYuceTool, BankuaiXuanguTool)
 
 
 def build_registry(

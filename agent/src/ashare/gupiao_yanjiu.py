@@ -34,7 +34,7 @@ MARKET_DATA_STALE_WARNING_BUSINESS_DAYS = 2
 MARKET_DATA_STALE_ERROR_BUSINESS_DAYS = 7
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 5
-SINGLE_STOCK_TOOL_CONTRACT_VERSION = 2
+SINGLE_STOCK_TOOL_CONTRACT_VERSION = 3
 
 FEATURE_COLUMNS = [
     "ret_1",
@@ -83,6 +83,50 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("量化配置必须是 JSON 对象")
+
+    def finite_number(section: dict[str, Any], key: str, default: float, label: str) -> float:
+        try:
+            number = float(section.get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}.{key} 必须是数值") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{label}.{key} 必须是有限数值")
+        return number
+
+    data_settings = value.get("shuju", {})
+    if not isinstance(data_settings, dict):
+        raise ValueError("shuju 必须是 JSON 对象")
+    data_history_days = int(finite_number(data_settings, "history_calendar_days", 540, "shuju"))
+    max_board_stocks = int(finite_number(data_settings, "max_board_stocks", 20, "shuju"))
+    minimum_history_rows = int(finite_number(data_settings, "minimum_history_rows", 120, "shuju"))
+    data_pause = finite_number(data_settings, "request_pause_seconds", 0.15, "shuju")
+    if not 180 <= data_history_days <= 3650:
+        raise ValueError("shuju.history_calendar_days 必须在 180 到 3650 之间")
+    if not 1 <= max_board_stocks <= 100:
+        raise ValueError("shuju.max_board_stocks 必须在 1 到 100 之间")
+    if not 60 <= minimum_history_rows <= 2000:
+        raise ValueError("shuju.minimum_history_rows 必须在 60 到 2000 之间")
+    if not 0 <= data_pause <= 10:
+        raise ValueError("shuju.request_pause_seconds 必须在 0 到 10 之间")
+    if not isinstance(data_settings.get("akshare_bypass_proxy", True), bool):
+        raise ValueError("shuju.akshare_bypass_proxy 必须是 true 或 false")
+
+    filters = value.get("guolv", {})
+    if not isinstance(filters, dict):
+        raise ValueError("guolv 必须是 JSON 对象")
+    minimum_price = finite_number(filters, "min_price", 2.0, "guolv")
+    maximum_price = finite_number(filters, "max_price", 300.0, "guolv")
+    minimum_amount = finite_number(filters, "min_amount_yuan", 50_000_000, "guolv")
+    if minimum_price <= 0 or maximum_price <= minimum_price:
+        raise ValueError("guolv 价格范围必须满足 0 < min_price < max_price")
+    if minimum_amount < 0:
+        raise ValueError("guolv.min_amount_yuan 不能小于 0")
+    keywords = filters.get("exclude_name_keywords", [])
+    if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
+        raise ValueError("guolv.exclude_name_keywords 必须是字符串数组")
+    if not isinstance(filters.get("exclude_latest_limit_up", True), bool):
+        raise ValueError("guolv.exclude_latest_limit_up 必须是 true 或 false")
+
     model = value.get("moxing", {})
     if not isinstance(model, dict):
         raise ValueError("moxing 必须是 JSON 对象")
@@ -112,7 +156,11 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.validation_ratio 必须在 0.05 到 0.4 之间")
     if len(clip_quantiles) != 2 or not 0 <= clip_quantiles[0] < clip_quantiles[1] <= 1:
         raise ValueError("moxing.prediction_clip_quantiles 必须是两个递增的 0~1 数值")
-    if set(weights) != {1, 2, 3} or any(item < 0 for item in weights.values()) or sum(weights.values()) <= 0:
+    if (
+        set(weights) != {1, 2, 3}
+        or any(not math.isfinite(item) or item < 0 for item in weights.values())
+        or sum(weights.values()) <= 0
+    ):
         raise ValueError("moxing.horizon_weights 必须为 T+1/T+2/T+3 提供非负权重且总和大于0")
     if any(item <= 0 for item in positive_integer_fields.values()):
         raise ValueError("moxing 的样本数、验证天数和 Top-N 配置必须为正整数")
@@ -120,6 +168,24 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.min_direction_accuracy 必须在 0.5 到 1 之间")
     if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1:
         raise ValueError("moxing 的 Rank IC 和基线提升门槛必须在 -1 到 1 之间")
+    learning_rate = finite_number(model, "learning_rate", 0.05, "moxing")
+    l2_regularization = finite_number(model, "l2_regularization", 1.0, "moxing")
+    model_integer_fields = {
+        "max_iter": int(finite_number(model, "max_iter", 180, "moxing")),
+        "max_leaf_nodes": int(finite_number(model, "max_leaf_nodes", 15, "moxing")),
+        "max_depth": int(finite_number(model, "max_depth", 4, "moxing")),
+        "min_samples_leaf": int(finite_number(model, "min_samples_leaf", 30, "moxing")),
+    }
+    try:
+        int(model.get("random_state", 42))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("moxing.random_state 必须是整数") from exc
+    if not 0 < learning_rate <= 1:
+        raise ValueError("moxing.learning_rate 必须在 0 到 1 之间")
+    if l2_regularization < 0:
+        raise ValueError("moxing.l2_regularization 不能小于 0")
+    if any(item <= 0 for item in model_integer_fields.values()):
+        raise ValueError("moxing 的迭代次数、树规模、深度和叶节点样本数必须为正整数")
     max_holding_days = int(value.get("jiaoyi", {}).get("max_holding_days", 0))
     if max_holding_days != 3:
         raise ValueError("jiaoyi.max_holding_days 必须为 3")
@@ -141,9 +207,16 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         walk_forward_folds = int(single.get("walk_forward_folds", 3))
         minimum_passed_folds = int(single.get("min_passed_folds", 2))
         minimum_feature_coverage = float(single.get("min_feature_coverage", 0.2))
-        minimum_net_return = float(single.get("decision_min_net_return", 0.003))
-        minimum_probability = float(single.get("decision_min_up_probability", 0.55))
-        maximum_entry_gap = float(single.get("maximum_entry_gap_pct", 0.03))
+        minimum_net_return = float(single.get("assessment_min_net_return", 0.003))
+        minimum_probability = float(single.get("assessment_min_positive_probability", 0.55))
+        single_minimum_history_rows = int(single.get("minimum_history_rows", 180))
+        minimum_listing_days = int(single.get("min_listing_calendar_days", 180))
+        single_minimum_amount = float(single.get("min_amount_yuan", 30_000_000))
+        single_pause = float(single.get("request_pause_seconds", 0.08))
+        validation_window_days = int(single.get("validation_window_days", 45))
+        minimum_training_dates = int(single.get("minimum_training_dates", 120))
+        minimum_fold_training = int(single.get("min_fold_training_samples", 500))
+        minimum_fold_validation = int(single.get("min_fold_validation_samples", 80))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"dangu 数值配置无效：{exc}") from exc
     if not 540 <= single_history_days <= 1800:
@@ -159,9 +232,19 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
     if not 0 < minimum_feature_coverage <= 1:
         raise ValueError("dangu.min_feature_coverage 必须在0到1之间")
     if not 0 <= minimum_net_return <= 0.2 or not 0.5 <= minimum_probability <= 1:
-        raise ValueError("dangu 的决策收益或上涨比例门槛无效")
-    if not 0 <= maximum_entry_gap <= 0.2:
-        raise ValueError("dangu.maximum_entry_gap_pct 必须在0到0.2之间")
+        raise ValueError("dangu 的证据评估收益或上涨比例门槛无效")
+    if single_minimum_history_rows < 60:
+        raise ValueError("dangu.minimum_history_rows 必须至少为 60")
+    if minimum_listing_days < 0 or single_minimum_amount < 0:
+        raise ValueError("dangu 的最少上市天数和最低成交额不能小于 0")
+    if not 0 <= single_pause <= 10:
+        raise ValueError("dangu.request_pause_seconds 必须在 0 到 10 之间")
+    if validation_window_days < 20 or minimum_training_dates < 80:
+        raise ValueError("dangu 的验证窗口至少为 20 日，训练日期至少为 80 日")
+    if minimum_fold_training <= 0 or minimum_fold_validation <= 0:
+        raise ValueError("dangu 的每折训练和验证样本数必须为正整数")
+    if not str(trading.get("cost_scenario", "")).strip():
+        raise ValueError("jiaoyi.cost_scenario 不能为空")
     return value, str(path)
 
 
@@ -324,19 +407,27 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
     raw = str(gupiao).strip()
     if shi_a_gu(raw):
         code = biaozhunhua_daima(raw)
-        cached = _match_stock_basic(_stock_basic_cache(), code) or {}
-        if not cached.get("name"):
+        resolved: dict[str, Any] = {}
+        if source in {"auto", "tushare"}:
+            resolved = _match_stock_basic(_stock_basic_cache(), code) or {}
+        if not resolved.get("name") and source in {"auto", "tushare"}:
             try:
-                cached = _match_stock_basic(_akshare_name_table(), code) or cached
-                if cached.get("name"):
+                resolved = _match_stock_basic(_load_or_fetch_stock_basic(_tushare_pro(), {}), code) or resolved
+            except Exception as exc:
+                warnings.append(f"Tushare 股票名称暂不可用：{exc}")
+        if not resolved.get("name") and source in {"auto", "akshare"}:
+            try:
+                resolved = _match_stock_basic(_akshare_name_table(), code) or resolved
+                if resolved.get("name"):
                     warnings.append("股票名称来自 AKShare 本地代码表缓存")
             except Exception as exc:
                 warnings.append(f"股票名称表暂不可用：{exc}")
-        return code, cached, warnings
+        return code, resolved, warnings
 
-    cached = _match_stock_basic(_stock_basic_cache(), raw)
-    if cached and cached.get("ts_code"):
-        return biaozhunhua_daima(str(cached["ts_code"])), cached, warnings
+    if source in {"auto", "tushare"}:
+        cached = _match_stock_basic(_stock_basic_cache(), raw)
+        if cached and cached.get("ts_code"):
+            return biaozhunhua_daima(str(cached["ts_code"])), cached, warnings
 
     errors: list[str] = []
     if source in {"auto", "tushare"}:
@@ -354,18 +445,19 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
             if source == "tushare":
                 raise RuntimeError(errors[-1]) from exc
 
-    try:
-        table = _akshare_name_table()
-        match = _match_stock_basic(table, raw)
-        if match and match.get("ts_code"):
-            if errors:
-                warnings.extend(errors)
-            warnings.append("股票名称由 AKShare 免费接口解析")
-            return biaozhunhua_daima(str(match["ts_code"])), match, warnings
-    except ValueError:
-        raise
-    except Exception as exc:
-        errors.append(f"AKShare 名称解析失败：{exc}")
+    if source in {"auto", "akshare"}:
+        try:
+            table = _akshare_name_table()
+            match = _match_stock_basic(table, raw)
+            if match and match.get("ts_code"):
+                if errors:
+                    warnings.extend(errors)
+                warnings.append("股票名称由 AKShare 免费接口解析")
+                return biaozhunhua_daima(str(match["ts_code"])), match, warnings
+        except ValueError:
+            raise
+        except Exception as exc:
+            errors.append(f"AKShare 名称解析失败：{exc}")
     raise RuntimeError("；".join(errors) or f"无法识别股票：{gupiao}")
 
 
@@ -1314,19 +1406,26 @@ def fenxi_gupiao(
             tradability=tradability,
         )
     except Exception as exc:
-        fallback_label = "回避" if not tradability.get("can_open_position") else "证据不足"
+        fallback_label = "证据偏负面" if not tradability.get("basic_execution_feasible") else "证据不足"
         fallback_reasons = list(tradability.get("hard_blocks", []))
         fallback_reasons.append(f"单股量化模型本次不可用：{exc}")
         quantitative = {
             "status": "unavailable",
             "requested_horizon": f"T+{holding_days}",
             "forecast": {},
+            "future_3_trading_days": {
+                "status": "unavailable",
+                "signal_date": str(technical["trade_date"]),
+                "forecast": {},
+                "error": str(exc),
+            },
             "validation": {"horizons": {}, "passed_horizons": 0},
-            "decision": {
-                "label": fallback_label,
+            "analysis_assessment": {
+                "evidence_label": fallback_label,
                 "requested_horizon": f"T+{holding_days}",
-                "conclusion": f"{fallback_label}：{fallback_reasons[0]}",
+                "summary": f"{fallback_label}：{fallback_reasons[0]}",
                 "reasons": fallback_reasons,
+                "responsibility_note": "这是分析证据汇总，不是交易指令；最终决定由用户自行作出。",
             },
             "error": str(exc),
             "limitations": ["模型失败时不使用启发式技术分替代收益预测"],
@@ -1356,7 +1455,7 @@ def fenxi_gupiao(
     risks.extend(str(value) for value in tradability.get("hard_blocks", []))
     risks.extend(str(value) for value in tradability.get("cautions", []))
     if quantitative.get("status") != "ok":
-        risks.append("指定持有期量化模型本次不可用或同行样本不足，程序不会生成买入倾向")
+        risks.append("指定持有期量化模型本次不可用或同行样本不足，相关证据不足")
 
     result: dict[str, Any] = {
         "status": "ok",
@@ -1384,7 +1483,8 @@ def fenxi_gupiao(
         "current_quote": current_quote,
         "tradability": tradability,
         "quantitative_analysis": quantitative,
-        "decision": quantitative.get("decision", {}),
+        "future_3_trading_days": quantitative.get("future_3_trading_days", {}),
+        "analysis_assessment": quantitative.get("analysis_assessment", {}),
         "technical_analysis": technical,
         "fundamental_analysis": {
             **fundamentals,
@@ -1400,9 +1500,9 @@ def fenxi_gupiao(
         "configuration": {"quant_config_path": resolved_config},
         "scope_note": (
             "这是基于公开数据、同行面板和滚动样本外验证的A股研究结果，不是收益保证；"
-            "数值、模型门槛和决策标签由程序生成，LLM只负责解释，不得改写"
+            "数值、模型门槛和证据标签由程序生成，LLM只负责解释，不得改写"
         ),
-        "execution_policy": "research_only：程序不连接券商、不读取交易账户、不提交委托，所有买卖决定由用户人工完成。",
+        "execution_policy": "research_only：程序只做分析和预测，不连接券商、不读取交易账户、不提交委托，也不替用户作买卖决定。",
     }
 
     if run_dir:

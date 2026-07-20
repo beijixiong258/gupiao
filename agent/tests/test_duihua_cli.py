@@ -64,3 +64,22 @@ def test_no_subcommand_starts_chat(monkeypatch) -> None:
     assert cli.main([]) == 0
     assert cli.main(["chat", "--max-iter", "7", "--new"]) == 0
     assert calls == [(50, None, False), (7, None, True)]
+
+
+def test_clear_history_command_requires_confirmation_and_removes_saved_sessions(tmp_path, monkeypatch) -> None:
+    store = DuihuaCunchu(tmp_path)
+    session = store.xinjian()
+    session.lunshu = 1
+    session.xiaoxi = [{"role": "user", "content": "旧问题"}]
+    store.baocun(session)
+    fake_agent = _FakeAgent()
+    prompts = iter(["/clear-history", "确认清除", "/exit"])
+    monkeypatch.setattr(huihua_module, "DUIHUA_MULU", tmp_path)
+    monkeypatch.setattr(preflight_module, "run_preflight", lambda console: [])
+    monkeypatch.setattr(cli, "_build_agent", lambda max_iter, event_callback=None: fake_agent)
+    monkeypatch.setattr(cli.console, "input", lambda *_args, **_kwargs: next(prompts))
+
+    assert cli.cmd_chat(5) == cli.EXIT_SUCCESS
+
+    assert DuihuaCunchu(tmp_path).liechu() == []
+    assert fake_agent.calls == []

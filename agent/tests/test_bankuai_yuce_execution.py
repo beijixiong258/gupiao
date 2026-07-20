@@ -13,6 +13,7 @@ from src.ashare import bankuai_yuce
 from src.ashare.bankuai_yuce import (
     _fetch_histories,
     _best_name,
+    _paginate_candidates,
     _position_for_budget,
     _prediction_rows,
     goujian_moxing_shuju,
@@ -99,6 +100,30 @@ def test_position_sizing_obeys_board_buy_units_and_budget() -> None:
     assert star["buy_share_increment"] == 1
     assert unaffordable["estimated_buy_shares"] == 0
     assert unaffordable["execution_feasible"] is False
+
+
+def test_selection_batches_are_capped_ranked_and_do_not_repeat() -> None:
+    eligible = [{"ts_code": f"600{index:03d}.SH"} for index in range(1, 19)]
+
+    first, first_next, first_has_more = _paginate_candidates(eligible, offset=0, batch_size=8)
+    second, second_next, second_has_more = _paginate_candidates(eligible, offset=first_next, batch_size=8)
+    last, last_next, last_has_more = _paginate_candidates(eligible, offset=second_next, batch_size=8)
+
+    assert [item["candidate_rank"] for item in first] == list(range(1, 9))
+    assert [item["candidate_rank"] for item in second] == list(range(9, 17))
+    assert [item["ts_code"] for item in first] == [item["ts_code"] for item in eligible[:8]]
+    assert not ({item["ts_code"] for item in first} & {item["ts_code"] for item in second})
+    assert (first_next, first_has_more) == (8, True)
+    assert (second_next, second_has_more) == (16, True)
+    assert (last_next, last_has_more) == (18, False)
+    assert [item["candidate_rank"] for item in last] == [17, 18]
+
+
+def test_selection_offset_requires_stable_sequence_id() -> None:
+    result = bankuai_yuce.bankuai_xuangu(bankuai="白酒", offset=8)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "selection_id_required"
 
 
 def test_ambiguous_board_name_is_not_silently_selected() -> None:
@@ -210,7 +235,9 @@ def test_only_validated_horizons_drive_weighted_return_and_price_is_bounded() ->
     row = _prediction_rows(predictions, constituents, validation, config, 0.0)[0]
 
     assert row["ranking_horizons"] == ["T+2"]
-    assert row["suggested_exit"] == "T+2"
+    assert row["strongest_forecast_horizon"] == "T+2"
+    assert row["strongest_horizon_trading_days"] == 2
+    assert row["strongest_horizon_validation_passed"] is True
     assert row["weighted_expected_net_return"] == row["forecast"]["T+2"]["estimated_net_return_after_cost"]
     assert row["forecast"]["T+1"]["used_for_ranking"] is False
     assert row["forecast"]["T+1"]["predicted_close"] is None
@@ -255,7 +282,9 @@ def test_validated_zero_weight_horizon_does_not_silently_become_equal_weight() -
 
     assert row["ranking_horizons"] == []
     assert row["weighted_expected_net_return"] is None
-    assert row["suggested_exit"] is None
+    assert row["strongest_forecast_horizon"] is None
+    assert row["strongest_horizon_trading_days"] is None
+    assert row["strongest_horizon_validation_passed"] is False
 
 
 def test_validation_reports_top_n_cost_metrics_and_refits_all_labeled_rows() -> None:

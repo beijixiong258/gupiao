@@ -16,6 +16,7 @@ from src.ashare.bankuai_yuce import (
     goujian_moxing_shuju,
     xunlian_yuce_moxing,
 )
+from src.ashare.dangu_yuce import _future_schedule_unavailable_reason
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
     _a_share_rules,
@@ -117,7 +118,7 @@ def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
 
 
 def test_agent_exposes_research_tools_only() -> None:
-    assert build_registry().tool_names == ["gupiao_fenxi", "bankuai_xuangu"]
+    assert build_registry().tool_names == ["gupiao_fenxi", "gupiao_yuce", "bankuai_xuangu"]
 
 
 def test_filter_removes_st_illiquid_and_limit_up_rows() -> None:
@@ -153,10 +154,48 @@ def test_stock_basic_cache_reads_existing_csv(tmp_path: Path, monkeypatch: pytes
     assert cached.to_dict("records") == [{"ts_code": "600519.SH", "name": "贵州茅台"}]
 
 
-def test_single_stock_rules_do_not_claim_a_single_stock_forecast() -> None:
+def test_single_stock_rules_describe_supported_t3_forecast() -> None:
     rules = _a_share_rules("600519.SH", "贵州茅台")
-    assert "单股工具不输出" in rules["prediction_horizon"]
-    assert "指定板块选股" in rules["prediction_horizon"]
+    assert "单股工具支持 T+1/T+2/T+3" in rules["prediction_horizon"]
+    assert "不伪造" in rules["prediction_horizon"]
+
+
+def test_model_panel_builds_literal_next_three_session_close_labels() -> None:
+    history = _history(9, rows=100)
+    panel = goujian_moxing_shuju(
+        {"600519.SH": history},
+        {"600519.SH": "贵州茅台"},
+        [1, 2, 3],
+    )
+    signal_index = len(history) - 4
+    signal_date = pd.Timestamp(history.iloc[signal_index]["trade_date"]).normalize()
+    row = panel.loc[panel["trade_date"] == signal_date].iloc[0]
+    signal_close = float(history.iloc[signal_index]["close"])
+
+    for horizon in [1, 2, 3]:
+        expected = history.iloc[signal_index + horizon]
+        assert row[f"future_date_t{horizon}"] == pd.Timestamp(expected["trade_date"]).normalize()
+        assert row[f"future_close_t{horizon}"] == pytest.approx(float(expected["close"]))
+        assert row[f"future_return_t{horizon}"] == pytest.approx(float(expected["close"]) / signal_close - 1.0)
+
+
+def test_future_forecast_rejects_first_target_that_already_closed() -> None:
+    schedule = {"future_session_dates": {"T+1": "2026-07-20"}}
+    post_close = {
+        "market_clock": {
+            "captured_at": "2026-07-20 15:52:00",
+            "session_status": "post_close",
+        }
+    }
+    during_session = {
+        "market_clock": {
+            "captured_at": "2026-07-20 10:00:00",
+            "session_status": "trading",
+        }
+    }
+
+    assert "已经结束" in _future_schedule_unavailable_reason(schedule, post_close)
+    assert _future_schedule_unavailable_reason(schedule, during_session) == ""
 
 
 def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:

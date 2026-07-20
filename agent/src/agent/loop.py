@@ -32,7 +32,6 @@ from src.providers.chat import ChatLLM
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
 TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
 KEEP_RECENT = 3
-TOOL_RESULT_LIMIT = 10_000
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
@@ -355,17 +354,14 @@ class AgentLoop:
         context = ContextBuilder(self.registry, self.memory,
                                   persistent_memory=self._persistent_memory)
         messages = context.build_messages(user_message, history)
-        required_current_tool = context.required_current_tool(user_message)
         react_trace: List[Dict[str, Any]] = []
+        durable_history = _export_history(messages)
 
         trace = TraceWriter(run_dir)
         trace.write({"type": "start", "prompt": user_message[:500]})
 
         iteration = 0
         final_content = ""
-        fresh_tool_retry_count = 0
-        enforcement_failure_reason = ""
-
         try:
             while iteration < self.max_iterations:
                 if self._cancelled:
@@ -410,84 +406,26 @@ class AgentLoop:
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
                 if not response.has_tool_calls:
-                    candidate_content = response.content or ""
-                    missing_required_tool = bool(
-                        required_current_tool
-                        and required_current_tool not in self._called_ok
-                    )
-                    if (
-                        missing_required_tool
-                        and context.is_object_clarification(candidate_content)
-                    ):
-                        final_content = candidate_content
-                        messages.append({"role": "assistant", "content": final_content})
-                        trace.write({
-                            "type": "required_tool_clarification",
-                            "iter": iteration,
-                            "tool": required_current_tool,
-                            "content": final_content[:500],
-                        })
-                        react_trace.append({"type": "clarification", "content": final_content[:500]})
-                        break
-                    if missing_required_tool and fresh_tool_retry_count < 1:
-                        fresh_tool_retry_count += 1
-                        trace.write({
-                            "type": "required_tool_answer_blocked",
-                            "iter": iteration,
-                            "tool": required_current_tool,
-                            "blocked_preview": candidate_content[:500],
-                        })
-                        react_trace.append({
-                            "type": "answer_blocked",
-                            "reason": f"本轮尚未成功调用 {required_current_tool}",
-                        })
-                        messages.append(_TransientMessage({
-                            "role": "assistant",
-                            "content": "我需要先获取本轮数据，不能直接沿用历史结论。",
-                        }))
-                        messages.append(_TransientMessage({
-                            "role": "user",
-                            "content": (
-                                f"系统校验：本轮尚未成功调用 {required_current_tool}。"
-                                "当前问题依赖最新市场数据，禁止使用历史结果直接作答。"
-                                "请现在先调用该工具；如果研究对象确实无法识别，只问一个简短的澄清问题。"
-                            ),
-                        }))
-                        continue
-                    if missing_required_tool:
-                        enforcement_failure_reason = (
-                            f"当前问题必须在本轮重新调用 {required_current_tool}，"
-                            "但模型连续两次未发起有效工具调用；已拦截可能过期的回答。"
-                        )
-                        trace.write({
-                            "type": "required_tool_enforcement_failed",
-                            "iter": iteration,
-                            "tool": required_current_tool,
-                            "blocked_preview": candidate_content[:500],
-                        })
-                        react_trace.append({
-                            "type": "answer_blocked",
-                            "reason": enforcement_failure_reason,
-                        })
-                        break
-                    final_content = candidate_content
-                    messages.append({"role": "assistant", "content": final_content})
+                    final_content = response.content or ""
+                    answer_message = {"role": "assistant", "content": final_content}
+                    messages.append(answer_message)
+                    durable_history.append(copy.deepcopy(answer_message))
                     trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
 
-                messages.append(
-                    context.format_assistant_tool_calls(
-                        response.tool_calls,
-                        content=response.content,
-                        reasoning_content=response.reasoning_content or thinking_text or None,
-                        provider_data=response.provider_data,
-                    )
+                assistant_tool_message = context.format_assistant_tool_calls(
+                    response.tool_calls,
+                    content=response.content,
+                    reasoning_content=response.reasoning_content or thinking_text or None,
+                    provider_data=response.provider_data,
                 )
+                messages.append(assistant_tool_message)
+                durable_history.append(copy.deepcopy(assistant_tool_message))
 
                 # Execute tools with read/write batching
                 compact_requested, focus_topic = self._process_tool_calls(
-                    response.tool_calls, context, messages, trace, react_trace, iteration,
+                    response.tool_calls, context, messages, durable_history, trace, react_trace, iteration,
                 )
 
                 # Layer 3: compress after all tools have executed
@@ -500,6 +438,17 @@ class AgentLoop:
             trace.write({"type": "end", "status": "error", "reason": str(exc), "iterations": iteration})
             trace.close()
             state_store.mark_failure(run_dir, str(exc))
+            state_store.save_response(
+                run_dir,
+                {
+                    "status": "failed",
+                    "content": "",
+                    "reason": str(exc),
+                    "iterations": iteration,
+                    "react_trace": react_trace,
+                    "history": durable_history,
+                },
+            )
             return {
                 "status": "failed",
                 "reason": str(exc),
@@ -507,16 +456,13 @@ class AgentLoop:
                 "run_id": run_dir.name,
                 "content": "",
                 "react_trace": react_trace,
-                "history": _export_history(messages),
+                "history": durable_history,
             }
 
         # Determine final status
         if self._cancelled:
             state_store.mark_failure(run_dir, "cancelled by user")
             final_status = "cancelled"
-        elif enforcement_failure_reason:
-            state_store.mark_failure(run_dir, enforcement_failure_reason)
-            final_status = "failed"
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
@@ -526,15 +472,26 @@ class AgentLoop:
 
         trace.write({"type": "end", "status": final_status, "iterations": iteration})
         trace.close()
+        state_store.save_response(
+            run_dir,
+            {
+                "status": final_status,
+                "content": final_content,
+                "reason": "",
+                "iterations": iteration,
+                "react_trace": react_trace,
+                "history": durable_history,
+            },
+        )
 
         return {
             "status": final_status,
             "run_dir": str(run_dir),
             "run_id": run_dir.name,
             "content": final_content,
-            "reason": enforcement_failure_reason,
+            "reason": "",
             "react_trace": react_trace,
-            "history": _export_history(messages),
+            "history": durable_history,
         }
 
     # -- Tool execution with read/write batching --------------------------------
@@ -544,6 +501,7 @@ class AgentLoop:
         tool_calls: list,
         context: ContextBuilder,
         messages: list,
+        durable_history: list[dict[str, Any]],
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
@@ -570,7 +528,9 @@ class AgentLoop:
             if tc.name == "compact":
                 compact_requested = True
                 focus_topic = tc.arguments.get("focus_topic", "")
-                messages.append(context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}'))
+                compact_result = context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}')
+                messages.append(compact_result)
+                durable_history.append(copy.deepcopy(compact_result))
                 trace.write({"type": "compact_requested", "iter": iteration})
                 continue
 
@@ -579,7 +539,9 @@ class AgentLoop:
             if tc.name in self._called_ok and not is_repeatable:
                 logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
                 skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
-                messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
+                skipped_result = context.format_tool_result(tc.id, tc.name, skip_msg)
+                messages.append(skipped_result)
+                durable_history.append(copy.deepcopy(skipped_result))
                 trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
                 react_trace.append({"type": "tool_skipped", "tool": tc.name})
                 continue
@@ -591,9 +553,9 @@ class AgentLoop:
 
         # Batch execute: consecutive readonly → parallel, write → serial
         if len(to_execute) == 1:
-            self._execute_single(to_execute[0], context, messages, trace, react_trace, iteration)
+            self._execute_single(to_execute[0], context, messages, durable_history, trace, react_trace, iteration)
         else:
-            self._batch_execute(to_execute, context, messages, trace, react_trace, iteration)
+            self._batch_execute(to_execute, context, messages, durable_history, trace, react_trace, iteration)
 
         return compact_requested, focus_topic
 
@@ -602,6 +564,7 @@ class AgentLoop:
         tool_calls: list,
         context: ContextBuilder,
         messages: list,
+        durable_history: list[dict[str, Any]],
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
@@ -637,16 +600,17 @@ class AgentLoop:
 
         for mode, batch in batches:
             if mode == "parallel" and len(batch) > 1:
-                self._execute_parallel(batch, context, messages, trace, react_trace, iteration)
+                self._execute_parallel(batch, context, messages, durable_history, trace, react_trace, iteration)
             else:
                 for tc in batch:
-                    self._execute_single(tc, context, messages, trace, react_trace, iteration)
+                    self._execute_single(tc, context, messages, durable_history, trace, react_trace, iteration)
 
     def _execute_parallel(
         self,
         tool_calls: list,
         context: ContextBuilder,
         messages: list,
+        durable_history: list[dict[str, Any]],
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
@@ -689,13 +653,16 @@ class AgentLoop:
 
         # Process results in order
         for tc, result, elapsed_ms in results:
-            self._finalize_tool_result(tc, result, elapsed_ms, context, messages, trace, react_trace, iteration)
+            self._finalize_tool_result(
+                tc, result, elapsed_ms, context, messages, durable_history, trace, react_trace, iteration
+            )
 
     def _execute_single(
         self,
         tc: Any,
         context: ContextBuilder,
         messages: list,
+        durable_history: list[dict[str, Any]],
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
@@ -720,7 +687,9 @@ class AgentLoop:
         result = self.registry.execute(tc.name, args)
         elapsed_ms = int((_time.perf_counter() - t0) * 1000)
 
-        self._finalize_tool_result(tc, result, elapsed_ms, context, messages, trace, react_trace, iteration)
+        self._finalize_tool_result(
+            tc, result, elapsed_ms, context, messages, durable_history, trace, react_trace, iteration
+        )
 
     def _finalize_tool_result(
         self,
@@ -729,6 +698,7 @@ class AgentLoop:
         elapsed_ms: int,
         context: ContextBuilder,
         messages: list,
+        durable_history: list[dict[str, Any]],
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
@@ -754,8 +724,9 @@ class AgentLoop:
             self._called_ok.add(tc.name)
 
         status = "ok" if success else "error"
-        truncated = result[:TOOL_RESULT_LIMIT]
-        messages.append(context.format_tool_result(tc.id, tc.name, truncated))
+        tool_result_message = context.format_tool_result(tc.id, tc.name, result)
+        messages.append(tool_result_message)
+        durable_history.append(copy.deepcopy(tool_result_message))
 
         trace.write({"type": "tool_result", "iter": iteration, "tool": tc.name, "status": status, "elapsed_ms": elapsed_ms, "preview": result[:200]})
         react_trace.append({"type": "tool_call", "tool": tc.name, "result_preview": result[:200]})

@@ -163,7 +163,7 @@ def pinggu_kejiaoyixing(
     config: dict[str, Any],
     reference: datetime | None = None,
 ) -> dict[str, Any]:
-    """Apply A-share entry gates before a model result may become a recommendation."""
+    """Assess A-share execution constraints used as evidence in the analysis."""
     current = reference or datetime.now()
     clock = shichang_shizhong(current)
     settings = config.get("dangu", {})
@@ -175,7 +175,7 @@ def pinggu_kejiaoyixing(
     if "退" in upper_name:
         hard_blocks.append("股票简称包含退市风险标记")
     if "ST" in upper_name:
-        hard_blocks.append("股票简称包含 ST 风险标记，本模型不生成买入倾向")
+        hard_blocks.append("股票简称包含 ST 风险标记，短期模型证据可靠性受限")
     if upper_name.startswith(("N", "C")):
         hard_blocks.append("新股无涨跌幅阶段缺少稳定可比样本")
 
@@ -250,7 +250,7 @@ def pinggu_kejiaoyixing(
         "post_close",
         "non_trading_day",
     }
-    entry_timing_reason = "下一交易日开盘尚未发生，可按模型入口口径等待执行"
+    entry_timing_reason = "下一交易日开盘尚未发生，模型情景的入口时点仍有效"
     if session_status in {"trading", "midday_break", "close_pending"}:
         model_entry_timing_valid = False
         entry_timing_reason = "最近完整收盘信号对应的下一交易日开盘已经过去，当前盘中价不属于模型入口口径"
@@ -259,12 +259,12 @@ def pinggu_kejiaoyixing(
             model_entry_timing_valid = False
             entry_timing_reason = "收盘后行情源尚未提供今日完整日线，旧信号的计划开盘入口已经过去"
     if not model_entry_timing_valid:
-        cautions.append(entry_timing_reason + "；应等待最新完整收盘日后重新分析")
+        cautions.append(entry_timing_reason + "；需要在最新完整收盘日后重新分析")
 
     status = "blocked" if hard_blocks else ("caution" if cautions else "tradable")
     return {
         "status": status,
-        "can_open_position": not hard_blocks,
+        "basic_execution_feasible": not hard_blocks,
         "analysis_price": last_price,
         "analysis_price_basis": price_basis,
         "amount_yuan": amount_yuan,
@@ -852,7 +852,9 @@ def _fit_single_stock_models(
             residual_low, residual_high = np.nanquantile(residual, [0.10, 0.90])
             nearest_count = min(len(oof), max(40, len(oof) // 5))
             nearest_index = np.argsort(np.abs(predicted - latest_prediction))[:nearest_count]
-            positive_probability = float(np.mean(actual[nearest_index] > 0)) if nearest_count else None
+            nearest_actual = actual[nearest_index]
+            positive_probability = float(np.mean(nearest_actual > 0)) if nearest_count else None
+            empirical_low, empirical_high = np.nanquantile(nearest_actual, [0.10, 0.90])
             quality = _quality_score(
                 train_count=len(usable),
                 direction_accuracy=direction,
@@ -891,9 +893,10 @@ def _fit_single_stock_models(
                 "probability_calibration_samples": int(nearest_count),
                 "probability_method": "与当前预测最接近的滚动样本外预测，其实际毛收益为正的比例",
                 "prediction_interval_80": [
-                    round(latest_prediction + float(residual_low), 6),
-                    round(latest_prediction + float(residual_high), 6),
+                    round(float(empirical_low), 6),
+                    round(float(empirical_high), 6),
                 ],
+                "prediction_interval_method": "与正收益比例相同的近邻滚动样本外实际收益的10%至90%经验分位数",
                 "quality_score": round(quality, 4),
                 "quality_label": _quality_label(quality),
                 "validation_passed": validation_passed,
@@ -917,6 +920,264 @@ def _fit_single_stock_models(
                 "quality_label": "low",
                 "unavailable_reason": "滚动样本外折数或训练样本不足",
             })
+        validation["horizons"][f"T+{horizon}"] = horizon_validation
+
+    validation["passed_horizons"] = sum(
+        bool(value.get("validation_passed")) for value in validation["horizons"].values()
+    )
+    qualities = [float(value.get("quality_score", 0.0)) for value in validation["horizons"].values()]
+    validation["overall_quality_score"] = round(float(np.mean(qualities)), 4) if qualities else 0.0
+    validation["overall_quality_label"] = _quality_label(float(validation["overall_quality_score"]))
+    return predictions, validation
+
+
+def _fit_future_session_models(
+    *,
+    panel: pd.DataFrame,
+    latest: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Predict the next one to three market-session closes from the signal close."""
+    model_config = config["moxing"]
+    single_config = config.get("dangu", {})
+    minimum_coverage = float(single_config.get("min_feature_coverage", 0.20))
+    coverage = panel[SINGLE_STOCK_FEATURE_COLUMNS].notna().mean()
+    feature_columns = [
+        column
+        for column in SINGLE_STOCK_FEATURE_COLUMNS
+        if float(coverage.get(column, 0.0)) >= minimum_coverage
+    ]
+    if not feature_columns:
+        raise RuntimeError("未来三交易日模型没有达到覆盖率门槛的特征")
+
+    predictions = latest[["ts_code", "name", "trade_date", "close"] + feature_columns].copy()
+    validation: dict[str, Any] = {
+        "split_method": "purged_expanding_walk_forward_with_final_holdout",
+        "forecast_basis": "最近完整收盘价到未来第1/2/3个市场交易日收盘的累计收益",
+        "feature_count": int(len(feature_columns)),
+        "features": feature_columns,
+        "horizons": {},
+    }
+    horizons = [int(value) for value in model_config["horizons"]]
+    lower_q, upper_q = [
+        float(value) for value in model_config.get("prediction_clip_quantiles", [0.01, 0.99])
+    ]
+    minimum_train = int(
+        single_config.get("min_fold_training_samples", model_config.get("min_training_samples", 500))
+    )
+    minimum_validation = int(single_config.get("min_fold_validation_samples", 80))
+    expected_folds = max(2, int(single_config.get("walk_forward_folds", 3)))
+    min_passed_folds = max(1, int(single_config.get("min_passed_folds", 2)))
+    minimum_direction = float(model_config.get("min_direction_accuracy", 0.52))
+    minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
+    minimum_rank_days = int(model_config.get("min_rank_ic_days", 10))
+    minimum_skill = float(model_config.get("min_skill_vs_baseline", 0.01))
+
+    for horizon in horizons:
+        target_column = f"future_return_t{horizon}"
+        target_date_column = f"future_date_t{horizon}"
+        usable = panel.dropna(subset=[target_column, target_date_column]).copy()
+        usable["trade_date"] = pd.to_datetime(usable["trade_date"])
+        usable[target_date_column] = pd.to_datetime(usable[target_date_column])
+        dates = [pd.Timestamp(value) for value in sorted(usable["trade_date"].dropna().unique())]
+        boundaries = _walk_forward_boundaries(dates, config)
+        fold_records: list[dict[str, Any]] = []
+        oof_frames: list[pd.DataFrame] = []
+
+        for fold_number, (validation_start, validation_end) in enumerate(boundaries, start=1):
+            role = "final_holdout" if fold_number == len(boundaries) else "walk_forward_validation"
+            train = usable[
+                (usable["trade_date"] < validation_start)
+                & (usable[target_date_column] < validation_start)
+            ]
+            validation_frame = usable[usable["trade_date"] >= validation_start]
+            if validation_end is not None:
+                validation_frame = validation_frame[validation_frame["trade_date"] < validation_end]
+            if len(train) < minimum_train or len(validation_frame) < minimum_validation:
+                fold_records.append(
+                    {
+                        "fold": fold_number,
+                        "role": role,
+                        "status": "insufficient_samples",
+                        "train_samples": int(len(train)),
+                        "validation_samples": int(len(validation_frame)),
+                        "validation_start": validation_start.strftime("%Y-%m-%d"),
+                        "validation_end": validation_end.strftime("%Y-%m-%d") if validation_end is not None else None,
+                    }
+                )
+                continue
+
+            y_train_raw = train[target_column].astype(float).to_numpy()
+            clip_low = float(np.nanquantile(y_train_raw, lower_q))
+            clip_high = float(np.nanquantile(y_train_raw, upper_q))
+            pipeline = _build_model_pipeline(model_config)
+            pipeline.fit(train[feature_columns], np.clip(y_train_raw, clip_low, clip_high))
+            actual = validation_frame[target_column].astype(float).to_numpy()
+            predicted = np.clip(
+                pipeline.predict(validation_frame[feature_columns]),
+                clip_low,
+                clip_high,
+            )
+            baseline_value = float(np.median(y_train_raw))
+            baseline = np.full(len(actual), baseline_value)
+            mae = float(mean_absolute_error(actual, predicted))
+            baseline_mae = float(mean_absolute_error(actual, baseline))
+            skill = 1.0 - mae / baseline_mae if baseline_mae > 0 else 0.0
+            direction = float(np.mean((predicted > 0) == (actual > 0)))
+            rank_ic, rank_days = _daily_rank_ic(validation_frame["trade_date"], actual, predicted)
+            fold_passed = bool(direction >= 0.50 and skill > 0 and rank_ic >= 0)
+            fold_records.append(
+                {
+                    "fold": fold_number,
+                    "role": role,
+                    "status": "ok",
+                    "train_samples": int(len(train)),
+                    "validation_samples": int(len(validation_frame)),
+                    "validation_start": validation_start.strftime("%Y-%m-%d"),
+                    "validation_end": validation_frame["trade_date"].max().strftime("%Y-%m-%d"),
+                    "mae": round(mae, 6),
+                    "baseline_mae": round(baseline_mae, 6),
+                    "skill_vs_median_baseline": round(skill, 6),
+                    "direction_accuracy": round(direction, 6),
+                    "mean_daily_rank_ic": round(rank_ic, 6),
+                    "rank_ic_days": int(rank_days),
+                    "fold_passed": fold_passed,
+                }
+            )
+            oof = validation_frame[["trade_date", "ts_code"]].copy()
+            oof["actual"] = actual
+            oof["predicted"] = predicted
+            oof["baseline"] = baseline
+            oof_frames.append(oof)
+
+        latest_prediction = None
+        final_clip_low = None
+        final_clip_high = None
+        if len(usable) >= minimum_train:
+            full_y = usable[target_column].astype(float).to_numpy()
+            final_clip_low = float(np.nanquantile(full_y, lower_q))
+            final_clip_high = float(np.nanquantile(full_y, upper_q))
+            final_model = _build_model_pipeline(model_config)
+            final_model.fit(
+                usable[feature_columns],
+                np.clip(full_y, final_clip_low, final_clip_high),
+            )
+            latest_prediction = float(
+                np.clip(
+                    final_model.predict(latest[feature_columns])[0],
+                    final_clip_low,
+                    final_clip_high,
+                )
+            )
+            predictions[f"future_pred_t{horizon}"] = latest_prediction
+        else:
+            predictions[f"future_pred_t{horizon}"] = np.nan
+
+        successful_folds = [record for record in fold_records if record.get("status") == "ok"]
+        passed_folds = sum(bool(record.get("fold_passed")) for record in successful_folds)
+        final_holdout = next(
+            (record for record in successful_folds if record.get("role") == "final_holdout"),
+            None,
+        )
+        final_holdout_passed = bool(final_holdout and final_holdout.get("fold_passed"))
+        horizon_validation: dict[str, Any] = {
+            "status": "ok" if latest_prediction is not None else "insufficient_training_samples",
+            "walk_forward_folds_requested": expected_folds,
+            "walk_forward_folds_completed": int(len(successful_folds)),
+            "walk_forward_folds_passed": int(passed_folds),
+            "minimum_passed_folds": min_passed_folds,
+            "final_holdout_passed": final_holdout_passed,
+            "folds": fold_records,
+            "final_train_samples": int(len(usable)),
+            "final_training_end": (
+                usable[target_date_column].max().strftime("%Y-%m-%d") if not usable.empty else None
+            ),
+            "final_prediction_clip": (
+                [round(final_clip_low, 6), round(final_clip_high, 6)]
+                if final_clip_low is not None
+                else None
+            ),
+        }
+
+        if oof_frames and latest_prediction is not None:
+            oof = pd.concat(oof_frames, ignore_index=True)
+            actual = oof["actual"].to_numpy(dtype=float)
+            predicted = oof["predicted"].to_numpy(dtype=float)
+            baseline = oof["baseline"].to_numpy(dtype=float)
+            mae = float(mean_absolute_error(actual, predicted))
+            baseline_mae = float(mean_absolute_error(actual, baseline))
+            skill = 1.0 - mae / baseline_mae if baseline_mae > 0 else 0.0
+            direction = float(np.mean((predicted > 0) == (actual > 0)))
+            rank_ic, rank_days = _daily_rank_ic(oof["trade_date"], actual, predicted)
+            residual = actual - predicted
+            residual_low, residual_high = np.nanquantile(residual, [0.10, 0.90])
+            nearest_count = min(len(oof), max(40, len(oof) // 5))
+            nearest_index = np.argsort(np.abs(predicted - latest_prediction))[:nearest_count]
+            nearest_actual = actual[nearest_index]
+            positive_probability = (
+                float(np.mean(nearest_actual > 0)) if nearest_count else None
+            )
+            empirical_low, empirical_high = np.nanquantile(nearest_actual, [0.10, 0.90])
+            quality = _quality_score(
+                train_count=len(usable),
+                direction_accuracy=direction,
+                rank_ic=rank_ic,
+                skill_vs_baseline=skill,
+            )
+            validation_passed = bool(
+                len(successful_folds) == expected_folds
+                and passed_folds >= min_passed_folds
+                and final_holdout_passed
+                and direction >= minimum_direction
+                and rank_ic >= minimum_rank_ic
+                and rank_days >= minimum_rank_days
+                and skill >= minimum_skill
+            )
+            horizon_validation.update(
+                {
+                    "oos_samples": int(len(oof)),
+                    "mae": round(mae, 6),
+                    "baseline_mae": round(baseline_mae, 6),
+                    "skill_vs_median_baseline": round(skill, 6),
+                    "direction_accuracy": round(direction, 6),
+                    "mean_daily_rank_ic": round(rank_ic, 6),
+                    "rank_ic_days": int(rank_days),
+                    "residual_std": (
+                        round(float(np.std(residual, ddof=1)), 6) if len(residual) > 1 else None
+                    ),
+                    "latest_empirical_positive_probability": (
+                        round(positive_probability, 6) if positive_probability is not None else None
+                    ),
+                    "probability_calibration_samples": int(nearest_count),
+                    "probability_method": "与当前预测最接近的滚动样本外预测，其实际累计收益为正的比例",
+                    "prediction_interval_80": [
+                        round(float(empirical_low), 6),
+                        round(float(empirical_high), 6),
+                    ],
+                    "prediction_interval_method": "与正收益比例相同的近邻滚动样本外实际收益的10%至90%经验分位数",
+                    "quality_score": round(quality, 4),
+                    "quality_label": _quality_label(quality),
+                    "validation_passed": validation_passed,
+                    "validation_thresholds": {
+                        "completed_folds": expected_folds,
+                        "passed_folds": min_passed_folds,
+                        "final_holdout_must_pass": True,
+                        "direction_accuracy": minimum_direction,
+                        "mean_daily_rank_ic": minimum_rank_ic,
+                        "rank_ic_days": minimum_rank_days,
+                        "skill_vs_median_baseline": minimum_skill,
+                    },
+                }
+            )
+        else:
+            horizon_validation.update(
+                {
+                    "validation_passed": False,
+                    "quality_score": 0.0,
+                    "quality_label": "low",
+                    "unavailable_reason": "滚动样本外折数或训练样本不足",
+                }
+            )
         validation["horizons"][f"T+{horizon}"] = horizon_validation
 
     validation["passed_horizons"] = sum(
@@ -959,10 +1220,43 @@ def _next_market_sessions(signal_date: str, count: int = 4) -> dict[str, Any]:
     return {
         "source": source,
         "signal_date": signal.strftime("%Y-%m-%d"),
-        "planned_entry_date": sessions[0].strftime("%Y-%m-%d"),
-        "planned_exit_dates": {f"T+{horizon}": sessions[horizon].strftime("%Y-%m-%d") for horizon in [1, 2, 3]},
+        "future_session_dates": {
+            f"T+{horizon}": sessions[horizon - 1].strftime("%Y-%m-%d")
+            for horizon in [1, 2, 3]
+        },
+        "assumed_entry_date": sessions[0].strftime("%Y-%m-%d"),
+        "scenario_exit_dates": {f"T+{horizon}": sessions[horizon].strftime("%Y-%m-%d") for horizon in [1, 2, 3]},
         "warnings": warnings,
     }
+
+
+def _future_schedule_unavailable_reason(
+    schedule: dict[str, Any],
+    tradability: dict[str, Any],
+) -> str:
+    """Reject a so-called future horizon whose first target session has already ended."""
+    clock = tradability.get("market_clock") or {}
+    captured_at = pd.to_datetime(clock.get("captured_at"), errors="coerce")
+    first_target = pd.to_datetime(
+        (schedule.get("future_session_dates") or {}).get("T+1"),
+        errors="coerce",
+    )
+    if pd.isna(first_target):
+        return "无法确定未来第一个交易日"
+    if pd.isna(captured_at):
+        return "缺少分析时间，无法确认预测日期仍属于未来"
+    captured_day = pd.Timestamp(captured_at).normalize()
+    target_day = pd.Timestamp(first_target).normalize()
+    session_status = str(clock.get("session_status") or "")
+    if target_day < captured_day or (
+        target_day == captured_day
+        and session_status in {"close_pending", "post_close", "non_trading_day"}
+    ):
+        return (
+            f"行情源最新完整日线对应的首个预测日 {target_day.strftime('%Y-%m-%d')} 已经结束；"
+            "需要等待数据源更新到最新完整收盘后重新预测"
+        )
+    return ""
 
 
 def _fundamental_risk_flags(fundamentals: dict[str, Any]) -> list[str]:
@@ -989,7 +1283,7 @@ def _fundamental_risk_flags(fundamentals: dict[str, Any]) -> list[str]:
     return flags
 
 
-def _build_decision(
+def _build_analysis_assessment(
     *,
     holding_days: int,
     forecast: dict[str, Any],
@@ -1001,130 +1295,90 @@ def _build_decision(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     settings = config.get("dangu", {})
-    minimum_net = float(settings.get("decision_min_net_return", 0.003))
-    minimum_probability = float(settings.get("decision_min_up_probability", 0.55))
-    label = "证据不足"
+    minimum_net = float(settings.get("assessment_min_net_return", 0.003))
+    minimum_probability = float(settings.get("assessment_min_positive_probability", 0.55))
+    evidence_label = "证据不足"
     reasons: list[str] = []
     requested = forecast.get(f"T+{holding_days}") or {}
     metrics = validation.get("horizons", {}).get(f"T+{holding_days}") or {}
     fundamental_flags = _fundamental_risk_flags(fundamentals)
     entry_timing_valid = bool(tradability.get("model_entry_timing_valid", True))
-    entry_timing_reason = str(tradability.get("model_entry_timing_reason") or "模型计划开盘入口可用")
-    planned_entry = pd.to_datetime(schedule.get("planned_entry_date"), errors="coerce")
+    entry_timing_reason = str(tradability.get("model_entry_timing_reason") or "模型假设的开盘测算基准可用")
+    assumed_entry = pd.to_datetime(schedule.get("assumed_entry_date"), errors="coerce")
     captured_at = pd.to_datetime(
         (tradability.get("market_clock") or {}).get("captured_at"),
         errors="coerce",
     )
-    if pd.notna(planned_entry) and pd.notna(captured_at):
-        planned_entry = pd.Timestamp(planned_entry).normalize()
+    if pd.notna(assumed_entry) and pd.notna(captured_at):
+        assumed_entry = pd.Timestamp(assumed_entry).normalize()
         captured_day = pd.Timestamp(captured_at).normalize()
         captured_minute = pd.Timestamp(captured_at).hour * 60 + pd.Timestamp(captured_at).minute
-        if planned_entry < captured_day or (planned_entry == captured_day and captured_minute >= 9 * 60 + 30):
+        if assumed_entry < captured_day or (assumed_entry == captured_day and captured_minute >= 9 * 60 + 30):
             entry_timing_valid = False
-            entry_timing_reason = "该收盘信号对应的计划开盘入口已经过去，当前价格不属于模型训练的入口口径"
-        elif planned_entry > captured_day or captured_minute < 9 * 60 + 30:
+            entry_timing_reason = "该收盘信号对应的假设开盘入口已经过去，当前价格不属于模型训练的入口口径"
+        elif assumed_entry > captured_day or captured_minute < 9 * 60 + 30:
             entry_timing_valid = True
-            entry_timing_reason = "计划开盘入口尚未发生，可等待对应交易日执行条件"
+            entry_timing_reason = "模型假设的开盘入口尚未发生，情景时点仍有效"
 
-    if not tradability.get("can_open_position"):
-        label = "回避"
+    if not tradability.get("basic_execution_feasible"):
+        evidence_label = "证据偏负面"
         reasons.extend(str(value) for value in tradability.get("hard_blocks", []))
     elif not entry_timing_valid:
-        label = "等待"
+        evidence_label = "证据不足"
         reasons.append(entry_timing_reason)
     elif not requested or requested.get("entry_to_exit_gross_return") is None:
         reasons.append("指定持有期没有可用模型预测")
     elif not metrics.get("validation_passed"):
         reasons.append("指定持有期模型没有通过滚动样本外门槛")
     elif not requested.get("position_and_cost", {}).get("execution_feasible"):
-        label = "回避"
-        reasons.append("目标资金不足以满足该板块最低买入数量")
+        evidence_label = "证据偏负面"
+        reasons.append("按目标资金测算，无法满足该板块最低买入数量")
     else:
         net = float(requested.get("estimated_net_return_after_cost") or 0.0)
         probability = requested.get("empirical_positive_probability")
         probability_value = float(probability) if probability is not None else 0.5
         if net <= -minimum_net or probability_value < 0.45:
-            label = "回避"
+            evidence_label = "证据偏负面"
             reasons.append("通过验证的成本后期望或样本外上涨比例明显不利")
         elif net >= minimum_net and probability_value >= minimum_probability:
-            label = "倾向买入"
-            reasons.append("指定期限模型通过滚动样本外验证，成本后期望和经验上涨比例同时达标")
+            evidence_label = "证据偏正面"
+            reasons.append("指定期限模型通过滚动样本外验证，成本后期望和经验上涨比例同时达到分析门槛")
         else:
-            label = "等待"
-            reasons.append("模型有效，但成本后优势或经验上涨比例未达到买入门槛")
+            evidence_label = "证据中性"
+            reasons.append("模型有效，但成本后优势或经验上涨比例没有形成明显方向")
 
     rsi = _round_optional(technical.get("rsi_14"))
     ret_5 = _round_optional((technical.get("returns") or {}).get("5d"))
-    if label == "倾向买入" and ((rsi is not None and rsi >= 80) or (ret_5 is not None and ret_5 >= 0.18)):
-        label = "等待"
-        reasons.append("短线指标处于过热区，等待回落或新收盘信号确认")
-    if label == "倾向买入" and fundamental_flags:
-        label = "等待"
-        reasons.append("基本面存在明显风险项，量化短线优势不足以直接覆盖该风险")
+    if evidence_label == "证据偏正面" and (
+        (rsi is not None and rsi >= 80) or (ret_5 is not None and ret_5 >= 0.18)
+    ):
+        evidence_label = "证据中性"
+        reasons.append("短线指标处于过热区，正面模型证据受到追高风险削弱")
+    if evidence_label == "证据偏正面" and fundamental_flags:
+        evidence_label = "证据中性"
+        reasons.append("基本面存在明显风险项，短线量化证据不足以覆盖这些不确定性")
     reasons.extend(fundamental_flags)
-
-    signal_close = _round_optional(technical.get("close"), 3)
-    atr = _round_optional(technical.get("atr_14_pct")) or 0.0
-    requested_net = _round_optional(requested.get("estimated_net_return_after_cost")) or 0.0
-    maximum_gap = float(settings.get("maximum_entry_gap_pct", 0.03))
-    entry_plan_authorized = label == "倾向买入"
-    allowed_gap = (
-        max(0.0, min(maximum_gap, max(requested_net, 0.0) * 0.5, max(atr, 0.0) * 0.5))
-        if entry_plan_authorized
-        else None
-    )
-    maximum_entry_price = (
-        _round_price_tick(signal_close * (1.0 + allowed_gap))
-        if signal_close and allowed_gap is not None
-        else None
-    )
-    support = _round_optional(technical.get("support_20"), 3)
-    ma20 = _round_optional((technical.get("moving_averages") or {}).get("ma20"), 3)
-    invalidation = [
-        "下一交易日开盘出现一字涨停、停牌或成交显著不足时不执行",
-        f"下一交易日实际开盘价高于 {maximum_entry_price:.2f} 元时，不追价并重新分析" if maximum_entry_price else "下一交易日明显高开时重新分析，不沿用旧信号",
-        f"持有期内收盘跌破20日支撑参考 {support:.2f} 元时，逻辑失效但仍须遵守T+1卖出限制" if support else "持有期内趋势结构破坏时重新分析，但仍须遵守T+1卖出限制",
-        f"到计划退出日 {schedule.get('planned_exit_dates', {}).get(f'T+{holding_days}')} 按期限结束研究，不自动把短线变成长线",
-    ]
-    if ma20 is not None:
-        invalidation.append(f"收盘持续低于 MA20 参考 {ma20:.2f} 元且模型成本后期望转负时，不再保留买入逻辑")
-    conclusion_detail = reasons[0] if reasons else "指定期限证据不足"
+    summary_detail = reasons[0] if reasons else "指定期限证据不足"
     return {
-        "label": label,
+        "evidence_label": evidence_label,
         "requested_horizon": f"T+{holding_days}",
-        "conclusion": f"{label}：{conclusion_detail}",
+        "summary": f"{evidence_label}：{summary_detail}",
         "confidence": metrics.get("quality_label", "low") if metrics.get("validation_passed") else "insufficient",
         "reasons": reasons,
-        "decision_thresholds": {
+        "assessment_thresholds": {
             "minimum_net_return_after_cost": minimum_net,
             "minimum_empirical_positive_probability": minimum_probability,
             "model_validation_must_pass": True,
-            "tradability_must_pass": True,
+            "execution_constraints_must_be_clear": True,
         },
-        "entry_timing": {
+        "scenario_timing": {
             "valid": entry_timing_valid,
             "reason": entry_timing_reason,
-            "planned_entry_date": schedule.get("planned_entry_date"),
+            "assumed_entry_date": schedule.get("assumed_entry_date"),
+            "scenario_exit_date": schedule.get("scenario_exit_dates", {}).get(f"T+{holding_days}"),
         },
-        "entry_plan": {
-            "signal_close": signal_close,
-            "planned_entry_date": schedule.get("planned_entry_date"),
-            "authorized": entry_plan_authorized,
-            "maximum_acceptable_entry_price": maximum_entry_price,
-            "maximum_entry_gap_from_signal_close": round(allowed_gap, 6) if allowed_gap is not None else None,
-            "price_cap_method": (
-                "取成本后预期的一半、半个ATR和3%上限中的最小值；这是追价失效线，不是成交保证"
-                if entry_plan_authorized
-                else "当前结论不是倾向买入，不生成可执行入场价"
-            ),
-        },
-        "exit_plan": {
-            "holding_trading_days": holding_days,
-            "planned_exit_date": schedule.get("planned_exit_dates", {}).get(f"T+{holding_days}"),
-            "settlement_note": "信号日收盘后决策，下一交易日开盘计划入场；T+1为入场后首个可卖出收盘",
-        },
-        "invalidation_conditions": invalidation,
         "fundamental_risk_flags": fundamental_flags,
+        "responsibility_note": "这是分析证据汇总，不是买入、卖出或持有指令；最终决定由用户自行作出。",
     }
 
 
@@ -1145,7 +1399,7 @@ def yanjiu_dangu_yuce(
     fundamentals: dict[str, Any],
     tradability: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run peer selection, walk-forward modeling, cost adjustment and decision gates."""
+    """Run peer selection, walk-forward modeling, cost adjustment and evidence assessment."""
     configured_budget, cost_scenario, cost_path, cost_errors = _load_cost_assumption(
         str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
     )
@@ -1176,18 +1430,35 @@ def yanjiu_dangu_yuce(
             if code in histories
             else "目标股票没有可用于模型的前复权历史"
         )
+        history_errors = [str(value) for value in history_meta.get("errors", [])]
+        unadjusted_count = sum("未复权行情" in value for value in history_errors)
+        if unadjusted_count:
+            reason += f"；另有 {unadjusted_count} 只股票仅取得未复权行情，不能进入模型"
+            if source == "tushare":
+                reason += "；严格 Tushare 模式不会自动降级到 AKShare"
         return {
             "status": "unavailable",
             "requested_horizon": f"T+{holding_days}",
             "schedule": schedule,
             "peer_universe": {**peer_meta, "history_fetch": history_meta, "relative_snapshot": peer_snapshot},
             "forecast": {},
+            "future_3_trading_days": {
+                "status": "unavailable",
+                "signal_date": signal_date,
+                "forecast": {},
+                "error": reason,
+            },
             "validation": {"horizons": {}, "passed_horizons": 0},
-            "decision": {
-                "label": "证据不足" if tradability.get("can_open_position") else "回避",
+            "analysis_assessment": {
+                "evidence_label": "证据不足" if tradability.get("basic_execution_feasible") else "证据偏负面",
                 "requested_horizon": f"T+{holding_days}",
-                "conclusion": f"证据不足：{reason}" if tradability.get("can_open_position") else "回避：可交易性检查未通过",
+                "summary": (
+                    f"证据不足：{reason}"
+                    if tradability.get("basic_execution_feasible")
+                    else "证据偏负面：存在明显可交易性约束"
+                ),
                 "reasons": [reason] + list(tradability.get("hard_blocks", [])),
+                "responsibility_note": "这是分析证据汇总，不是交易指令；最终决定由用户自行作出。",
             },
             "limitations": ["同行历史不足时不退化为单股票自拟合模型，也不把启发式技术分冒充预测"],
         }
@@ -1208,6 +1479,25 @@ def yanjiu_dangu_yuce(
         config=config,
         budget_yuan=actual_budget,
     )
+    future_schedule_error = _future_schedule_unavailable_reason(schedule, tradability)
+    try:
+        if future_schedule_error:
+            raise RuntimeError(future_schedule_error)
+        future_predictions, future_validation = _fit_future_session_models(
+            panel=panel,
+            latest=target_rows.tail(1),
+            config=config,
+        )
+        future_error = ""
+    except Exception as exc:
+        future_predictions = pd.DataFrame()
+        future_validation = {
+            "horizons": {},
+            "passed_horizons": 0,
+            "overall_quality_score": 0.0,
+            "overall_quality_label": "low",
+        }
+        future_error = str(exc)
     prediction_row = predictions.iloc[0]
     analysis_price = _round_optional(tradability.get("analysis_price"), 3) or _round_optional(prediction_row.get("close"), 3)
     stock_cost_rate, position_cost = _stock_roundtrip_cost(code, float(analysis_price), actual_budget, cost_scenario)
@@ -1231,13 +1521,70 @@ def yanjiu_dangu_yuce(
             "validation_passed": bool(metrics.get("validation_passed")),
             "model_quality": metrics.get("quality_label", "low"),
             "position_and_cost": position_cost,
-            "timing": f"{signal_date} 收盘后信号，下一交易日开盘计划入场；入场后第{horizon}个可卖出交易日收盘退出",
-            "planned_entry_date": schedule.get("planned_entry_date"),
-            "planned_exit_date": schedule.get("planned_exit_dates", {}).get(f"T+{horizon}"),
+            "timing": f"{signal_date} 收盘后信号，假设下一交易日开盘作为测算基准；比较入场后第{horizon}个可卖出交易日收盘",
+            "assumed_entry_date": schedule.get("assumed_entry_date"),
+            "scenario_exit_date": schedule.get("scenario_exit_dates", {}).get(f"T+{horizon}"),
             "predicted_close": None,
             "predicted_close_unavailable_reason": "入场开盘价尚未知，模型预测的是入场到退出收益，不能伪造精确目标价",
         }
-    decision = _build_decision(
+
+    future_forecast: dict[str, Any] = {}
+    signal_close = _round_optional(prediction_row.get("close"), 3)
+    future_status = "ok" if not future_predictions.empty and signal_close is not None else "unavailable"
+    if future_status == "ok":
+        future_row = future_predictions.iloc[0]
+        limit_pct = _round_optional(tradability.get("price_limit_pct"))
+        limit_rate = limit_pct / 100.0 if limit_pct is not None else None
+        for horizon in [1, 2, 3]:
+            predicted_return = _round_optional(future_row.get(f"future_pred_t{horizon}"))
+            metrics = future_validation.get("horizons", {}).get(f"T+{horizon}", {})
+            interval = metrics.get("prediction_interval_80")
+            lower_price, upper_price = _price_limit_bounds(signal_close, limit_rate, horizon)
+            predicted_close = None
+            predicted_close_interval = None
+            if predicted_return is not None:
+                raw_close = signal_close * (1.0 + predicted_return)
+                predicted_close = _round_price_tick(min(max(raw_close, lower_price), upper_price))
+            if interval and len(interval) == 2:
+                interval_prices = [signal_close * (1.0 + float(value)) for value in interval]
+                predicted_close_interval = [
+                    _round_price_tick(min(max(value, lower_price), upper_price))
+                    for value in interval_prices
+                ]
+            future_forecast[f"T+{horizon}"] = {
+                "target_trade_date": schedule.get("future_session_dates", {}).get(f"T+{horizon}"),
+                "cumulative_return_from_signal_close": (
+                    round(float(predicted_return), 6) if predicted_return is not None else None
+                ),
+                "cumulative_return_from_signal_close_pct": (
+                    round(float(predicted_return) * 100.0, 3) if predicted_return is not None else None
+                ),
+                "predicted_close_reference": predicted_close,
+                "predicted_close_interval_80": predicted_close_interval,
+                "empirical_return_interval_80": interval,
+                "empirical_positive_probability": metrics.get("latest_empirical_positive_probability"),
+                "validation_passed": bool(metrics.get("validation_passed")),
+                "model_quality": metrics.get("quality_label", "low"),
+                "direction": (
+                    "up" if predicted_return is not None and predicted_return > 0
+                    else "down" if predicted_return is not None and predicted_return < 0
+                    else "flat_or_unavailable"
+                ),
+            }
+
+    future_three_days = {
+        "status": future_status,
+        "signal_date": signal_date,
+        "signal_close": signal_close,
+        "definition": "以最近完整收盘日为T，预测未来第1、2、3个市场交易日收盘相对T收盘的累计收益",
+        "forecast": future_forecast,
+        "validation": future_validation,
+        "error": future_error or None,
+        "interpretation": (
+            "预测收盘价是模型参考值，不是目标价或成交承诺；未通过样本外验证的周期只作观察。"
+        ),
+    }
+    analysis_assessment = _build_analysis_assessment(
         holding_days=holding_days,
         forecast=forecast,
         validation=validation,
@@ -1258,8 +1605,9 @@ def yanjiu_dangu_yuce(
             "relative_snapshot": peer_snapshot,
         },
         "forecast": forecast,
+        "future_3_trading_days": future_three_days,
         "validation": validation,
-        "decision": decision,
+        "analysis_assessment": analysis_assessment,
         "cost_assumption": {
             "scenario": cost_scenario.name,
             "config_path": cost_path,
@@ -1272,8 +1620,9 @@ def yanjiu_dangu_yuce(
             "training_universe": "目标股票的当前同行优先，加少量全市场高流动性参考股票",
             "validation": "三段扩展窗口、标签跨界清除的滚动样本外验证，最后一段作为最终保留测试窗口",
             "signal": "只使用已确认收盘的日线和当日可得横截面特征",
-            "execution": "下一交易日开盘入场，按A股T+1和指定T+1/T+2/T+3退出",
-            "llm_boundary": "数值、验证与结论标签均由程序生成；LLM只能解释，不能改写",
+            "execution_scenario": "假设下一交易日开盘作为收益测算基准，并按A股T+1比较指定T+1/T+2/T+3收盘",
+            "future_forecast": "另行预测从最近完整收盘到未来第1/2/3个交易日收盘，两类结果都只用于分析",
+            "llm_boundary": "数值、验证与证据标签均由程序生成；LLM只能解释，不能改写或作交易决定",
         },
         "limitations": [
             "当前同行池用于历史训练，仍存在当前成分与幸存者偏差",

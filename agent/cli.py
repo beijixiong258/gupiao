@@ -97,6 +97,7 @@ def _dayin_duihua_bangzhu() -> None:
             "直接输入自然语言即可连续追问。\n"
             "/new      新建空白会话\n"
             "/clear    清空当前会话\n"
+            "/clear-history 清除全部历史会话\n"
             "/sessions 查看最近会话\n"
             "/resume ID 切换到指定会话\n"
             "/history  查看当前会话最近内容\n"
@@ -149,6 +150,7 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
         "gupiao_fenxi": "正在核对单股时点、拉取同行历史并训练三周期模型...",
+        "gupiao_yuce": "正在计算指定周期预测、交易费用和收益空间...",
         "bankuai_xuangu": "正在拉取板块成分并训练 T+3 模型...",
     }
 
@@ -197,8 +199,16 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
     console.print(
         Panel(
             f"{mode}\n会话：{huihua.huihua_id}\n"
-            "可直接连续追问；输入 /help 查看会话命令。\n"
-            "示例：分析贵州茅台，然后追问：它目前主要有哪些风险？",
+            "可直接连续追问。示例：分析贵州茅台，然后追问：它目前主要有哪些风险？\n\n"
+            "可用斜杠命令：\n"
+            "/new            新建空白会话\n"
+            "/clear          清空当前会话\n"
+            "/clear-history  清除全部历史会话\n"
+            "/sessions       查看最近会话\n"
+            "/resume 会话ID  切换到指定会话\n"
+            "/history        查看当前会话最近内容\n"
+            "/help           再次显示命令说明\n"
+            "/exit           保存并退出",
             title="A股 T+3 量化研究员 | 连续对话",
         )
     )
@@ -232,6 +242,21 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             history = []
             cunchu.baocun(huihua)
             console.print("[green]当前会话已清空[/green]")
+            continue
+        if command in {"/clear-history", "/clearhistory", "清除历史"}:
+            console.print("[yellow]这会永久删除全部已保存的历史会话，但不会删除运行记录或行情缓存。[/yellow]")
+            try:
+                confirmation = console.input("请输入 [bold]确认清除[/bold] 继续，直接回车取消：").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]已取消清除历史[/dim]")
+                continue
+            if confirmation != "确认清除":
+                console.print("[dim]已取消清除历史[/dim]")
+                continue
+            deleted = cunchu.qingkong_quanbu()
+            huihua = cunchu.xinjian()
+            history = []
+            console.print(f"[green]已清除 {deleted} 个历史会话，并新建空白会话：{huihua.huihua_id}[/green]")
             continue
         if command in {"/sessions", "会话列表"}:
             _dayin_huihua_liebiao(cunchu, huihua.huihua_id)
@@ -375,16 +400,16 @@ def cmd_gupiao(
     config_path: str | None,
     json_mode: bool,
 ) -> int:
-    from src.ashare.gupiao_yanjiu import fenxi_gupiao
+    from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
 
-    result = fenxi_gupiao(
+    result = json.loads(GupiaoFenxiTool().execute(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
         holding_days=holding_days,
         budget_yuan=budget_yuan,
         config_path=config_path,
-    )
+    ))
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
     else:
@@ -392,10 +417,59 @@ def cmd_gupiao(
     return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
 
 
+def cmd_yuce(
+    gupiao: str,
+    source: str,
+    history_calendar_days: int,
+    config_path: str | None,
+    json_mode: bool,
+) -> int:
+    """Run diagnosis once, then print gated forecasts for the next three market sessions."""
+    from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
+    from src.tools.gupiao_yuce_tool import GupiaoYuceTool
+
+    diagnosis = json.loads(GupiaoFenxiTool().execute(
+        gupiao=gupiao,
+        source=source,
+        history_calendar_days=history_calendar_days,
+        holding_days=2,
+        config_path=config_path,
+    ))
+    predictions: dict[str, Any] = {}
+    analysis_id = diagnosis.get("analysis_id")
+    if diagnosis.get("status") == "ok" and analysis_id:
+        predictor = GupiaoYuceTool()
+        for horizon in (1, 2, 3):
+            predictions[f"T+{horizon}"] = json.loads(predictor.execute(
+                analysis_id=analysis_id,
+                horizon=horizon,
+                mode="future_close",
+                intent="forecast",
+            ))
+    compact = {
+        "status": diagnosis.get("status"),
+        "stock": diagnosis.get("stock"),
+        "as_of": diagnosis.get("as_of"),
+        "generated_at": diagnosis.get("generated_at"),
+        "analysis_id": analysis_id,
+        "predictions": predictions,
+        "market_data": diagnosis.get("market_data"),
+        "error": diagnosis.get("error"),
+    }
+    if json_mode:
+        print(json.dumps(compact, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(compact, ensure_ascii=False))
+    has_validated = any(item.get("forecast_status") == "validated" for item in predictions.values())
+    return EXIT_SUCCESS if compact.get("status") == "ok" and has_validated else EXIT_RUN_FAILED
+
+
 def cmd_bankuai(
     bankuai: str,
     bankuai_leixing: str,
     top_n: int,
+    offset: int,
+    selection_id: str | None,
     source: str,
     config_path: str | None,
     json_mode: bool,
@@ -406,6 +480,8 @@ def cmd_bankuai(
         bankuai=bankuai,
         bankuai_leixing=bankuai_leixing,
         top_n=top_n,
+        offset=offset,
+        selection_id=selection_id,
         source=source,
         config_path=config_path,
     )
@@ -449,10 +525,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     gupiao.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     gupiao.add_argument("--json", action="store_true")
 
+    yuce = sub.add_parser("yuce", help="预测一只 A 股未来第 1、2、3 个交易日收盘")
+    yuce.add_argument("gupiao", help="例如 600519.SH 或贵州茅台")
+    yuce.add_argument(
+        "--source",
+        choices=["auto", "tushare", "akshare"],
+        default="auto",
+        help="股票名称解析和日线行情来源",
+    )
+    yuce.add_argument("--history-calendar-days", type=int, default=1080)
+    yuce.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
+    yuce.add_argument("--json", action="store_true")
+
     bankuai = sub.add_parser("bankuai", help="从指定板块选股并预测 T+1/T+2/T+3")
     bankuai.add_argument("bankuai", help="中国大陆行业或概念板块名称")
     bankuai.add_argument("--type", dest="bankuai_leixing", choices=["auto", "hangye", "gainian"], default="auto")
-    bankuai.add_argument("--top-n", type=int, default=3)
+    bankuai.add_argument("--top-n", type=int, default=8, help="每批候选数量，默认8且最多8")
+    bankuai.add_argument("--offset", type=int, default=0, help="顺延批次的起始偏移；第一批为0")
+    bankuai.add_argument("--selection-id", help="上一批返回的候选序列ID；offset大于0时必填")
     bankuai.add_argument(
         "--source",
         choices=["auto", "tushare", "akshare"],
@@ -489,11 +579,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.config_path,
             args.json,
         )
+    if args.command == "yuce":
+        return cmd_yuce(
+            args.gupiao,
+            args.source,
+            args.history_calendar_days,
+            args.config_path,
+            args.json,
+        )
     if args.command == "bankuai":
         return cmd_bankuai(
             args.bankuai,
             args.bankuai_leixing,
             args.top_n,
+            args.offset,
+            args.selection_id,
             args.source,
             args.config_path,
             args.json,

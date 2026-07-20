@@ -56,6 +56,46 @@ def test_partial_name_with_multiple_candidates_is_rejected_but_exact_name_works(
         gupiao_yanjiu._match_stock_basic(table, "银行")
 
 
+def test_explicit_akshare_name_resolution_never_calls_tushare(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        gupiao_yanjiu,
+        "_akshare_name_table",
+        lambda: pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}]),
+    )
+    monkeypatch.setattr(
+        gupiao_yanjiu,
+        "_tushare_pro",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit akshare must not call tushare")),
+    )
+
+    code, profile, warnings = gupiao_yanjiu.jiexi_gupiao("贵州茅台", source="akshare")
+
+    assert code == "600519.SH"
+    assert profile["name"] == "贵州茅台"
+    assert any("AKShare" in warning for warning in warnings)
+
+
+def test_explicit_tushare_name_resolution_never_calls_akshare(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gupiao_yanjiu, "_stock_basic_cache", lambda: pd.DataFrame())
+    monkeypatch.setattr(gupiao_yanjiu, "_tushare_pro", lambda: object())
+    monkeypatch.setattr(
+        gupiao_yanjiu,
+        "_load_or_fetch_stock_basic",
+        lambda _pro, _quality: pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}]),
+    )
+    monkeypatch.setattr(
+        gupiao_yanjiu,
+        "_akshare_name_table",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit tushare must not call akshare")),
+    )
+
+    code, profile, warnings = gupiao_yanjiu.jiexi_gupiao("贵州茅台", source="tushare")
+
+    assert code == "600519.SH"
+    assert profile["name"] == "贵州茅台"
+    assert warnings == []
+
+
 def test_only_known_920_segment_is_inferred_from_a_code_starting_with_nine() -> None:
     assert gupiao_yanjiu.biaozhunhua_daima("920001") == "920001.BJ"
     with pytest.raises(ValueError, match="不属于.*A 股"):

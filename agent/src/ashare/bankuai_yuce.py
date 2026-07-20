@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 from collections import Counter
@@ -445,17 +446,27 @@ def goujian_moxing_shuju(
         features["ts_code"] = code
         features["name"] = names.get(code, "")
         for horizon in horizons:
+            future_dates: list[Any] = []
             entry_dates: list[Any] = []
             exit_dates: list[Any] = []
             for signal_date in features["trade_date"]:
                 position = market_position.get(pd.Timestamp(signal_date)) if pd.notna(signal_date) else None
+                future_index = position + int(horizon) if position is not None else len(market_dates)
                 entry_index = position + 1 if position is not None else len(market_dates)
                 exit_index = entry_index + int(horizon)
+                future_dates.append(market_dates[future_index] if future_index < len(market_dates) else pd.NaT)
                 entry_dates.append(market_dates[entry_index] if entry_index < len(market_dates) else pd.NaT)
                 exit_dates.append(market_dates[exit_index] if exit_index < len(market_dates) else pd.NaT)
 
+            future_series = pd.Series(future_dates, index=features.index, dtype="datetime64[ns]")
             entry_series = pd.Series(entry_dates, index=features.index, dtype="datetime64[ns]")
             exit_series = pd.Series(exit_dates, index=features.index, dtype="datetime64[ns]")
+            future_close = future_series.map(pd.to_numeric(prices["close"], errors="coerce"))
+            features[f"future_date_t{horizon}"] = future_series
+            features[f"future_close_t{horizon}"] = future_close
+            features[f"future_return_t{horizon}"] = (
+                future_close / pd.to_numeric(features["close"], errors="coerce") - 1.0
+            )
             entry_open = entry_series.map(pd.to_numeric(prices["open"], errors="coerce"))
             entry_high = entry_series.map(pd.to_numeric(prices["high"], errors="coerce"))
             entry_low = entry_series.map(pd.to_numeric(prices["low"], errors="coerce"))
@@ -855,7 +866,7 @@ def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
         "estimated_roundtrip_cost_rate": round(float(roundtrip), 6),
         "estimated_roundtrip_cost_rate_is_reference_only": True,
         "stamp_tax_sell_rate": scenario.stamp_tax_sell_rate,
-        "position_sizing": "每只股票按目标资金、T+1最不利可买价格和所属板块买入数量规则重新计算，见个股明细",
+        "capital_assumption": "每只股票按给定测算资金、T+1最不利参考价格和所属板块最低申报数量重新计算成本，见个股明细",
         "config_errors": errors,
     }
 
@@ -997,9 +1008,9 @@ def _prediction_rows(
                 "ranking_horizon_weights": {
                     f"T+{value}": round(weight, 6) for value, weight in normalized_weights.items()
                 },
-                "suggested_exit": f"T+{best_horizon}" if best_horizon is not None else None,
-                "suggested_holding_trading_days": int(best_horizon) if best_horizon is not None else None,
-                "suggested_exit_validation_passed": bool(best_horizon in passed_horizons)
+                "strongest_forecast_horizon": f"T+{best_horizon}" if best_horizon is not None else None,
+                "strongest_horizon_trading_days": int(best_horizon) if best_horizon is not None else None,
+                "strongest_horizon_validation_passed": bool(best_horizon in passed_horizons)
                 if best_horizon is not None
                 else False,
                 "forecast": forecasts,
@@ -1021,7 +1032,7 @@ def _prediction_rows(
                 },
                 "a_share_constraints": {
                     "signal_time": "T日收盘后",
-                    "planned_entry": "下一市场交易日（T+1）开盘",
+                    "assumed_entry_for_analysis": "下一市场交易日（T+1）开盘",
                     "can_sell_earliest": "信号后的第2个市场交易日收盘（输出标记为T+1）",
                     "price_limit_pct": round(limit_rate * 100.0, 2) if limit_rate is not None else None,
                 },
@@ -1051,14 +1062,14 @@ def _save_artifacts(run_dir: str, result: dict[str, Any]) -> dict[str, str]:
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     csv_path = artifact_dir / "bankuai_xuangu.csv"
     flat_rows: list[dict[str, Any]] = []
-    for item in result.get("recommendations", []):
+    for item in result.get("validated_candidates", []):
         row = {
             "ts_code": item["ts_code"],
             "name": item["name"],
             "as_of": item["as_of"],
             "latest_close": item["latest_close"],
             "selection_score": item["selection_score"],
-            "suggested_exit": item["suggested_exit"],
+            "strongest_forecast_horizon": item["strongest_forecast_horizon"],
         }
         for horizon in [1, 2, 3]:
             forecast = item["forecast"][f"T+{horizon}"]
@@ -1069,18 +1080,65 @@ def _save_artifacts(run_dir: str, result: dict[str, Any]) -> dict[str, str]:
     return {"json": str(json_path), "csv": str(csv_path)}
 
 
+def _selection_sequence_id(
+    *,
+    board_meta: dict[str, Any],
+    as_of: pd.Timestamp,
+    source: str,
+    config_path: str,
+    eligible: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "board_name": board_meta.get("resolved_name"),
+        "board_type": board_meta.get("board_type"),
+        "as_of": as_of.strftime("%Y-%m-%d"),
+        "source": source,
+        "config_path": config_path,
+        "ordered_codes": [str(item.get("ts_code") or "") for item in eligible],
+    }
+    return "sel_" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _paginate_candidates(
+    eligible: list[dict[str, Any]],
+    *,
+    offset: int,
+    batch_size: int,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    candidates: list[dict[str, Any]] = []
+    for candidate_rank, item in enumerate(eligible[offset : offset + batch_size], start=offset + 1):
+        candidate = dict(item)
+        candidate["candidate_rank"] = candidate_rank
+        candidates.append(candidate)
+    next_offset = offset + len(candidates)
+    return candidates, next_offset, next_offset < len(eligible)
+
+
 def bankuai_xuangu(
     *,
     bankuai: str,
     bankuai_leixing: str = "auto",
-    top_n: int = 3,
+    top_n: int = 8,
+    offset: int = 0,
+    selection_id: str | None = None,
     source: str = "auto",
     config_path: str | None = None,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
     """Select stocks from a specified A-share board and predict only T+1 to T+3."""
     _ensure_dotenv()
-    top_n = max(1, min(int(top_n), 10))
+    requested_top_n = int(top_n)
+    top_n = max(1, min(requested_top_n, 8))
+    offset = max(0, int(offset))
+    selection_id = str(selection_id or "").strip() or None
+    if offset > 0 and selection_id is None:
+        return {
+            "status": "error",
+            "error_code": "selection_id_required",
+            "error": "offset大于0时必须传入上一批返回的selection_id，避免候选序列错位或重复",
+        }
     source = source.strip().lower()
     if source not in {"auto", "tushare", "akshare"}:
         return {"status": "error", "error": "source 必须是 auto、tushare 或 akshare"}
@@ -1182,14 +1240,41 @@ def bankuai_xuangu(
         for item in ranked
         if passed_horizon_labels
         and item["position_and_cost"]["execution_feasible"]
-        and item["suggested_exit_validation_passed"]
+        and item["strongest_horizon_validation_passed"]
         and item["weighted_expected_net_return"] is not None
         and float(item["weighted_expected_net_return"]) > 0
         and item["selection_score"] is not None
         and float(item["selection_score"]) > 0
-        and float(item["forecast"][item["suggested_exit"]]["estimated_net_return_after_cost"]) > 0
+        and float(item["forecast"][item["strongest_forecast_horizon"]]["estimated_net_return_after_cost"]) > 0
     ]
-    recommendations = eligible[:top_n]
+    current_selection_id = _selection_sequence_id(
+        board_meta=board_meta,
+        as_of=global_as_of,
+        source=source,
+        config_path=resolved_config,
+        eligible=eligible,
+    )
+    if selection_id is not None and selection_id != current_selection_id:
+        return {
+            "status": "selection_expired",
+            "error_code": "selection_sequence_changed",
+            "error": "板块快照或模型排名已经变化，旧候选序列不能继续顺延；请从新的Top 8重新开始",
+            "board": board_meta,
+            "as_of": global_as_of.strftime("%Y-%m-%d"),
+            "provided_selection_id": selection_id,
+            "current_selection_id": current_selection_id,
+            "restart_offset": 0,
+        }
+    validated_candidates, next_offset, has_more = _paginate_candidates(
+        eligible,
+        offset=offset,
+        batch_size=top_n,
+    )
+    limit_notice = (
+        f"单批最多返回8只；请求的{requested_top_n}只已按Top 8执行"
+        if requested_top_n > 8
+        else None
+    )
     daily_source_policy = {
         "auto": "个股日线优先 Tushare，失败后降级 AKShare",
         "tushare": "个股日线固定使用 Tushare，不自动降级 AKShare",
@@ -1218,18 +1303,31 @@ def bankuai_xuangu(
             for item in stale_latest.to_dict("records")[:20]
         ],
         "model_sample_count": int(len(panel)),
-        "recommendations": recommendations,
-        "recommendation_count": int(len(recommendations)),
-        "watchlist": ranked[: max(top_n, 5)],
+        "validated_candidates": validated_candidates,
+        "validated_candidate_count": int(len(validated_candidates)),
+        "validated_candidate_total": int(len(eligible)),
+        "selection": {
+            "selection_id": current_selection_id,
+            "offset": offset,
+            "requested_top_n": requested_top_n,
+            "applied_top_n": top_n,
+            "max_batch_size": 8,
+            "limit_notice": limit_notice,
+            "rank_start": offset + 1 if validated_candidates else None,
+            "rank_end": offset + len(validated_candidates) if validated_candidates else None,
+            "has_more": has_more,
+            "next_offset": next_offset if has_more else None,
+        },
+        "model_ranking": ranked[: max(offset + top_n, 8)],
         "validation": validation,
-        "recommendation_gate": {
+        "candidate_evidence_gate": {
             "passed_horizons": passed_horizon_labels,
             "rules": [
                 "至少一个预测周期通过样本外验证",
                 "只有通过验证的预测周期才参与加权收益和排名，剩余权重重新归一化",
-                "建议卖出周期必须是已通过验证的周期",
-                "目标资金必须能够按所属板块最低买入数量建仓",
-                "加权成本后收益、建议周期成本后收益、风险调整分数都必须为正",
+                "模型最强预测周期必须是已通过验证的周期",
+                "给定测算资金必须覆盖所属板块最低申报数量",
+                "加权成本后收益、最强周期成本后收益、风险调整分数都必须为正",
             ],
         },
         "cost_assumption": cost_meta,
@@ -1254,21 +1352,23 @@ def bankuai_xuangu(
             "survivorship_bias": "模型使用当前板块成分回看历史，验证结果仍可能含当前成分股带来的幸存者偏差",
         },
         "a_share_rules": {
-            "signal_and_entry": "T日收盘后生成信号，计划在下一市场交易日（T+1）开盘买入",
+            "analysis_timing": "T日完整收盘后分析，假设下一市场交易日（T+1）开盘作为持有期收益测算基准",
             "t_plus_one": "输出T+1指入场后第1个可卖出交易日，实际是信号后的第2个市场交易日；不输出不可执行的同日卖出",
             "max_holding": "最多输出入场后第3个可卖出交易日；系统不会输出更远预测",
             "price_limits": "不输出目标收盘价；仅展示模型未约束参考价和从信号收盘逐日推导、按0.01元取整的合法价格区间，实际T+1开盘确定后必须重算",
         },
-        "scope_note": "预测是有验证指标和成本假设的概率研究，不是价格承诺。验证质量低时应降低仓位或不交易。",
-        "execution_policy": "research_only：只输出研究候选和预测，永不连接券商、永不提交订单、永不自动交易。",
+        "scope_note": "预测是带有验证指标和成本假设的研究结果，不是价格承诺，也不回答用户应采取何种交易动作。验证质量低只表示证据较弱。",
+        "execution_policy": "analysis_only：只输出分析候选和预测，永不连接券商、永不提交订单、永不自动交易。",
     }
-    if not recommendations:
-        if not passed_horizon_labels:
-            result["no_trade_reason"] = "T+1、T+2、T+3 均未通过样本外验证，系统选择不推荐任何股票。"
+    if not validated_candidates:
+        if offset >= len(eligible) and eligible:
+            result["no_validated_candidate_reason"] = "候选序列已经到末尾，没有更多通过证据门槛且未重复的股票。"
+        elif not passed_horizon_labels:
+            result["no_validated_candidate_reason"] = "T+1、T+2、T+3 均未通过样本外验证，没有形成有效候选证据。"
         else:
-            result["no_trade_reason"] = "通过验证的周期内，没有股票同时满足合法买入数量、成本后收益和风险调整门槛，系统选择不推荐。"
+            result["no_validated_candidate_reason"] = "通过验证的周期内，没有股票同时满足成本、可执行性和风险调整证据门槛。"
     if validation["overall_quality_label"] == "low":
-        result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也不应把它当作高确信度交易信号。"
+        result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也只能视为低强度分析证据。"
     if run_dir:
         try:
             result["artifacts"] = _save_artifacts(run_dir, result)

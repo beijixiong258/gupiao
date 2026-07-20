@@ -95,3 +95,19 @@ def test_clear_keeps_session_identity(tmp_path) -> None:
     assert loaded.biaoti == "新会话"
     assert loaded.lunshu == 0
     assert loaded.xiaoxi == []
+
+
+def test_clear_all_history_deletes_only_valid_saved_sessions(tmp_path) -> None:
+    store = DuihuaCunchu(tmp_path)
+    first = store.xinjian()
+    store.baocun(first)
+    second = store.xinjian()
+    store.baocun(second)
+    unrelated = tmp_path / "notes.json"
+    unrelated.write_text("{}", encoding="utf-8")
+
+    deleted = store.qingkong_quanbu()
+
+    assert deleted == 2
+    assert store.liechu() == []
+    assert unrelated.is_file()

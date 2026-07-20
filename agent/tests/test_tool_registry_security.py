@@ -13,4 +13,4 @@ def test_shell_tools_absent_from_default_registry() -> None:
 def test_shell_tools_cannot_be_enabled() -> None:
     registry = build_registry(include_shell_tools=True)
 
-    assert registry.tool_names == ["gupiao_fenxi", "bankuai_xuangu"]
+    assert registry.tool_names == ["gupiao_fenxi", "gupiao_yuce", "bankuai_xuangu"]

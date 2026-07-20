@@ -13,6 +13,8 @@ class BankuaiXuanguTool(BaseTool):
         "Runs chronological out-of-sample validation and returns cost-adjusted T+1, T+2, and T+3 sellable-horizon forecasts. "
         "Signals use the completed close, entry is the next session open, and T+1 is the first later session when the new shares can be sold. "
         "Use this for natural-language requests to pick stocks from a sector and compare those three sellable horizons. "
+        "One batch returns at most 8 candidates. For a later batch, reuse selection_id and pass next_offset so ranking "
+        "continues without duplicates. "
         "Research only; it never connects to a broker or submits orders."
     )
     parameters = {
@@ -24,7 +26,21 @@ class BankuaiXuanguTool(BaseTool):
                 "enum": ["auto", "hangye", "gainian"],
                 "description": "Board type. auto resolves industry or concept automatically.",
             },
-            "top_n": {"type": "integer", "description": "Maximum recommendations to return, default 3 and max 10."},
+            "top_n": {
+                "type": "integer",
+                "default": 8,
+                "description": "Requested candidate count. The tool defaults to and hard-caps each batch at 8.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Zero-based offset for the next batch; use the previous result's next_offset.",
+            },
+            "selection_id": {
+                "type": "string",
+                "description": "Stable sequence identifier from the previous batch; required when offset is greater than 0.",
+            },
             "source": {
                 "type": "string",
                 "enum": ["auto", "tushare", "akshare"],

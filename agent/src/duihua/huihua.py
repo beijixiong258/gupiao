@@ -152,6 +152,16 @@ class DuihuaCunchu:
                 continue
         return sessions
 
+    def qingkong_quanbu(self) -> int:
+        """Delete every saved conversation JSON file in the conversation directory."""
+        deleted = 0
+        for path in self.mulu.glob("*.json"):
+            if not path.is_file() or not HUIHUA_ID_GESHI.fullmatch(path.stem):
+                continue
+            path.unlink()
+            deleted += 1
+        return deleted
+
     def zuijin(self) -> DuihuaHuihua | None:
         sessions = self.liechu(1)
         return sessions[0] if sessions else None

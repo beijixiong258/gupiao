@@ -6,15 +6,17 @@ import json
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.tools.gupiao_analysis_cache import store_analysis
 
 
 class GupiaoFenxiTool(BaseTool):
     name = "gupiao_fenxi"
     description = (
-        "Analyze one mainland China A-share by code or Chinese name. Returns verified market-data provenance, "
-        "fundamentals, valuation, technical indicators, current tradability, and T+1/T+2/T+3 peer-panel forecasts "
-        "with walk-forward validation and after-cost decisions. Use this whenever the user asks how a specific "
-        "stock is doing or whether it fits a 1-3 trading-day holding period. Research only; it never submits orders."
+        "First-stage comprehensive diagnosis for one mainland China A-share. It checks data freshness and provenance, "
+        "fundamentals, valuation, technical state, volatility, tradability, peer context, risks, and the internal model "
+        "workspace. Always call this before answering a new stock diagnosis, upside, buy, sell, or 1-3 trading-day "
+        "prediction request. The returned analysis_id is required by gupiao_yuce. Do not quote a profit forecast from "
+        "this first-stage result; use gupiao_yuce for the user's requested number."
     )
     parameters = {
         "type": "object",
@@ -39,7 +41,7 @@ class GupiaoFenxiTool(BaseTool):
                 "type": "integer",
                 "enum": [1, 2, 3],
                 "default": 2,
-                "description": "Requested sellable holding horizon. 两个交易日必须传2并使用T+2模型。",
+                "description": "Requested sellable holding horizon; for example, a two-session holding question maps to horizon 2.",
             },
             "budget_yuan": {
                 "type": "number",
@@ -57,4 +59,23 @@ class GupiaoFenxiTool(BaseTool):
     def execute(self, **kwargs: Any) -> str:
         from src.ashare.gupiao_yanjiu import fenxi_gupiao
 
-        return json.dumps(fenxi_gupiao(**kwargs), ensure_ascii=False)
+        full_result = fenxi_gupiao(**kwargs)
+        if full_result.get("status") != "ok":
+            return json.dumps(full_result, ensure_ascii=False)
+
+        analysis_id = store_analysis(full_result)
+        hidden = {"quantitative_analysis", "future_3_trading_days", "analysis_assessment"}
+        public_result = {key: value for key, value in full_result.items() if key not in hidden}
+        public_result.update(
+            {
+                "tool_contract_version": 4,
+                "analysis_id": analysis_id,
+                "analysis_stage": {
+                    "status": "completed",
+                    "scope": "行情时点、基本面、估值、技术面、波动、可交易约束、同行和风险已完成",
+                    "next_tool_for_numbers": "gupiao_yuce",
+                    "instruction": "如用户询问上涨空间、能否盈利、买卖或T+1至T+3，必须继续调用gupiao_yuce",
+                },
+            }
+        )
+        return json.dumps(public_result, ensure_ascii=False)
