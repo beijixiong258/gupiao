@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterable
 
 import numpy as np
@@ -175,19 +178,27 @@ def _number(value: Any) -> float | None:
     return float(parsed) if pd.notna(parsed) and np.isfinite(float(parsed)) else None
 
 
-def _upsert_calendar(connection: sqlite3.Connection, frame: pd.DataFrame) -> None:
+def _upsert_calendar(
+    connection: sqlite3.Connection,
+    frame: pd.DataFrame,
+    *,
+    source: str = "tushare_trade_cal",
+) -> None:
     if frame is None or frame.empty:
         raise RuntimeError("Tushare trade_cal 返回空数据")
     fetched_at = _now_text()
     rows = []
     for row in frame.to_dict("records"):
+        pretrade_date = row.get("pretrade_date")
         rows.append(
             (
                 _date_text(row.get("cal_date")),
                 int(_number(row.get("is_open")) or 0),
-                _date_text(row.get("pretrade_date")) if row.get("pretrade_date") else None,
+                _date_text(pretrade_date)
+                if pretrade_date is not None and pd.notna(pretrade_date) and str(pretrade_date).strip()
+                else None,
                 str(row.get("exchange") or "SSE"),
-                "tushare_trade_cal",
+                source,
                 fetched_at,
             )
         )
@@ -204,6 +215,70 @@ def _upsert_calendar(connection: sqlite3.Connection, frame: pd.DataFrame) -> Non
         """,
         rows,
     )
+
+
+def _akshare_trade_calendar(start: str, end: str) -> pd.DataFrame:
+    import akshare as ak
+
+    frame = ak.tool_trade_date_hist_sina()
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        raise RuntimeError("AKShare 交易日历返回空数据")
+    dates = pd.to_datetime(frame["trade_date"], errors="coerce").dropna().drop_duplicates().sort_values()
+    dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+    if dates.empty:
+        raise RuntimeError(f"AKShare 交易日历不覆盖 {start} 至 {end}")
+    result = pd.DataFrame({"cal_date": dates.dt.strftime("%Y%m%d")})
+    result["is_open"] = 1
+    result["pretrade_date"] = result["cal_date"].shift(1)
+    result["exchange"] = "SSE"
+    return result
+
+
+def _ensure_trade_calendar(
+    connection: sqlite3.Connection,
+    provider: Any,
+    *,
+    start: str,
+    end: str,
+) -> dict[str, Any]:
+    meta_rows = connection.execute(
+        "SELECT meta_key,meta_value FROM warehouse_meta "
+        "WHERE meta_key IN ('calendar_coverage_start','calendar_coverage_end')"
+    ).fetchall()
+    coverage = {str(row["meta_key"]): str(row["meta_value"]) for row in meta_rows}
+    cached_start = coverage.get("calendar_coverage_start")
+    cached_end = coverage.get("calendar_coverage_end")
+    if cached_start and cached_end and cached_start <= start and cached_end >= end:
+        return {"source": "warehouse_cache", "warnings": []}
+
+    warnings: list[str] = []
+    source = "tushare_trade_cal"
+    try:
+        frame = provider.trade_cal(
+            exchange="SSE",
+            start_date=start,
+            end_date=end,
+            fields="exchange,cal_date,is_open,pretrade_date",
+        )
+    except Exception as exc:
+        warnings.append(f"Tushare trade_cal 不可用，改用 AKShare 交易日历：{exc}")
+        frame = _akshare_trade_calendar(start, end)
+        source = "akshare_sina_trade_calendar"
+
+    with connection:
+        _upsert_calendar(connection, frame, source=source)
+        new_start = min(value for value in [cached_start, start] if value)
+        new_end = max(value for value in [cached_end, end] if value)
+        connection.executemany(
+            "INSERT INTO warehouse_meta(meta_key,meta_value) VALUES(?,?) "
+            "ON CONFLICT(meta_key) DO UPDATE SET meta_value=excluded.meta_value",
+            [
+                ("calendar_coverage_start", new_start),
+                ("calendar_coverage_end", new_end),
+                ("calendar_source", source),
+            ],
+        )
+    return {"source": source, "warnings": warnings}
 
 
 def _snapshot_stock_master(
@@ -485,6 +560,257 @@ def _sync_one_session(connection: sqlite3.Connection, pro: Any, trade_date: str,
     return result
 
 
+def rebuild_derived_adj_factors(
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+) -> dict[str, Any]:
+    """Rebuild a consistent relative adjustment chain from daily pre-close values."""
+    resolved = Path(path).expanduser().resolve()
+    initialize_daily_warehouse(resolved)
+    read_connection = _connect(resolved, create=False)
+    write_connection = _connect(resolved, create=False)
+    cursor = read_connection.execute(
+        "SELECT ts_code,trade_date,close,pre_close FROM daily_bars ORDER BY ts_code,trade_date"
+    )
+    inserted = 0
+    current_code: str | None = None
+    previous_close: float | None = None
+    factor = 1.0
+    pending: list[tuple[str, str, float, str, str]] = []
+
+    def flush() -> None:
+        nonlocal inserted
+        if not pending:
+            return
+        with write_connection:
+            write_connection.executemany(
+                """
+                INSERT INTO adj_factors(trade_date,ts_code,adj_factor,source,fetched_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(trade_date,ts_code) DO UPDATE SET
+                    adj_factor=excluded.adj_factor,
+                    source=excluded.source,
+                    fetched_at=excluded.fetched_at
+                """,
+                pending,
+            )
+        inserted += len(pending)
+        pending.clear()
+
+    try:
+        for row in cursor:
+            code = str(row["ts_code"])
+            close = _number(row["close"])
+            pre_close = _number(row["pre_close"])
+            if code != current_code:
+                current_code = code
+                previous_close = None
+                factor = 1.0
+            elif previous_close is not None and pre_close is not None and pre_close > 0:
+                ratio = previous_close / pre_close
+                if math.isfinite(ratio) and ratio > 0:
+                    factor *= ratio
+            if not math.isfinite(factor) or factor <= 0:
+                factor = 1.0
+            pending.append(
+                (
+                    str(row["trade_date"]),
+                    code,
+                    float(factor),
+                    "derived_from_daily_pre_close",
+                    _now_text(),
+                )
+            )
+            if len(pending) >= 20_000:
+                flush()
+            if close is not None and close > 0:
+                previous_close = close
+        flush()
+        with write_connection:
+            write_connection.execute(
+                """
+                UPDATE sync_status
+                SET adj_status='complete',
+                    adj_rows=(
+                        SELECT COUNT(*) FROM adj_factors a
+                        WHERE a.trade_date=sync_status.trade_date
+                    ),
+                    updated_at=?
+                WHERE bars_status='complete'
+                  AND EXISTS(
+                      SELECT 1 FROM adj_factors a
+                      WHERE a.trade_date=sync_status.trade_date
+                  )
+                """,
+                (_now_text(),),
+            )
+    finally:
+        read_connection.close()
+        write_connection.close()
+    return {
+        "status": "ok",
+        "warehouse_path": str(resolved),
+        "rows": int(inserted),
+        "source": "derived_from_daily_pre_close",
+        "definition": "相邻复权因子比=上一实际收盘价/当日pre_close；仅确定相对比例",
+    }
+
+
+def sync_price_warehouse(
+    *,
+    start_date: str,
+    end_date: str | None = None,
+    max_sessions: int = 20,
+    newest_first: bool = True,
+    force: bool = False,
+    pause_seconds: float = 0.08,
+    workers: int = 1,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+    pro: Any | None = None,
+) -> dict[str, Any]:
+    """Sync full-market daily prices and derive adjustment factors for low-quota accounts."""
+    start = _date_text(start_date)
+    end = _date_text(end_date or date.today().isoformat())
+    if start > end:
+        raise ValueError("start_date 不能晚于 end_date")
+    if max_sessions < 0:
+        raise ValueError("max_sessions 不能小于0；0表示本次处理全部待同步交易日")
+    if not 0 <= pause_seconds <= 10:
+        raise ValueError("pause_seconds 必须在0到10秒之间")
+    if not 1 <= int(workers) <= 8:
+        raise ValueError("workers 必须在1到8之间")
+    resolved = Path(path).expanduser().resolve()
+    initialize_daily_warehouse(resolved)
+    live_provider = pro is None
+    provider = pro or _tushare_pro()
+    warnings: list[str] = [
+        "低额度模式只同步全市场日线并重建相对复权链；不把缺失的历史daily_basic伪造成完整数据"
+    ]
+    with _connect(resolved) as connection:
+        calendar_result = _ensure_trade_calendar(connection, provider, start=start, end=end)
+        warnings.extend(calendar_result.get("warnings", []))
+        with connection:
+            snapshot = _snapshot_stock_master(
+                connection,
+                provider,
+                snapshot_date=date.today().strftime("%Y%m%d"),
+            )
+        warnings.extend(snapshot.get("warnings", []))
+        rows = connection.execute(
+            """
+            SELECT c.cal_date,COALESCE(s.bars_status,'pending') AS bars_status
+            FROM trade_calendar c
+            LEFT JOIN sync_status s ON s.trade_date=c.cal_date
+            WHERE c.is_open=1 AND c.cal_date BETWEEN ? AND ?
+            ORDER BY c.cal_date
+            """,
+            (start, end),
+        ).fetchall()
+        pending_dates = [
+            str(row["cal_date"])
+            for row in rows
+            if force or row["bars_status"] != "complete"
+        ]
+        if newest_first:
+            pending_dates.reverse()
+        selected = pending_dates if max_sessions == 0 else pending_dates[:max_sessions]
+        sessions: list[dict[str, Any]] = []
+        throttle_lock = Lock()
+        next_request_at = [time.monotonic()]
+
+        def fetch_one(trade_date: str) -> tuple[str, pd.DataFrame | None, str | None]:
+            try:
+                if live_provider and workers > 1:
+                    with throttle_lock:
+                        now = time.monotonic()
+                        wait_seconds = max(0.0, next_request_at[0] - now)
+                        if wait_seconds > 0:
+                            time.sleep(wait_seconds)
+                        next_request_at[0] = max(now, next_request_at[0]) + (60.0 / 30.0)
+                frame = provider.daily(trade_date=trade_date)
+                if pause_seconds > 0:
+                    time.sleep(pause_seconds)
+                return trade_date, frame, None
+            except Exception as exc:
+                return trade_date, None, str(exc)
+
+        if workers == 1:
+            fetched = (fetch_one(trade_date) for trade_date in selected)
+        else:
+            executor = ThreadPoolExecutor(max_workers=int(workers))
+            futures = [executor.submit(fetch_one, trade_date) for trade_date in selected]
+            fetched = (future.result() for future in as_completed(futures))
+        try:
+            for trade_date, frame, fetch_error in fetched:
+                try:
+                    if fetch_error is not None:
+                        raise RuntimeError(fetch_error)
+                    with connection:
+                        assert frame is not None
+                        count = _upsert_daily_bars(connection, frame, trade_date)
+                        _set_sync_result(
+                            connection,
+                            trade_date=trade_date,
+                            endpoint="bars",
+                            status="complete",
+                            rows=count,
+                            error=None,
+                        )
+                    sessions.append({"trade_date": trade_date, "status": "complete", "rows": count})
+                except Exception as exc:
+                    error = str(exc)
+                    with connection:
+                        _set_sync_result(
+                            connection,
+                            trade_date=trade_date,
+                            endpoint="bars",
+                            status="failed",
+                            rows=0,
+                            error=error,
+                        )
+                    sessions.append({"trade_date": trade_date, "status": "failed", "error": error})
+        finally:
+            if workers != 1:
+                executor.shutdown(wait=True)
+    with _connect(resolved) as connection:
+        with connection:
+            connection.execute(
+                "INSERT INTO warehouse_meta(meta_key,meta_value) VALUES('adjustment_mode',?) "
+                "ON CONFLICT(meta_key) DO UPDATE SET meta_value=excluded.meta_value",
+                ("derived_on_load_from_daily_pre_close",),
+            )
+            connection.execute(
+                """
+                UPDATE sync_status
+                SET adj_status='complete',adj_rows=0,updated_at=?
+                WHERE bars_status='complete'
+                """,
+                (_now_text(),),
+            )
+    adjustment = {
+        "status": "ok",
+        "source": "derived_on_load_from_daily_pre_close",
+        "rows_persisted": 0,
+        "definition": "读取单股历史时递推：相邻复权因子比=上一实际收盘价/当日pre_close",
+    }
+    status = daily_warehouse_status(resolved)
+    return {
+        "status": "ok" if all(item["status"] == "complete" for item in sessions) else "partial",
+        "mode": "price_only_low_quota",
+        "warehouse_path": str(resolved),
+        "requested_range": [_display_date(start), _display_date(end)],
+        "trading_sessions_in_range": int(len(rows)),
+        "pending_before_run": int(len(pending_dates)),
+        "attempted_sessions": int(len(sessions)),
+        "order": "newest_first" if newest_first else "oldest_first",
+        "calendar_source": calendar_result.get("source"),
+        "stock_snapshot": snapshot,
+        "adjustment_rebuild": adjustment,
+        "sessions": sessions,
+        "warnings": warnings,
+        "warehouse_status": status,
+    }
+
+
 def sync_daily_warehouse(
     *,
     start_date: str,
@@ -510,14 +836,14 @@ def sync_daily_warehouse(
     provider = pro or _tushare_pro()
     warnings: list[str] = []
     with _connect(resolved) as connection:
-        calendar = provider.trade_cal(
-            exchange="SSE",
-            start_date=start,
-            end_date=end,
-            fields="exchange,cal_date,is_open,pretrade_date",
+        calendar_result = _ensure_trade_calendar(
+            connection,
+            provider,
+            start=start,
+            end=end,
         )
+        warnings.extend(calendar_result.get("warnings", []))
         with connection:
-            _upsert_calendar(connection, calendar)
             snapshot = _snapshot_stock_master(
                 connection,
                 provider,
@@ -561,6 +887,7 @@ def sync_daily_warehouse(
         "remaining_after_run": max(0, int(len(pending) - len(sessions))),
         "order": "newest_first" if newest_first else "oldest_first",
         "force": force,
+        "calendar_source": calendar_result.get("source"),
         "stock_snapshot": snapshot,
         "sessions": sessions,
         "warnings": warnings,
@@ -585,8 +912,12 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
             """
             SELECT COUNT(*) AS tracked,
                    SUM(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN 1 ELSE 0 END) AS complete,
+                   SUM(CASE WHEN bars_status='complete' AND adj_status='complete' THEN 1 ELSE 0 END) AS price_complete,
+                   SUM(CASE WHEN basic_status='complete' THEN 1 ELSE 0 END) AS basic_complete,
                    MIN(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN trade_date END) AS min_complete,
-                   MAX(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN trade_date END) AS max_complete
+                   MAX(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN trade_date END) AS max_complete,
+                   MIN(CASE WHEN bars_status='complete' AND adj_status='complete' THEN trade_date END) AS min_price_complete,
+                   MAX(CASE WHEN bars_status='complete' AND adj_status='complete' THEN trade_date END) AS max_price_complete
             FROM sync_status
             """
         ).fetchone()
@@ -597,32 +928,54 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
         latest_snapshot = connection.execute(
             "SELECT MAX(snapshot_date) AS value FROM stock_snapshots"
         ).fetchone()["value"]
+        adjustment_row = connection.execute(
+            "SELECT meta_value FROM warehouse_meta WHERE meta_key='adjustment_mode'"
+        ).fetchone()
+        adjustment_mode = str(adjustment_row["meta_value"]) if adjustment_row else "persisted_factor"
     complete = int(session["complete"] or 0)
+    price_complete = int(session["price_complete"] or 0)
+    basic_complete = int(session["basic_complete"] or 0)
     tracked = int(session["tracked"] or 0)
+    low_quota_mode = adjustment_mode == "derived_on_load_from_daily_pre_close"
+    reported_complete = price_complete if low_quota_mode else complete
+    reported_min = session["min_price_complete"] if low_quota_mode else session["min_complete"]
+    reported_max = session["max_price_complete"] if low_quota_mode else session["max_complete"]
     return {
         "status": "ok",
         "warehouse_path": str(resolved),
         "schema_version": int(schema["meta_value"]) if schema else None,
         "size_mb": round(resolved.stat().st_size / (1024 * 1024), 2),
         "tracked_sessions": tracked,
-        "complete_sessions": complete,
-        "complete_ratio": round(complete / tracked, 4) if tracked else 0.0,
+        "complete_sessions": reported_complete,
+        "complete_ratio": round(reported_complete / tracked, 4) if tracked else 0.0,
         "complete_date_range": [
-            _display_date(session["min_complete"]),
-            _display_date(session["max_complete"]),
+            _display_date(reported_min),
+            _display_date(reported_max),
         ],
+        "all_endpoints_complete_sessions": complete,
+        "all_endpoints_complete_ratio": round(complete / tracked, 4) if tracked else 0.0,
+        "price_complete_sessions": price_complete,
+        "price_complete_date_range": [
+            _display_date(session["min_price_complete"]),
+            _display_date(session["max_price_complete"]),
+        ],
+        "daily_basic_complete_sessions": basic_complete,
+        "adjustment_mode": adjustment_mode,
         "row_counts": counts,
         "latest_stock_snapshot": (
             _display_date(latest_snapshot)
         ),
         "daily_frequency_only": True,
-        "full_market_training_ready": complete >= FULL_MARKET_MIN_COMPLETE_SESSIONS,
+        "full_market_training_ready": price_complete >= FULL_MARKET_MIN_COMPLETE_SESSIONS,
         "full_market_training_min_complete_sessions": FULL_MARKET_MIN_COMPLETE_SESSIONS,
         "pit_scope": (
-            "日线、复权因子、daily_basic和交易日历按交易日保存；股票资料按实际抓取日留快照，"
+            "日线和交易日历按交易日保存；相对前复权在读取单股时由pre_close递推；"
+            "低额度模式不伪造daily_basic；股票资料按实际抓取日留快照，不会把当前行业标签倒填为历史标签"
+            if adjustment_mode == "derived_on_load_from_daily_pre_close"
+            else "日线、复权因子、daily_basic和交易日历按交易日保存；股票资料按实际抓取日留快照，"
             "不会把当前行业标签倒填为历史标签"
         ),
-        "remaining_bias": "数据源不能倒推出仓库建立前的历史行业/板块成分快照",
+        "remaining_bias": "数据源不能倒推出仓库建立前的历史行业/板块成分快照；低额度模式不保证历史daily_basic完整",
     }
 
 
@@ -649,25 +1002,38 @@ def warehouse_range_coverage(
                 (start, end),
             ).fetchone()[0]
         )
-        complete = int(
+        price_complete = int(
             connection.execute(
                 """
                 SELECT COUNT(*) FROM sync_status
                 WHERE trade_date BETWEEN ? AND ?
-                  AND bars_status='complete' AND basic_status='complete' AND adj_status='complete'
+                  AND bars_status='complete' AND adj_status='complete'
                 """,
                 (start, end),
             ).fetchone()[0]
         )
-    coverage = complete / expected if expected else 0.0
+        basic_complete = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM sync_status
+                WHERE trade_date BETWEEN ? AND ? AND basic_status='complete'
+                """,
+                (start, end),
+            ).fetchone()[0]
+        )
+    coverage = price_complete / expected if expected else 0.0
+    basic_coverage = basic_complete / expected if expected else 0.0
     return {
         "status": "ok",
         "requested_range": [_display_date(start), _display_date(end)],
         "expected_sessions": expected,
-        "complete_sessions": complete,
+        "complete_sessions": price_complete,
         "coverage": round(coverage, 4),
         "ready": bool(expected >= 60 and coverage >= 0.90),
         "minimum_coverage": 0.90,
+        "coverage_definition": "全市场日线与相对复权链完整交易日覆盖率",
+        "daily_basic_complete_sessions": basic_complete,
+        "daily_basic_coverage": round(basic_coverage, 4),
     }
 
 
@@ -702,6 +1068,10 @@ def load_qfq_history_from_warehouse(
     start = _date_text(start_date)
     end = _date_text(end_date)
     with _connect(resolved, create=False) as connection:
+        adjustment_row = connection.execute(
+            "SELECT meta_value FROM warehouse_meta WHERE meta_key='adjustment_mode'"
+        ).fetchone()
+        adjustment_mode = str(adjustment_row["meta_value"]) if adjustment_row else "persisted_factor"
         list_date, delist_date = _stock_lifetime(connection, normalized)
         effective_start = max(start, list_date) if list_date else start
         effective_end = min(end, delist_date) if delist_date else end
@@ -730,18 +1100,31 @@ def load_qfq_history_from_warehouse(
                 "sync_coverage": round(sync_coverage, 4),
                 "minimum_sync_coverage": minimum_sync_coverage,
             }
-        rows = connection.execute(
-            """
-            SELECT b.trade_date,b.open,b.high,b.low,b.close,b.pre_close,b.pct_chg,
-                   b.volume,b.amount_yuan,a.adj_factor,d.turnover_rate
-            FROM daily_bars b
-            JOIN adj_factors a ON a.trade_date=b.trade_date AND a.ts_code=b.ts_code
-            LEFT JOIN daily_basic d ON d.trade_date=b.trade_date AND d.ts_code=b.ts_code
-            WHERE b.ts_code=? AND b.trade_date BETWEEN ? AND ?
-            ORDER BY b.trade_date
-            """,
-            (normalized, effective_start, effective_end),
-        ).fetchall()
+        if adjustment_mode == "derived_on_load_from_daily_pre_close":
+            rows = connection.execute(
+                """
+                SELECT b.trade_date,b.open,b.high,b.low,b.close,b.pre_close,b.pct_chg,
+                       b.volume,b.amount_yuan,NULL AS adj_factor,d.turnover_rate
+                FROM daily_bars b
+                LEFT JOIN daily_basic d ON d.trade_date=b.trade_date AND d.ts_code=b.ts_code
+                WHERE b.ts_code=? AND b.trade_date BETWEEN ? AND ?
+                ORDER BY b.trade_date
+                """,
+                (normalized, effective_start, effective_end),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT b.trade_date,b.open,b.high,b.low,b.close,b.pre_close,b.pct_chg,
+                       b.volume,b.amount_yuan,a.adj_factor,d.turnover_rate
+                FROM daily_bars b
+                JOIN adj_factors a ON a.trade_date=b.trade_date AND a.ts_code=b.ts_code
+                LEFT JOIN daily_basic d ON d.trade_date=b.trade_date AND d.ts_code=b.ts_code
+                WHERE b.ts_code=? AND b.trade_date BETWEEN ? AND ?
+                ORDER BY b.trade_date
+                """,
+                (normalized, effective_start, effective_end),
+            ).fetchall()
     data = pd.DataFrame([dict(row) for row in rows])
     if len(data) < minimum_rows:
         return pd.DataFrame(), {
@@ -764,17 +1147,26 @@ def load_qfq_history_from_warehouse(
         "turnover_rate",
     ]:
         data[column] = pd.to_numeric(data[column], errors="coerce")
-    if data["adj_factor"].isna().any() or not (data["adj_factor"] > 0).all():
-        return pd.DataFrame(), {"status": "invalid_adjustment_factor"}
-    latest_factor = float(data["adj_factor"].iloc[-1])
-    ratio = data["adj_factor"] / latest_factor
+    if adjustment_mode == "derived_on_load_from_daily_pre_close":
+        previous_close = data["close"].shift(1)
+        step = previous_close / data["pre_close"]
+        step = step.where(step.gt(0) & np.isfinite(step), 1.0).fillna(1.0)
+        relative_factor = step.cumprod()
+        ratio = relative_factor / float(relative_factor.iloc[-1])
+        adjustment_label = "qfq_derived_on_load_from_daily_pre_close"
+    else:
+        if data["adj_factor"].isna().any() or not (data["adj_factor"] > 0).all():
+            return pd.DataFrame(), {"status": "invalid_adjustment_factor"}
+        latest_factor = float(data["adj_factor"].iloc[-1])
+        ratio = data["adj_factor"] / latest_factor
+        adjustment_label = "qfq_by_warehouse_adj_factor"
     for column in ["open", "high", "low", "close", "pre_close"]:
         data[column] = data[column] * ratio
     data = data.drop(columns=["adj_factor"])
     return data, {
         "status": "ok",
         "source": "tushare_daily_warehouse",
-        "adjustment": "qfq_by_warehouse_adj_factor",
+        "adjustment": adjustment_label,
         "rows": int(len(data)),
         "sync_coverage": round(sync_coverage, 4),
         "warehouse_path": str(resolved),
@@ -836,6 +1228,8 @@ __all__ = [
     "initialize_daily_warehouse",
     "load_daily_basic_from_warehouse",
     "load_qfq_history_from_warehouse",
+    "rebuild_derived_adj_factors",
     "sync_daily_warehouse",
+    "sync_price_warehouse",
     "warehouse_range_coverage",
 ]

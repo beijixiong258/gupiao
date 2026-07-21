@@ -66,6 +66,7 @@ class FakePro:
     def daily(self, *, trade_date: str, **_kwargs) -> pd.DataFrame:
         self.calls[f"daily_{trade_date}"] += 1
         close = 10.0 if trade_date == "20240102" else 20.0
+        pre_close = 9.5 if trade_date == "20240102" else 5.0
         return pd.DataFrame(
             [
                 {
@@ -75,7 +76,7 @@ class FakePro:
                     "high": close + 1.0,
                     "low": close - 2.0,
                     "close": close,
-                    "pre_close": close - 0.5,
+                    "pre_close": pre_close,
                     "change": 0.5,
                     "pct_chg": 1.0,
                     "vol": 1000.0,
@@ -163,6 +164,7 @@ def test_daily_warehouse_sync_resume_and_qfq_read(tmp_path) -> None:
         for key, value in pro.calls.items()
         if key.startswith(("daily_", "adj_factor_"))
     }
+    calendar_calls = pro.calls["trade_cal"]
     second = riping_cangku.sync_daily_warehouse(
         start_date="2024-01-01",
         end_date="2024-01-03",
@@ -177,6 +179,48 @@ def test_daily_warehouse_sync_resume_and_qfq_read(tmp_path) -> None:
         for key, value in pro.calls.items()
         if key.startswith(("daily_", "adj_factor_"))
     } == endpoint_calls
+    assert pro.calls["trade_cal"] == calendar_calls
+
+
+def test_daily_warehouse_falls_back_to_akshare_calendar(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "calendar-fallback.sqlite3"
+    pro = FakePro()
+    monkeypatch.setattr(
+        pro,
+        "trade_cal",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("trade_cal quota exceeded")),
+    )
+    monkeypatch.setattr(
+        riping_cangku,
+        "_akshare_trade_calendar",
+        lambda _start, _end: pd.DataFrame(
+            [
+                {
+                    "exchange": "SSE",
+                    "cal_date": "20240102",
+                    "is_open": 1,
+                    "pretrade_date": "20231229",
+                }
+            ]
+        ),
+    )
+
+    result = riping_cangku.sync_daily_warehouse(
+        start_date="2024-01-02",
+        end_date="2024-01-02",
+        max_sessions=1,
+        pause_seconds=0,
+        path=database,
+        pro=pro,
+    )
+
+    assert result["status"] == "ok"
+    assert result["calendar_source"] == "akshare_sina_trade_calendar"
+    assert result["warehouse_status"]["complete_sessions"] == 1
+    assert result["warnings"][0].startswith("Tushare trade_cal 不可用")
 
 
 def test_daily_warehouse_retries_only_failed_endpoint(tmp_path) -> None:
@@ -209,6 +253,34 @@ def test_daily_warehouse_retries_only_failed_endpoint(tmp_path) -> None:
     assert pro.calls["daily_20240102"] == 1
     assert pro.calls["adj_factor_20240102"] == 1
     assert pro.calls["daily_basic_20240102"] == 2
+
+
+def test_low_quota_price_sync_derives_qfq_chain(tmp_path) -> None:
+    database = tmp_path / "price-only.sqlite3"
+    result = riping_cangku.sync_price_warehouse(
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        max_sessions=0,
+        newest_first=False,
+        pause_seconds=0,
+        workers=2,
+        path=database,
+        pro=FakePro(),
+    )
+    history, metadata = riping_cangku.load_qfq_history_from_warehouse(
+        "600001.SH",
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        path=database,
+        minimum_rows=1,
+    )
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "price_only_low_quota"
+    assert result["warehouse_status"]["price_complete_sessions"] == 2
+    assert result["warehouse_status"]["daily_basic_complete_sessions"] == 0
+    assert metadata["status"] == "ok"
+    assert history["close"].tolist() == pytest.approx([5.0, 20.0])
 
 
 def test_stock_history_fetch_prefers_complete_warehouse(monkeypatch: pytest.MonkeyPatch) -> None:

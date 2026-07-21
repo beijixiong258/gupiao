@@ -360,7 +360,7 @@ def cmd_settings() -> int:
                     f"Tushare token: {'set' if os.getenv('TUSHARE_TOKEN') else 'not set'}",
                     (
                         f"Daily warehouse: {warehouse.get('status')} | "
-                        f"complete sessions: {warehouse.get('complete_sessions', 0)} | "
+                        f"price-complete sessions: {warehouse.get('price_complete_sessions', 0)} | "
                         f"full-market ready: {warehouse.get('full_market_training_ready', False)}"
                     ),
                 ]
@@ -520,11 +520,14 @@ def cmd_warehouse_sync(
     force: bool,
     pause_seconds: float,
     json_mode: bool,
+    price_only: bool = False,
+    workers: int = 1,
 ) -> int:
-    from src.ashare.riping_cangku import sync_daily_warehouse
+    from src.ashare.riping_cangku import sync_daily_warehouse, sync_price_warehouse
 
     try:
-        result = sync_daily_warehouse(
+        sync_function = sync_price_warehouse if price_only else sync_daily_warehouse
+        sync_kwargs = dict(
             start_date=start_date,
             end_date=end_date,
             max_sessions=max_sessions,
@@ -532,6 +535,9 @@ def cmd_warehouse_sync(
             force=force,
             pause_seconds=pause_seconds,
         )
+        if price_only:
+            sync_kwargs["workers"] = workers
+        result = sync_function(**sync_kwargs)
     except Exception as exc:
         result = {"status": "error", "error": str(exc)}
     if json_mode:
@@ -621,6 +627,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     warehouse_sync.add_argument("--force", action="store_true", help="重新拉取已经完成的交易日")
     warehouse_sync.add_argument("--pause-seconds", type=float, default=0.08, help="交易日之间的请求间隔")
+    warehouse_sync.add_argument(
+        "--price-only",
+        action="store_true",
+        help="低额度模式：只同步全市场日线，并从pre_close重建相对复权链",
+    )
+    warehouse_sync.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="低额度模式的日线下载并发数，范围1到8",
+    )
     warehouse_sync.add_argument("--json", action="store_true")
 
     sub.add_parser("settings", help="查看当前运行配置")
@@ -680,6 +697,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             force=args.force,
             pause_seconds=args.pause_seconds,
             json_mode=args.json,
+            price_only=args.price_only,
+            workers=args.workers,
         )
     if args.command == "settings":
         return cmd_settings()
