@@ -18,7 +18,7 @@ from src.ashare.shuju_yuan import CACHE_DIR, _normalize_code, _tushare_pro
 
 
 DAILY_WAREHOUSE_PATH = CACHE_DIR / "a_share_daily_warehouse.sqlite3"
-WAREHOUSE_SCHEMA_VERSION = 1
+WAREHOUSE_SCHEMA_VERSION = 2
 FULL_MARKET_MIN_COMPLETE_SESSIONS = 500
 
 
@@ -143,8 +143,31 @@ def initialize_daily_warehouse(path: Path | str = DAILY_WAREHOUSE_PATH) -> str:
                 bars_rows INTEGER NOT NULL DEFAULT 0,
                 basic_rows INTEGER NOT NULL DEFAULT 0,
                 adj_rows INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
                 last_error TEXT,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS board_snapshots (
+                snapshot_date TEXT NOT NULL,
+                board_type TEXT NOT NULL,
+                board_name TEXT NOT NULL,
+                source TEXT NOT NULL,
+                member_count INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, board_type, board_name, source)
+            );
+
+            CREATE TABLE IF NOT EXISTS board_members (
+                snapshot_date TEXT NOT NULL,
+                board_type TEXT NOT NULL,
+                board_name TEXT NOT NULL,
+                ts_code TEXT NOT NULL,
+                name TEXT,
+                source TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, board_type, board_name, ts_code, source)
             );
 
             CREATE INDEX IF NOT EXISTS idx_daily_bars_code_date
@@ -155,8 +178,20 @@ def initialize_daily_warehouse(path: Path | str = DAILY_WAREHOUSE_PATH) -> str:
                 ON adj_factors (ts_code, trade_date);
             CREATE INDEX IF NOT EXISTS idx_stock_snapshots_code_date
                 ON stock_snapshots (ts_code, snapshot_date);
+            CREATE INDEX IF NOT EXISTS idx_board_members_board_date
+                ON board_members (board_type, board_name, snapshot_date);
             """
         )
+        sync_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sync_status)").fetchall()
+        }
+        if "attempt_count" not in sync_columns:
+            connection.execute(
+                "ALTER TABLE sync_status ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_attempt_at" not in sync_columns:
+            connection.execute("ALTER TABLE sync_status ADD COLUMN last_attempt_at TEXT")
         connection.execute(
             "INSERT INTO warehouse_meta(meta_key, meta_value) VALUES('schema_version', ?) "
             "ON CONFLICT(meta_key) DO UPDATE SET meta_value=excluded.meta_value",
@@ -345,6 +380,229 @@ def _snapshot_stock_master(
     }
 
 
+def snapshot_board_constituents(
+    frame: pd.DataFrame,
+    *,
+    board_name: str,
+    board_type: str,
+    source: str,
+    snapshot_date: str | None = None,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+) -> dict[str, Any]:
+    """Persist the exact membership returned by a board provider on a fetch date."""
+    resolved = Path(path).expanduser().resolve()
+    initialize_daily_warehouse(resolved)
+    captured_date = _date_text(snapshot_date or date.today().isoformat())
+    normalized = _normalise_codes(frame)
+    if normalized.empty or "ts_code" not in normalized.columns:
+        return {"status": "empty", "snapshot_date": _display_date(captured_date), "rows": 0}
+    normalized = normalized.drop_duplicates("ts_code", keep="first")
+    board_key = str(board_name).strip()
+    type_key = str(board_type).strip().lower()
+    source_key = str(source).strip()
+    fetched_at = _now_text()
+    with _connect(resolved) as connection:
+        previous_row = connection.execute(
+            """
+            SELECT MAX(snapshot_date) AS value FROM board_snapshots
+            WHERE board_type=? AND board_name=? AND source=? AND snapshot_date<?
+            """,
+            (type_key, board_key, source_key, captured_date),
+        ).fetchone()
+        previous_date = previous_row["value"] if previous_row else None
+        previous_codes: set[str] = set()
+        if previous_date:
+            previous_codes = {
+                str(row["ts_code"])
+                for row in connection.execute(
+                    """
+                    SELECT ts_code FROM board_members
+                    WHERE snapshot_date=? AND board_type=? AND board_name=? AND source=?
+                    """,
+                    (previous_date, type_key, board_key, source_key),
+                ).fetchall()
+            }
+        connection.execute(
+            "DELETE FROM board_members WHERE snapshot_date=? AND board_type=? AND board_name=? AND source=?",
+            (captured_date, type_key, board_key, source_key),
+        )
+        rows = [
+            (
+                captured_date,
+                type_key,
+                board_key,
+                str(row.get("ts_code")),
+                str(row.get("name") or "") or None,
+                source_key,
+                fetched_at,
+            )
+            for row in normalized.to_dict("records")
+        ]
+        connection.executemany(
+            """
+            INSERT INTO board_members(
+                snapshot_date,board_type,board_name,ts_code,name,source,fetched_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        connection.execute(
+            """
+            INSERT INTO board_snapshots(
+                snapshot_date,board_type,board_name,source,member_count,fetched_at
+            ) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(snapshot_date,board_type,board_name,source) DO UPDATE SET
+                member_count=excluded.member_count,fetched_at=excluded.fetched_at
+            """,
+            (captured_date, type_key, board_key, source_key, len(rows), fetched_at),
+        )
+    current_codes = set(normalized["ts_code"].astype(str))
+    return {
+        "status": "ok",
+        "snapshot_date": _display_date(captured_date),
+        "rows": int(len(rows)),
+        "previous_snapshot_date": _display_date(previous_date),
+        "added_since_previous": int(len(current_codes - previous_codes)) if previous_date else None,
+        "removed_since_previous": int(len(previous_codes - current_codes)) if previous_date else None,
+        "warehouse_path": str(resolved),
+    }
+
+
+def board_constituent_history_status(
+    *,
+    board_name: str,
+    board_type: str,
+    source: str,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+) -> dict[str, Any]:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        return {"status": "not_initialized", "historical_membership_ready": False}
+    with _connect(resolved, create=False) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS snapshots,MIN(snapshot_date) AS first_date,
+                   MAX(snapshot_date) AS last_date,MAX(member_count) AS maximum_members
+            FROM board_snapshots
+            WHERE board_type=? AND board_name=? AND source=?
+            """,
+            (str(board_type).strip().lower(), str(board_name).strip(), str(source).strip()),
+        ).fetchone()
+    snapshots = int(row["snapshots"] or 0)
+    first_date = row["first_date"]
+    last_date = row["last_date"]
+    coverage_days = (
+        int((pd.Timestamp(last_date) - pd.Timestamp(first_date)).days)
+        if first_date and last_date
+        else 0
+    )
+    change_tracking_ready = snapshots >= 2
+    historical_training_ready = snapshots >= 12 and coverage_days >= 180
+    return {
+        "status": (
+            "historical_training_ready"
+            if historical_training_ready
+            else "change_tracking_available"
+            if change_tracking_ready
+            else "collecting"
+        ),
+        "change_tracking_ready": change_tracking_ready,
+        "historical_membership_ready": historical_training_ready,
+        "snapshot_count": snapshots,
+        "snapshot_date_range": [_display_date(first_date), _display_date(last_date)],
+        "coverage_calendar_days": coverage_days,
+        "historical_training_minimum": {"snapshots": 12, "coverage_calendar_days": 180},
+        "maximum_members": int(row["maximum_members"] or 0),
+        "usage": (
+            "快照跨度已达到历史训练门槛，可按真实快照日期构造成分区间；仓库建立前仍无法倒推"
+            if historical_training_ready
+            else "已有多个真实抓取日快照，可识别成员变化，但跨度尚不足以替代当前成分历史训练"
+            if change_tracking_ready
+            else "正在积累真实抓取日成分快照；当前历史训练仍需明确标记当前成分偏差"
+        ),
+    }
+
+
+def load_board_membership_history(
+    *,
+    board_name: str,
+    board_type: str,
+    source: str,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    resolved = Path(path).expanduser().resolve()
+    status = board_constituent_history_status(
+        board_name=board_name,
+        board_type=board_type,
+        source=source,
+        path=resolved,
+    )
+    if not resolved.is_file():
+        return pd.DataFrame(), status
+    with _connect(resolved, create=False) as connection:
+        rows = connection.execute(
+            """
+            SELECT snapshot_date,ts_code,name
+            FROM board_members
+            WHERE board_type=? AND board_name=? AND source=?
+            ORDER BY snapshot_date,ts_code
+            """,
+            (str(board_type).strip().lower(), str(board_name).strip(), str(source).strip()),
+        ).fetchall()
+    data = pd.DataFrame([dict(row) for row in rows])
+    if not data.empty:
+        data["snapshot_date"] = pd.to_datetime(data["snapshot_date"], errors="coerce").dt.normalize()
+    return data, {**status, "rows": int(len(data))}
+
+
+def load_stock_snapshot_asof(
+    as_of: str,
+    *,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load the latest stock-master snapshot that was actually captured by an as-of date."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        return pd.DataFrame(), {"status": "warehouse_not_initialized"}
+    target = _date_text(as_of)
+    with _connect(resolved, create=False) as connection:
+        row = connection.execute(
+            "SELECT MAX(snapshot_date) AS value FROM stock_snapshots WHERE snapshot_date<=?",
+            (target,),
+        ).fetchone()
+        snapshot_date = row["value"] if row else None
+        if not snapshot_date:
+            return pd.DataFrame(), {"status": "no_snapshot_on_or_before_asof"}
+        rows = connection.execute(
+            """
+            SELECT ts_code,symbol,name,area,industry,market,exchange,list_status,list_date,delist_date
+            FROM stock_snapshots
+            WHERE snapshot_date=?
+            ORDER BY ts_code
+            """,
+            (snapshot_date,),
+        ).fetchall()
+    data = pd.DataFrame([dict(value) for value in rows])
+    target_date = pd.Timestamp(target)
+    if not data.empty:
+        listed = pd.to_datetime(data["list_date"], errors="coerce")
+        delisted = pd.to_datetime(data["delist_date"], errors="coerce")
+        data = data[
+            (listed.isna() | (listed <= target_date))
+            & (delisted.isna() | (delisted > target_date))
+        ].reset_index(drop=True)
+    age_days = int((pd.Timestamp(target) - pd.Timestamp(snapshot_date)).days)
+    return data, {
+        "status": "ok",
+        "source": "warehouse_stock_snapshot",
+        "snapshot_date": _display_date(snapshot_date),
+        "requested_as_of": _display_date(target),
+        "snapshot_age_calendar_days": age_days,
+        "rows": int(len(data)),
+        "historical_precision": "使用不晚于分析日的真实抓取快照，不把更新快照倒填到更早日期",
+    }
+
+
 def _upsert_daily_bars(connection: sqlite3.Connection, frame: pd.DataFrame, trade_date: str) -> int:
     data = _normalise_codes(frame)
     if data.empty:
@@ -505,8 +763,12 @@ def _sync_one_session(connection: sqlite3.Connection, pro: Any, trade_date: str,
             (trade_date, _now_text()),
         )
         connection.execute(
-            "UPDATE sync_status SET last_error=NULL, updated_at=? WHERE trade_date=?",
-            (_now_text(), trade_date),
+            """
+            UPDATE sync_status
+            SET last_error=NULL,attempt_count=attempt_count+1,last_attempt_at=?,updated_at=?
+            WHERE trade_date=?
+            """,
+            (_now_text(), _now_text(), trade_date),
         )
     fields = (
         "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pe_ttm,pb,ps,ps_ttm,"
@@ -557,6 +819,12 @@ def _sync_one_session(connection: sqlite3.Connection, pro: Any, trade_date: str,
         value.get("status") in {"complete", "already_complete"}
         for value in result["endpoints"].values()
     ) else "partial"
+    if result["status"] == "complete":
+        with connection:
+            connection.execute(
+                "UPDATE sync_status SET last_error=NULL,updated_at=? WHERE trade_date=?",
+                (_now_text(), trade_date),
+            )
     return result
 
 
@@ -714,6 +982,20 @@ def sync_price_warehouse(
             pending_dates.reverse()
         selected = pending_dates if max_sessions == 0 else pending_dates[:max_sessions]
         sessions: list[dict[str, Any]] = []
+        with connection:
+            for trade_date in selected:
+                connection.execute(
+                    "INSERT OR IGNORE INTO sync_status(trade_date,updated_at) VALUES(?,?)",
+                    (trade_date, _now_text()),
+                )
+                connection.execute(
+                    """
+                    UPDATE sync_status
+                    SET attempt_count=attempt_count+1,last_attempt_at=?,updated_at=?
+                    WHERE trade_date=?
+                    """,
+                    (_now_text(), _now_text(), trade_date),
+                )
         throttle_lock = Lock()
         next_request_at = [time.monotonic()]
 
@@ -754,6 +1036,10 @@ def sync_price_warehouse(
                             status="complete",
                             rows=count,
                             error=None,
+                        )
+                        connection.execute(
+                            "UPDATE sync_status SET last_error=NULL,updated_at=? WHERE trade_date=?",
+                            (_now_text(), trade_date),
                         )
                     sessions.append({"trade_date": trade_date, "status": "complete", "rows": count})
                 except Exception as exc:
@@ -801,6 +1087,7 @@ def sync_price_warehouse(
         "trading_sessions_in_range": int(len(rows)),
         "pending_before_run": int(len(pending_dates)),
         "attempted_sessions": int(len(sessions)),
+        "remaining_after_run": max(0, int(len(pending_dates) - len(sessions))),
         "order": "newest_first" if newest_first else "oldest_first",
         "calendar_source": calendar_result.get("source"),
         "stock_snapshot": snapshot,
@@ -808,6 +1095,13 @@ def sync_price_warehouse(
         "sessions": sessions,
         "warnings": warnings,
         "warehouse_status": status,
+        "resume": {
+            "supported": True,
+            "next_run_skips_completed_sessions": True,
+            "failed_sessions_this_run": [
+                item["trade_date"] for item in sessions if item.get("status") != "complete"
+            ],
+        },
     }
 
 
@@ -892,6 +1186,13 @@ def sync_daily_warehouse(
         "sessions": sessions,
         "warnings": warnings,
         "warehouse_status": status,
+        "resume": {
+            "supported": True,
+            "next_run_skips_completed_endpoints": True,
+            "failed_sessions_this_run": [
+                item["trade_date"] for item in sessions if item.get("status") != "complete"
+            ],
+        },
     }
 
 
@@ -904,6 +1205,7 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
             "daily_frequency_only": True,
             "full_market_training_ready": False,
         }
+    initialize_daily_warehouse(resolved)
     with _connect(resolved, create=False) as connection:
         schema = connection.execute(
             "SELECT meta_value FROM warehouse_meta WHERE meta_key='schema_version'"
@@ -914,6 +1216,8 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
                    SUM(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN 1 ELSE 0 END) AS complete,
                    SUM(CASE WHEN bars_status='complete' AND adj_status='complete' THEN 1 ELSE 0 END) AS price_complete,
                    SUM(CASE WHEN basic_status='complete' THEN 1 ELSE 0 END) AS basic_complete,
+                   SUM(CASE WHEN last_error IS NOT NULL AND last_error<>'' THEN 1 ELSE 0 END) AS failed,
+                   MAX(attempt_count) AS maximum_attempts,
                    MIN(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN trade_date END) AS min_complete,
                    MAX(CASE WHEN bars_status='complete' AND basic_status='complete' AND adj_status='complete' THEN trade_date END) AS max_complete,
                    MIN(CASE WHEN bars_status='complete' AND adj_status='complete' THEN trade_date END) AS min_price_complete,
@@ -923,8 +1227,28 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
         ).fetchone()
         counts = {
             table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in ["daily_bars", "daily_basic", "adj_factors", "trade_calendar", "stock_snapshots"]
+            for table in [
+                "daily_bars",
+                "daily_basic",
+                "adj_factors",
+                "trade_calendar",
+                "stock_snapshots",
+                "board_snapshots",
+                "board_members",
+            ]
         }
+        recent_failures = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT trade_date,attempt_count,last_attempt_at,last_error
+                FROM sync_status
+                WHERE last_error IS NOT NULL AND last_error<>''
+                ORDER BY updated_at DESC
+                LIMIT 20
+                """
+            ).fetchall()
+        ]
         latest_snapshot = connection.execute(
             "SELECT MAX(snapshot_date) AS value FROM stock_snapshots"
         ).fetchone()["value"]
@@ -936,6 +1260,7 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
     price_complete = int(session["price_complete"] or 0)
     basic_complete = int(session["basic_complete"] or 0)
     tracked = int(session["tracked"] or 0)
+    failed = int(session["failed"] or 0)
     low_quota_mode = adjustment_mode == "derived_on_load_from_daily_pre_close"
     reported_complete = price_complete if low_quota_mode else complete
     reported_min = session["min_price_complete"] if low_quota_mode else session["min_complete"]
@@ -960,6 +1285,20 @@ def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str,
             _display_date(session["max_price_complete"]),
         ],
         "daily_basic_complete_sessions": basic_complete,
+        "failed_sessions": failed,
+        "maximum_attempts_for_one_session": int(session["maximum_attempts"] or 0),
+        "recent_failures": [
+            {
+                **item,
+                "trade_date": _display_date(str(item["trade_date"])),
+            }
+            for item in recent_failures
+        ],
+        "resume": {
+            "supported": True,
+            "behavior": "再次执行相同区间的 warehouse sync 会跳过完整交易日，只重试缺失或失败端点",
+            "remaining_sessions": max(0, tracked - reported_complete),
+        },
         "adjustment_mode": adjustment_mode,
         "row_counts": counts,
         "latest_stock_snapshot": (
@@ -996,6 +1335,19 @@ def warehouse_range_coverage(
     start = _date_text(start_date)
     end = _date_text(end_date)
     with _connect(resolved, create=False) as connection:
+        calendar_rows = connection.execute(
+            "SELECT meta_key,meta_value FROM warehouse_meta "
+            "WHERE meta_key IN ('calendar_coverage_start','calendar_coverage_end')"
+        ).fetchall()
+        calendar_meta = {str(row["meta_key"]): str(row["meta_value"]) for row in calendar_rows}
+        calendar_start = calendar_meta.get("calendar_coverage_start")
+        calendar_end = calendar_meta.get("calendar_coverage_end")
+        calendar_covers_request = bool(
+            calendar_start
+            and calendar_end
+            and calendar_start <= start
+            and calendar_end >= end
+        )
         expected = int(
             connection.execute(
                 "SELECT COUNT(*) FROM trade_calendar WHERE is_open=1 AND cal_date BETWEEN ? AND ?",
@@ -1024,14 +1376,19 @@ def warehouse_range_coverage(
     coverage = price_complete / expected if expected else 0.0
     basic_coverage = basic_complete / expected if expected else 0.0
     return {
-        "status": "ok",
+        "status": "ok" if calendar_covers_request else "calendar_range_incomplete",
         "requested_range": [_display_date(start), _display_date(end)],
+        "calendar_coverage_range": [
+            _display_date(calendar_start),
+            _display_date(calendar_end),
+        ],
+        "calendar_covers_requested_range": calendar_covers_request,
         "expected_sessions": expected,
         "complete_sessions": price_complete,
         "coverage": round(coverage, 4),
-        "ready": bool(expected >= 60 and coverage >= 0.90),
+        "ready": bool(calendar_covers_request and expected >= 60 and coverage >= 0.90),
         "minimum_coverage": 0.90,
-        "coverage_definition": "全市场日线与相对复权链完整交易日覆盖率",
+        "coverage_definition": "本地交易日历先完整覆盖请求区间，再计算全市场日线与相对复权链完整交易日覆盖率",
         "daily_basic_complete_sessions": basic_complete,
         "daily_basic_coverage": round(basic_coverage, 4),
     }
@@ -1075,6 +1432,29 @@ def load_qfq_history_from_warehouse(
         list_date, delist_date = _stock_lifetime(connection, normalized)
         effective_start = max(start, list_date) if list_date else start
         effective_end = min(end, delist_date) if delist_date else end
+        calendar_rows = connection.execute(
+            "SELECT meta_key,meta_value FROM warehouse_meta "
+            "WHERE meta_key IN ('calendar_coverage_start','calendar_coverage_end')"
+        ).fetchall()
+        calendar_meta = {str(row["meta_key"]): str(row["meta_value"]) for row in calendar_rows}
+        calendar_start = calendar_meta.get("calendar_coverage_start")
+        calendar_end = calendar_meta.get("calendar_coverage_end")
+        calendar_covers_request = bool(
+            calendar_start
+            and calendar_end
+            and calendar_start <= effective_start
+            and calendar_end >= effective_end
+        )
+        if not calendar_covers_request:
+            return pd.DataFrame(), {
+                "status": "calendar_range_incomplete",
+                "requested_range": [_display_date(effective_start), _display_date(effective_end)],
+                "calendar_coverage_range": [
+                    _display_date(calendar_start),
+                    _display_date(calendar_end),
+                ],
+                "sync_coverage": 0.0,
+            }
         expected = int(
             connection.execute(
                 "SELECT COUNT(*) FROM trade_calendar WHERE is_open=1 AND cal_date BETWEEN ? AND ?",
@@ -1173,6 +1553,108 @@ def load_qfq_history_from_warehouse(
     }
 
 
+def load_qfq_histories_from_warehouse(
+    codes: Iterable[str],
+    *,
+    start_date: str,
+    end_date: str,
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+    minimum_sync_coverage: float = 0.90,
+    minimum_rows: int = 60,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    """Load several adjusted histories with one SQLite query."""
+    resolved = Path(path).expanduser().resolve()
+    normalized = sorted({_normalize_code(code) for code in codes})
+    if not resolved.is_file() or not normalized:
+        return {}, {"status": "warehouse_not_initialized_or_no_codes"}
+    start = _date_text(start_date)
+    end = _date_text(end_date)
+    coverage = warehouse_range_coverage(start_date=start, end_date=end, path=resolved)
+    if not coverage.get("ready") or float(coverage.get("coverage", 0.0)) < minimum_sync_coverage:
+        return {}, {
+            "status": "insufficient_warehouse_coverage",
+            "range": coverage,
+            "minimum_sync_coverage": minimum_sync_coverage,
+        }
+    placeholders = ",".join("?" for _ in normalized)
+    with _connect(resolved, create=False) as connection:
+        adjustment_row = connection.execute(
+            "SELECT meta_value FROM warehouse_meta WHERE meta_key='adjustment_mode'"
+        ).fetchone()
+        adjustment_mode = str(adjustment_row["meta_value"]) if adjustment_row else "persisted_factor"
+        factor_join = (
+            "LEFT JOIN adj_factors a ON a.trade_date=b.trade_date AND a.ts_code=b.ts_code"
+            if adjustment_mode == "derived_on_load_from_daily_pre_close"
+            else "JOIN adj_factors a ON a.trade_date=b.trade_date AND a.ts_code=b.ts_code"
+        )
+        rows = connection.execute(
+            f"""
+            SELECT b.ts_code,b.trade_date,b.open,b.high,b.low,b.close,b.pre_close,b.pct_chg,
+                   b.volume,b.amount_yuan,a.adj_factor,d.turnover_rate
+            FROM daily_bars b
+            {factor_join}
+            LEFT JOIN daily_basic d ON d.trade_date=b.trade_date AND d.ts_code=b.ts_code
+            WHERE b.ts_code IN ({placeholders}) AND b.trade_date BETWEEN ? AND ?
+            ORDER BY b.ts_code,b.trade_date
+            """,
+            [*normalized, start, end],
+        ).fetchall()
+    combined = pd.DataFrame([dict(row) for row in rows])
+    if combined.empty:
+        return {}, {"status": "no_rows", "range": coverage}
+    combined["trade_date"] = pd.to_datetime(combined["trade_date"], errors="coerce")
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "pre_close",
+        "pct_chg",
+        "volume",
+        "amount_yuan",
+        "adj_factor",
+        "turnover_rate",
+    ]
+    for column in numeric_columns:
+        combined[column] = pd.to_numeric(combined[column], errors="coerce")
+    histories: dict[str, pd.DataFrame] = {}
+    skipped: dict[str, str] = {}
+    for code, group in combined.groupby("ts_code", sort=False):
+        data = group.sort_values("trade_date").reset_index(drop=True).copy()
+        if len(data) < minimum_rows:
+            skipped[str(code)] = f"rows={len(data)}<minimum_rows={minimum_rows}"
+            continue
+        if adjustment_mode == "derived_on_load_from_daily_pre_close":
+            step = data["close"].shift(1) / data["pre_close"]
+            step = step.where(step.gt(0) & np.isfinite(step), 1.0).fillna(1.0)
+            relative_factor = step.cumprod()
+            ratio = relative_factor / float(relative_factor.iloc[-1])
+            adjustment_label = "qfq_derived_on_load_from_daily_pre_close"
+        else:
+            if data["adj_factor"].isna().any() or not (data["adj_factor"] > 0).all():
+                skipped[str(code)] = "invalid_adjustment_factor"
+                continue
+            ratio = data["adj_factor"] / float(data["adj_factor"].iloc[-1])
+            adjustment_label = "qfq_by_warehouse_adj_factor"
+        for column in ["open", "high", "low", "close", "pre_close"]:
+            data[column] = data[column] * ratio
+        data = data.drop(columns=["adj_factor"])
+        data.attrs["adjustment"] = adjustment_label
+        histories[str(code)] = data
+    missing = sorted(set(normalized) - set(histories))
+    return histories, {
+        "status": "ok" if histories else "no_usable_stocks",
+        "source": "tushare_daily_warehouse_batch",
+        "requested_stocks": int(len(normalized)),
+        "loaded_stocks": int(len(histories)),
+        "missing_stocks": missing,
+        "skipped": skipped,
+        "rows": int(sum(len(frame) for frame in histories.values())),
+        "range": coverage,
+        "warehouse_path": str(resolved),
+    }
+
+
 def load_daily_basic_from_warehouse(
     codes: Iterable[str],
     *,
@@ -1224,11 +1706,16 @@ def load_daily_basic_from_warehouse(
 
 __all__ = [
     "DAILY_WAREHOUSE_PATH",
+    "board_constituent_history_status",
     "daily_warehouse_status",
     "initialize_daily_warehouse",
     "load_daily_basic_from_warehouse",
+    "load_board_membership_history",
+    "load_qfq_histories_from_warehouse",
     "load_qfq_history_from_warehouse",
+    "load_stock_snapshot_asof",
     "rebuild_derived_adj_factors",
+    "snapshot_board_constituents",
     "sync_daily_warehouse",
     "sync_price_warehouse",
     "warehouse_range_coverage",

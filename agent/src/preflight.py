@@ -61,12 +61,27 @@ def _check_llm_provider() -> CheckResult:
             headers={"Authorization": f"Bearer {settings['api_key']}"},
             timeout=10.0,
         )
+        if 200 <= response.status_code < 300:
+            return CheckResult(
+                name=f"LLM ({provider})",
+                status="ready",
+                message=f"{model} via {base_url}",
+                impact="",
+            )
         if response.status_code in {401, 403}:
             return CheckResult(
                 name=f"LLM ({provider})",
                 status="error",
                 message=f"credential rejected (HTTP {response.status_code})",
                 impact="agent cannot function",
+                critical=True,
+            )
+        if response.status_code == 429:
+            return CheckResult(
+                name=f"LLM ({provider})",
+                status="error",
+                message="provider rate limited the connectivity check (HTTP 429)",
+                impact="agent may be temporarily unavailable",
                 critical=True,
             )
         if response.status_code >= 500:
@@ -79,9 +94,10 @@ def _check_llm_provider() -> CheckResult:
             )
         return CheckResult(
             name=f"LLM ({provider})",
-            status="ready",
-            message=f"{model} via {base_url}",
-            impact="",
+            status="error",
+            message=f"unexpected provider response (HTTP {response.status_code})",
+            impact="agent cannot function",
+            critical=True,
         )
     except Exception as exc:
         return CheckResult(

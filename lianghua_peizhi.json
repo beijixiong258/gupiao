@@ -57,6 +57,7 @@
     "min_mean_daily_rank_ic": 0.01,
     "min_rank_ic_days": 10,
     "min_skill_vs_baseline": 0.01,
+    "min_skill_vs_best_naive_baseline": 0.0,
     "validation_top_n": 3,
     "min_top_n_days": 10,
     "learning_rate": 0.05,
@@ -105,11 +106,17 @@
       "1": 0.5,
       "2": 0.3,
       "3": 0.2
-    }
+    },
+    "abstain_min_net_return": 0.003,
+    "abstain_min_positive_probability": 0.55,
+    "abstain_min_quality_score": 0.4
   },
   "jiaoyi": {
     "max_holding_days": 3,
     "cost_scenario": "normal_cost",
+    "dynamic_slippage_enabled": true,
+    "max_dynamic_slippage_bps_roundtrip": 40.0,
+    "max_participation_rate": 0.005,
     "execution_mode": "research_only",
     "allow_live_trading": false,
     "allow_order_submission": false

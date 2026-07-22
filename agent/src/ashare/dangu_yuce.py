@@ -18,7 +18,6 @@ import pandas as pd
 from sklearn.metrics import brier_score_loss, mean_absolute_error
 
 from src.ashare.bankuai_yuce import (
-    _apply_cost,
     _blend_component_predictions,
     _calibrate_direction_probability,
     _daily_rank_ic,
@@ -26,16 +25,12 @@ from src.ashare.bankuai_yuce import (
     _fit_direction_probabilities,
     _fit_model_components,
     _fold_stability,
-    _load_cost_assumption,
-    _price_limit_bounds,
     _quality_label,
     _quality_score,
     _regime_stability,
     _rolling_conformal_interval,
     _select_stable_features,
-    _round_price_tick,
     _select_ensemble_weight,
-    _stock_roundtrip_cost,
     _top_n_validation_metrics,
     goujian_moxing_shuju,
 )
@@ -51,6 +46,14 @@ from src.ashare.gupiao_yanjiu import (
     huoqu_rili_xingqing,
     shi_a_gu,
 )
+from src.ashare.jiaoyi_zhixing import (
+    _apply_cost,
+    _load_cost_assumption,
+    _price_limit_bounds,
+    _round_price_tick,
+    _stock_roundtrip_cost,
+)
+from src.ashare.moxing_pinggu import regression_baseline_metrics, signal_evidence_gate
 from src.ashare.shuju_yuan import _load_or_fetch_stock_basic, _price_limit_rule, _tushare_pro
 from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
 
@@ -306,12 +309,41 @@ def _normalise_universe_codes(frame: pd.DataFrame) -> pd.DataFrame:
     return data.drop_duplicates("ts_code", keep="first").reset_index(drop=True)
 
 
-def _latest_tushare_cross_section(signal_date: pd.Timestamp) -> tuple[pd.DataFrame, str, list[str]]:
+def _latest_tushare_cross_section(
+    signal_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, str, list[str], dict[str, Any]]:
     pro = _tushare_pro()
     warnings: list[str] = []
     quality: dict[str, Any] = {}
-    basic = _load_or_fetch_stock_basic(pro, quality)
-    warnings.extend(str(value) for value in quality.get("warnings", []))
+    stock_master_meta: dict[str, Any] = {"status": "live_current_snapshot"}
+    try:
+        from src.ashare.riping_cangku import load_stock_snapshot_asof
+
+        basic, stock_master_meta = load_stock_snapshot_asof(signal_date.strftime("%Y%m%d"))
+        if (
+            not basic.empty
+            and int(stock_master_meta.get("snapshot_age_calendar_days", 0)) > 45
+        ):
+            warnings.append(
+                f"本地股票资料PIT快照已距分析日 {stock_master_meta.get('snapshot_age_calendar_days')} 天，"
+                "改用当前接口并明确保留当前行业标签偏差"
+            )
+            basic = pd.DataFrame()
+    except Exception as exc:
+        basic = pd.DataFrame()
+        stock_master_meta = {"status": "warehouse_snapshot_failed", "error": str(exc)}
+    if basic.empty:
+        basic = _load_or_fetch_stock_basic(pro, quality)
+        warnings.extend(str(value) for value in quality.get("warnings", []))
+        stock_master_meta = {
+            "status": "live_current_snapshot",
+            "source": str(quality.get("stock_basic", {}).get("source") or "tushare_stock_basic"),
+            "known_bias": "没有不晚于分析日的本地股票资料快照，行业标签来自当前接口",
+        }
+    else:
+        warnings.append(
+            f"同行股票资料使用 {stock_master_meta.get('snapshot_date')} 的本地PIT快照"
+        )
     daily = pd.DataFrame()
     daily_date = ""
     for offset in range(12):
@@ -356,10 +388,12 @@ def _latest_tushare_cross_section(signal_date: pd.Timestamp) -> tuple[pd.DataFra
     basic = _normalise_universe_codes(basic)
     daily = _normalise_universe_codes(daily)
     data = basic.merge(daily, on="ts_code", how="left")
-    return data, pd.Timestamp(daily_date).strftime("%Y-%m-%d"), warnings
+    return data, pd.Timestamp(daily_date).strftime("%Y-%m-%d"), warnings, stock_master_meta
 
 
-def _latest_akshare_cross_section(signal_date: pd.Timestamp) -> tuple[pd.DataFrame, str, list[str]]:
+def _latest_akshare_cross_section(
+    signal_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, str, list[str], dict[str, Any]]:
     import akshare as ak
 
     with akshare_zhilian():
@@ -406,7 +440,16 @@ def _latest_akshare_cross_section(signal_date: pd.Timestamp) -> tuple[pd.DataFra
         if "name_basic" in data.columns:
             data["name"] = data.get("name").fillna(data["name_basic"])
             data = data.drop(columns=["name_basic"])
-    return data, signal_date.strftime("%Y-%m-%d"), ["同行池降级为 AKShare 当前快照，横截面日期由分析信号日近似"]
+    return (
+        data,
+        signal_date.strftime("%Y-%m-%d"),
+        ["同行池降级为 AKShare 当前快照，横截面日期由分析信号日近似"],
+        {
+            "status": "live_current_snapshot",
+            "source": "akshare_current_snapshot",
+            "known_bias": "AKShare 快照没有历史行业成员时点，不能用于回填过去行业标签",
+        },
+    )
 
 
 def xuanze_tonghang_yangben(
@@ -455,12 +498,12 @@ def xuanze_tonghang_yangben(
     same_industry_limit = max(4, min(maximum - 1, base_same_industry))
     warnings: list[str] = []
     try:
-        universe, as_of, source_warnings = _latest_tushare_cross_section(signal)
+        universe, as_of, source_warnings, stock_master_meta = _latest_tushare_cross_section(signal)
         source = "tushare"
         warnings.extend(source_warnings)
     except Exception as tushare_exc:
         warnings.append(f"Tushare 同行池失败：{tushare_exc}")
-        universe, as_of, source_warnings = _latest_akshare_cross_section(signal)
+        universe, as_of, source_warnings, stock_master_meta = _latest_akshare_cross_section(signal)
         source = "akshare"
         warnings.extend(source_warnings)
 
@@ -529,8 +572,12 @@ def xuanze_tonghang_yangben(
         "applied_peer_limit": maximum,
         "warehouse_range": warehouse_range,
         "warehouse_expansion_applied": bool(warehouse_range.get("ready") and maximum > base_maximum),
+        "stock_master_snapshot": stock_master_meta,
         "selection_method": "当前同行优先，再用全市场高流动性股票补足；目标股票始终保留",
-        "known_bias": "使用当前上市股票、当前行业标签和当前流动性构造历史面板，仍存在幸存者与当前成分偏差",
+        "known_bias": (
+            "优先使用不晚于分析日的本地股票资料快照；若快照不可用则退回当前行业标签。"
+            "即使有快照，仓库建立前的行业变化仍无法倒推"
+        ),
         "warnings": warnings,
     }
 
@@ -594,6 +641,28 @@ def _fetch_peer_histories(
     errors: list[str] = []
     warnings: list[str] = []
     sources: Counter[str] = Counter()
+    warehouse_histories: dict[str, pd.DataFrame] = {}
+    warehouse_batch: dict[str, Any] = {}
+    try:
+        from src.ashare.riping_cangku import load_qfq_histories_from_warehouse
+
+        warehouse_codes = [
+            str(value)
+            for value in peer_table["ts_code"].astype(str)
+            if str(value) != target_code
+        ]
+        warehouse_histories, warehouse_batch = load_qfq_histories_from_warehouse(
+            warehouse_codes,
+            start_date=pd.Timestamp(start).strftime("%Y%m%d"),
+            end_date=signal.strftime("%Y%m%d"),
+            minimum_rows=minimum_rows,
+        )
+        if warehouse_histories:
+            warnings.append(
+                f"本地仓库一次批量读取 {len(warehouse_histories)} 只同行，剩余同行才访问外部行情源"
+            )
+    except Exception as exc:
+        warnings.append(f"本地仓库批量读取不可用，改为逐只读取：{exc}")
 
     for _, row in peer_table.iterrows():
         peer_code = str(row["ts_code"])
@@ -604,6 +673,13 @@ def _fetch_peer_histories(
             adjustment = target_adjustment
             source_warnings: list[str] = []
             source_errors: list[str] = []
+        elif peer_code in warehouse_histories:
+            warehouse_data = warehouse_histories[peer_code]
+            adjustment = str(warehouse_data.attrs.get("adjustment") or "qfq_by_warehouse")
+            data = warehouse_data.copy()
+            data_source = str(warehouse_batch.get("source") or "tushare_daily_warehouse_batch")
+            source_warnings = []
+            source_errors = []
         else:
             fetched = huoqu_rili_xingqing(
                 peer_code,
@@ -851,6 +927,11 @@ def _fit_single_stock_models(
                 clip_low,
                 clip_high,
             )
+            naive_comparison = regression_baseline_metrics(
+                actual=actual,
+                predicted=predicted,
+                training_target=y_train_raw,
+            )
             baseline_value = float(np.median(y_train_raw))
             baseline = np.full(len(actual), baseline_value)
             mae = float(mean_absolute_error(actual, predicted))
@@ -866,10 +947,12 @@ def _fit_single_stock_models(
                 budget_yuan=budget_yuan,
                 scenario=cost_scenario,
                 top_n=validation_top_n,
+                trading_settings=config.get("jiaoyi", {}),
             )
             fold_passed = bool(
                 direction >= 0.50
                 and skill > 0
+                and float(naive_comparison["skill_vs_best_naive_baseline"]) > 0
                 and rank_ic >= 0
                 and top_n["top_n_mean_net_return"] > 0
             )
@@ -884,6 +967,7 @@ def _fit_single_stock_models(
                 "mae": round(mae, 6),
                 "baseline_mae": round(baseline_mae, 6),
                 "skill_vs_median_baseline": round(skill, 6),
+                "naive_baseline_comparison": naive_comparison,
                 "direction_accuracy": round(direction, 6),
                 "mean_daily_rank_ic": round(rank_ic, 6),
                 "rank_ic_days": int(rank_days),
@@ -911,6 +995,9 @@ def _fit_single_stock_models(
                 "fold_passed": fold_passed,
             })
             oof_columns = ["trade_date", "ts_code", entry_open_column]
+            oof_columns.extend(
+                column for column in ["amount_yuan", "atr_14_pct"] if column in validation_frame.columns
+            )
             if regime_column in validation_frame.columns:
                 oof_columns.append(regime_column)
             oof = validation_frame[oof_columns].copy()
@@ -1031,6 +1118,16 @@ def _fit_single_stock_models(
             mae = float(mean_absolute_error(actual, predicted))
             baseline_mae = float(mean_absolute_error(actual, baseline))
             skill = 1.0 - mae / baseline_mae if baseline_mae > 0 else 0.0
+            first_validation_start = boundaries[0][0] if boundaries else usable["trade_date"].min()
+            baseline_training = usable[
+                (usable["trade_date"] < first_validation_start)
+                & (usable[target_date_column] < first_validation_start)
+            ][target_column].to_numpy(dtype=float)
+            naive_comparison = regression_baseline_metrics(
+                actual=actual,
+                predicted=predicted,
+                training_target=baseline_training,
+            )
             direction = float(np.mean((predicted > 0) == (actual > 0)))
             rank_ic, rank_days = _daily_rank_ic(oof["trade_date"], actual, predicted)
             top_n = _top_n_validation_metrics(
@@ -1041,6 +1138,7 @@ def _fit_single_stock_models(
                 budget_yuan=budget_yuan,
                 scenario=cost_scenario,
                 top_n=validation_top_n,
+                trading_settings=config.get("jiaoyi", {}),
             )
             residual = actual - predicted
             residual_low, residual_high = np.nanquantile(residual, [0.10, 0.90])
@@ -1071,6 +1169,7 @@ def _fit_single_stock_models(
             )
             minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
             minimum_skill = float(model_config.get("min_skill_vs_baseline", 0.01))
+            minimum_best_naive_skill = float(model_config.get("min_skill_vs_best_naive_baseline", 0.0))
             minimum_direction = float(model_config.get("min_direction_accuracy", 0.52))
             minimum_rank_days = int(model_config.get("min_rank_ic_days", 10))
             minimum_top_days = int(model_config.get("min_top_n_days", 10))
@@ -1082,6 +1181,7 @@ def _fit_single_stock_models(
                 and rank_ic >= minimum_rank_ic
                 and rank_days >= minimum_rank_days
                 and skill >= minimum_skill
+                and float(naive_comparison["skill_vs_best_naive_baseline"]) >= minimum_best_naive_skill
                 and top_n["top_n_days"] >= minimum_top_days
                 and top_n["top_n_mean_net_return"] > 0
                 and top_n["top_n_mean_excess_vs_universe"] > 0
@@ -1091,6 +1191,7 @@ def _fit_single_stock_models(
                 "mae": round(mae, 6),
                 "baseline_mae": round(baseline_mae, 6),
                 "skill_vs_median_baseline": round(skill, 6),
+                "naive_baseline_comparison": naive_comparison,
                 "direction_accuracy": round(direction, 6),
                 "mean_daily_rank_ic": round(rank_ic, 6),
                 "rank_ic_days": int(rank_days),
@@ -1125,6 +1226,7 @@ def _fit_single_stock_models(
                     "mean_daily_rank_ic": minimum_rank_ic,
                     "rank_ic_days": minimum_rank_days,
                     "skill_vs_median_baseline": minimum_skill,
+                    "skill_vs_best_naive_baseline": minimum_best_naive_skill,
                     "top_n_days": minimum_top_days,
                     "top_n_mean_net_return": "> 0",
                     "top_n_mean_excess_vs_universe": "> 0",
@@ -1710,7 +1812,12 @@ def _build_analysis_assessment(
         reasons.append("指定持有期模型没有通过滚动样本外门槛")
     elif not requested.get("position_and_cost", {}).get("execution_feasible"):
         evidence_label = "证据偏负面"
-        reasons.append("按目标资金测算，无法满足该板块最低买入数量")
+        reasons.append(
+            str(
+                requested.get("position_and_cost", {}).get("reason")
+                or "按目标资金测算，无法满足最低买入数量或成交容量约束"
+            )
+        )
     else:
         net = float(requested.get("estimated_net_return_after_cost") or 0.0)
         probability = requested.get("direction_model_positive_probability")
@@ -1738,6 +1845,29 @@ def _build_analysis_assessment(
         evidence_label = "证据中性"
         reasons.append("基本面存在明显风险项，短线量化证据不足以覆盖这些不确定性")
     reasons.extend(fundamental_flags)
+    requested_probability = requested.get("direction_model_positive_probability") if requested else None
+    if requested_probability is None and requested:
+        requested_probability = requested.get("empirical_positive_probability")
+    signal_gate = signal_evidence_gate(
+        validation_passed=bool(metrics.get("validation_passed")),
+        execution_feasible=bool((requested.get("position_and_cost") or {}).get("execution_feasible"))
+        if requested
+        else False,
+        net_return=_round_optional(requested.get("estimated_net_return_after_cost")) if requested else None,
+        positive_probability=_round_optional(requested_probability),
+        quality_score=_round_optional(metrics.get("quality_score")),
+        minimum_net_return=minimum_net,
+        minimum_positive_probability=minimum_probability,
+        minimum_quality_score=float(config.get("moxing", {}).get("abstain_min_quality_score", 0.40)),
+    )
+    if evidence_label == "证据偏正面" and not signal_gate["actionable_signal"]:
+        evidence_label = "证据中性"
+        reasons.extend(value for value in signal_gate["reasons"] if value not in reasons)
+    if evidence_label != "证据偏正面":
+        signal_gate["actionable_signal"] = False
+        signal_gate["decision"] = "abstain"
+        if not signal_gate["reasons"]:
+            signal_gate["reasons"] = ["综合技术、基本面或时点约束后没有形成明确正面证据"]
     summary_detail = reasons[0] if reasons else "指定期限证据不足"
     return {
         "evidence_label": evidence_label,
@@ -1745,6 +1875,7 @@ def _build_analysis_assessment(
         "summary": f"{evidence_label}：{summary_detail}",
         "confidence": metrics.get("quality_label", "low") if metrics.get("validation_passed") else "insufficient",
         "reasons": reasons,
+        "signal_gate": signal_gate,
         "assessment_thresholds": {
             "minimum_net_return_after_cost": minimum_net,
             "minimum_oos_direction_positive_probability": minimum_probability,
@@ -1838,6 +1969,11 @@ def yanjiu_dangu_yuce(
                     else "证据偏负面：存在明显可交易性约束"
                 ),
                 "reasons": [reason] + list(tradability.get("hard_blocks", [])),
+                "signal_gate": {
+                    "actionable_signal": False,
+                    "decision": "abstain",
+                    "reasons": [reason] + list(tradability.get("hard_blocks", [])),
+                },
                 "responsibility_note": "这是分析证据汇总，不是交易指令；最终决定由用户自行作出。",
             },
             "limitations": ["同行历史不足时不退化为单股票自拟合模型，也不把启发式技术分冒充预测"],
@@ -1885,7 +2021,16 @@ def yanjiu_dangu_yuce(
         future_error = str(exc)
     prediction_row = predictions.iloc[0]
     analysis_price = _round_optional(tradability.get("analysis_price"), 3) or _round_optional(prediction_row.get("close"), 3)
-    stock_cost_rate, position_cost = _stock_roundtrip_cost(code, float(analysis_price), actual_budget, cost_scenario)
+    latest_model_row = target_rows.tail(1).iloc[0]
+    stock_cost_rate, position_cost = _stock_roundtrip_cost(
+        code,
+        float(analysis_price),
+        actual_budget,
+        cost_scenario,
+        daily_amount_yuan=_round_optional(latest_model_row.get("amount_yuan")),
+        atr_pct=_round_optional(latest_model_row.get("atr_14_pct")),
+        trading_settings=config.get("jiaoyi", {}),
+    )
     forecast: dict[str, Any] = {}
     for horizon in [1, 2, 3]:
         gross = _round_optional(prediction_row.get(f"pred_t{horizon}"))

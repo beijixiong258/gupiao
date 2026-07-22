@@ -23,6 +23,7 @@ from src.ashare.shuju_yuan import (
     _price_limit_rule,
     _tushare_pro,
 )
+from src.ashare.shuju_zhiliang import build_data_health, classify_failure
 from src.providers.llm import _ensure_dotenv
 from src.tools.path_utils import safe_run_dir
 
@@ -169,6 +170,10 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         min_direction = float(model.get("min_direction_accuracy", 0.52))
         min_rank_ic = float(model.get("min_mean_daily_rank_ic", 0.01))
         min_skill = float(model.get("min_skill_vs_baseline", 0.01))
+        min_best_naive_skill = float(model.get("min_skill_vs_best_naive_baseline", 0.0))
+        abstain_min_net_return = float(model.get("abstain_min_net_return", 0.003))
+        abstain_min_probability = float(model.get("abstain_min_positive_probability", 0.55))
+        abstain_min_quality = float(model.get("abstain_min_quality_score", 0.40))
         ridge_alpha = float(model.get("ridge_alpha", 10.0))
         ensemble_default_tree_weight = float(model.get("ensemble_default_tree_weight", 0.75))
         ensemble_calibration_ratio = float(model.get("ensemble_calibration_ratio", 0.15))
@@ -204,8 +209,14 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
     if not 0.5 <= min_direction <= 1:
         raise ValueError("moxing.min_direction_accuracy 必须在 0.5 到 1 之间")
-    if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1:
+    if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1 or not -1 <= min_best_naive_skill <= 1:
         raise ValueError("moxing 的 Rank IC 和基线提升门槛必须在 -1 到 1 之间")
+    if not 0 <= abstain_min_net_return <= 0.2:
+        raise ValueError("moxing.abstain_min_net_return 必须在 0 到 0.2 之间")
+    if not 0.5 <= abstain_min_probability <= 1:
+        raise ValueError("moxing.abstain_min_positive_probability 必须在 0.5 到 1 之间")
+    if not 0 <= abstain_min_quality <= 1:
+        raise ValueError("moxing.abstain_min_quality_score 必须在 0 到 1 之间")
     if not isinstance(model.get("ensemble_enabled", True), bool):
         raise ValueError("moxing.ensemble_enabled 必须是 true 或 false")
     if not isinstance(model.get("factor_stability_enabled", True), bool):
@@ -268,6 +279,17 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         or trading.get("allow_order_submission") is not False
     ):
         raise ValueError("本程序被硬限制为 research_only，禁止实盘交易和订单提交")
+    if not isinstance(trading.get("dynamic_slippage_enabled", True), bool):
+        raise ValueError("jiaoyi.dynamic_slippage_enabled 必须是 true 或 false")
+    try:
+        maximum_dynamic_slippage = float(trading.get("max_dynamic_slippage_bps_roundtrip", 40.0))
+        maximum_participation = float(trading.get("max_participation_rate", 0.005))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"jiaoyi 动态成交成本配置无效：{exc}") from exc
+    if not 0 <= maximum_dynamic_slippage <= 500:
+        raise ValueError("jiaoyi.max_dynamic_slippage_bps_roundtrip 必须在 0 到 500 之间")
+    if not 0 < maximum_participation <= 0.1:
+        raise ValueError("jiaoyi.max_participation_rate 必须在 0 到 0.1 之间")
     single = value.get("dangu", {})
     if not isinstance(single, dict):
         raise ValueError("dangu 必须是 JSON 对象")
@@ -726,6 +748,12 @@ def _load_daily_bar_cache(
             & (data["trade_date"] <= pd.Timestamp(wanted_end))
         ].reset_index(drop=True)
         if data.empty:
+            return None
+        expected_latest = _latest_expected_market_date()
+        if (
+            pd.Timestamp(wanted_end).normalize() >= expected_latest
+            and pd.Timestamp(data["trade_date"].max()).normalize() < expected_latest
+        ):
             return None
         provider = str(meta.get("provider") or source)
         adjustment = str(meta.get("adjustment") or "unknown")
@@ -1635,9 +1663,16 @@ def fenxi_gupiao(
                 "requested_horizon": f"T+{holding_days}",
                 "summary": f"{fallback_label}：{fallback_reasons[0]}",
                 "reasons": fallback_reasons,
+                "signal_gate": {
+                    "actionable_signal": False,
+                    "decision": "abstain",
+                    "reasons": fallback_reasons,
+                },
                 "responsibility_note": "这是分析证据汇总，不是交易指令；最终决定由用户自行作出。",
             },
             "error": str(exc),
+            "failure_category": classify_failure(exc),
+            "failure_stage": "single_stock_model",
             "limitations": ["模型失败时不使用启发式技术分替代收益预测"],
         }
     risks: list[str] = []
@@ -1667,6 +1702,28 @@ def fenxi_gupiao(
     if quantitative.get("status") != "ok":
         risks.append("指定持有期量化模型本次不可用或同行样本不足，相关证据不足")
 
+    peer_universe = quantitative.get("peer_universe", {})
+    history_fetch = peer_universe.get("history_fetch", {})
+    data_health = build_data_health(
+        as_of=str(technical["trade_date"]),
+        expected_as_of=freshness.get("expected_latest_date"),
+        freshness=freshness,
+        sources={
+            "market_history": market.source,
+            "adjustment": market.adjustment,
+            "fundamentals": fundamentals.get("sources", {}),
+            "peer_history": history_fetch.get("history_sources", {}),
+            "daily_factors": quantitative.get("daily_factor_data", {}).get("source"),
+        },
+        warehouse=peer_universe.get("warehouse_range"),
+        warnings=market_warnings + list(history_fetch.get("warnings", [])),
+        errors=list(market.errors) + list(history_fetch.get("errors", [])),
+        constituent_history={
+            **(peer_universe.get("stock_master_snapshot") or {"status": "unavailable"}),
+            "usage": "同行池优先使用不晚于信号日的股票资料快照；仓库建立前的行业成员变化仍无法倒推",
+        },
+    )
+
     result: dict[str, Any] = {
         "status": "ok",
         "tool_contract_version": SINGLE_STOCK_TOOL_CONTRACT_VERSION,
@@ -1690,6 +1747,7 @@ def fenxi_gupiao(
             "warnings": market_warnings,
             "errors": list(market.errors),
         },
+        "data_health": data_health,
         "current_quote": current_quote,
         "tradability": tradability,
         "quantitative_analysis": quantitative,
@@ -1707,7 +1765,12 @@ def fenxi_gupiao(
         },
         "a_share_rules": _a_share_rules(code, name),
         "risks": risks,
-        "configuration": {"quant_config_path": resolved_config},
+        "configuration": {
+            "quant_config_path": resolved_config,
+            "config_version": config.get("banben"),
+            "cost_scenario": config.get("jiaoyi", {}).get("cost_scenario"),
+            "dynamic_slippage_enabled": config.get("jiaoyi", {}).get("dynamic_slippage_enabled", True),
+        },
         "scope_note": (
             "这是基于公开数据、同行面板和滚动样本外验证的A股研究结果，不是收益保证；"
             "数值、模型门槛和证据标签由程序生成，LLM只负责解释，不得改写"
