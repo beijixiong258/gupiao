@@ -432,7 +432,7 @@ def cmd_yuce(
     config_path: str | None,
     json_mode: bool,
 ) -> int:
-    """Run diagnosis once, then print gated forecasts for the next three market sessions."""
+    """Run diagnosis once, then print model forecasts for the next three market sessions."""
     from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
     from src.tools.gupiao_yuce_tool import GupiaoYuceTool
 
@@ -468,8 +468,8 @@ def cmd_yuce(
         print(json.dumps(compact, ensure_ascii=False))
     else:
         console.print_json(json.dumps(compact, ensure_ascii=False))
-    has_validated = any(item.get("forecast_status") == "validated" for item in predictions.values())
-    return EXIT_SUCCESS if compact.get("status") == "ok" and has_validated else EXIT_RUN_FAILED
+    has_forecast = any(item.get("forecast") is not None for item in predictions.values())
+    return EXIT_SUCCESS if compact.get("status") == "ok" and has_forecast else EXIT_RUN_FAILED
 
 
 def cmd_bankuai(

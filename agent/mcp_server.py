@@ -26,7 +26,6 @@ automatic trading. All outputs are research results for manual review.
 
 mcp = FastMCP(
     name="A股 T+3 量化研究员",
-    version="0.3.0",
     instructions=MCP_INSTRUCTIONS,
     mask_error_details=True,
     strict_input_validation=True,

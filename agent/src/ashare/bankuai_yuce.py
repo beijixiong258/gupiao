@@ -20,7 +20,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import brier_score_loss, mean_absolute_error
+from sklearn.metrics import brier_score_loss, mean_absolute_error, ndcg_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
@@ -61,6 +61,11 @@ from src.tools.path_utils import safe_run_dir
 
 
 BOARD_FEATURE_COLUMNS = FEATURE_COLUMNS + DAILY_FACTOR_FEATURE_COLUMNS
+MARKET_BASELINE_FEATURE_COLUMNS = [
+    column
+    for column in DAILY_FACTOR_FEATURE_COLUMNS
+    if column.startswith(("market_", "universe_", "industry_"))
+]
 
 
 def _board_name_column(frame: pd.DataFrame) -> str | None:
@@ -670,6 +675,7 @@ def _build_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
             (
                 "model",
                 HistGradientBoostingRegressor(
+                    loss="absolute_error",
                     learning_rate=float(model_config.get("learning_rate", 0.05)),
                     max_iter=int(model_config.get("max_iter", 180)),
                     max_leaf_nodes=int(model_config.get("max_leaf_nodes", 15)),
@@ -710,6 +716,203 @@ def _fit_model_components(
         np.asarray(tree.predict(predict_features), dtype=float),
         np.asarray(linear.predict(predict_features), dtype=float),
     )
+
+
+def _fit_market_baseline(
+    *,
+    train: pd.DataFrame,
+    predict: pd.DataFrame,
+    target_column: str,
+    model_config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Predict the board-wide return separately from stock-specific excess return."""
+    candidate_features = [
+        column
+        for column in MARKET_BASELINE_FEATURE_COLUMNS
+        if column in train.columns and column in predict.columns
+    ]
+    coverage_threshold = float(model_config.get("min_feature_coverage", 0.20))
+    feature_columns = [
+        column
+        for column in candidate_features
+        if float(train[column].notna().mean()) >= coverage_threshold
+    ]
+    fallback = float(pd.to_numeric(train[target_column], errors="coerce").median())
+    if not math.isfinite(fallback):
+        fallback = 0.0
+    if not feature_columns:
+        return np.full(len(predict), fallback, dtype=float), {
+            "status": "constant_fallback",
+            "reason": "没有达到覆盖率门槛的市场/板块状态特征",
+            "constant_return": round(fallback, 6),
+        }
+
+    date_level = (
+        train[["trade_date", target_column] + feature_columns]
+        .groupby("trade_date", as_index=False)
+        .agg({target_column: "mean", **{column: "median" for column in feature_columns}})
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=[target_column])
+        .sort_values("trade_date")
+    )
+    if len(date_level) < 60:
+        return np.full(len(predict), fallback, dtype=float), {
+            "status": "constant_fallback",
+            "reason": f"市场基准训练日期只有{len(date_level)}个，少于60个",
+            "constant_return": round(fallback, 6),
+        }
+    model = _build_model_pipeline(model_config)
+    model.fit(date_level[feature_columns], date_level[target_column].to_numpy(dtype=float))
+    prediction = np.asarray(model.predict(predict[feature_columns]), dtype=float)
+    return prediction, {
+        "status": "modelled",
+        "model": "HistGradientBoostingRegressor(loss=absolute_error)",
+        "training_dates": int(len(date_level)),
+        "features": feature_columns,
+        "target": "同一交易日板块股票平均持有期收益",
+    }
+
+
+def _historical_net_returns(
+    frame: pd.DataFrame,
+    actual: np.ndarray,
+    *,
+    horizon: int,
+    budget_yuan: float,
+    scenario: CostScenario,
+    trading_settings: dict[str, Any] | None = None,
+) -> np.ndarray:
+    values: list[float] = []
+    for (_, row), gross_return in zip(frame.iterrows(), np.asarray(actual, dtype=float)):
+        cost_rate, _ = _stock_roundtrip_cost(
+            str(row["ts_code"]),
+            float(row[f"entry_open_t{horizon}"]),
+            budget_yuan,
+            scenario,
+            daily_amount_yuan=_round_optional(row.get("amount_yuan")),
+            atr_pct=_round_optional(row.get("atr_14_pct")),
+            trading_settings=trading_settings,
+        )
+        values.append(_apply_cost(float(gross_return), cost_rate) if cost_rate is not None else np.nan)
+    return np.asarray(values, dtype=float)
+
+
+def _daily_relevance_labels(
+    dates: pd.Series,
+    net_returns: np.ndarray,
+    *,
+    grades: int,
+) -> np.ndarray:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, errors="coerce"),
+            "net_return": np.asarray(net_returns, dtype=float),
+            "row_order": np.arange(len(net_returns)),
+        }
+    )
+    labels = np.zeros(len(frame), dtype=np.int32)
+    for _, group in frame.dropna(subset=["date", "net_return"]).groupby("date", sort=False):
+        if len(group) < 2 or group["net_return"].nunique() < 2:
+            continue
+        percentile = group["net_return"].rank(method="average", pct=True).to_numpy(dtype=float)
+        relevance = np.minimum(grades - 1, np.floor(percentile * grades - 1e-12)).astype(np.int32)
+        labels[group["row_order"].to_numpy(dtype=int)] = relevance
+    return labels
+
+
+def _fit_ranking_model(
+    *,
+    train: pd.DataFrame,
+    predict: pd.DataFrame,
+    feature_columns: list[str],
+    net_target: np.ndarray,
+    model_config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit one LambdaMART ranker with each signal date used as a qid group."""
+    try:
+        from xgboost import XGBRanker
+    except ImportError as exc:
+        raise RuntimeError("缺少xgboost依赖，请重新执行 python -m pip install -e .") from exc
+
+    work = train[["trade_date", "ts_code"] + feature_columns].copy()
+    work["_net_target"] = np.asarray(net_target, dtype=float)
+    work = work.replace([np.inf, -np.inf], np.nan).dropna(subset=["trade_date", "_net_target"])
+    group_status = work.groupby("trade_date")["_net_target"].agg(["size", "nunique"])
+    usable_dates = group_status[(group_status["size"] >= 2) & (group_status["nunique"] >= 2)].index
+    work = work[work["trade_date"].isin(usable_dates)].sort_values(["trade_date", "ts_code"])
+    if len(work) < 100 or len(usable_dates) < 20:
+        raise RuntimeError(
+            f"学习排序样本不足：{len(work)}条、{len(usable_dates)}个有效交易日；至少需要100条和20日"
+        )
+
+    grades = int(model_config.get("ranking_relevance_grades", 5))
+    relevance = _daily_relevance_labels(work["trade_date"], work["_net_target"].to_numpy(), grades=grades)
+    qid = pd.factorize(work["trade_date"], sort=True)[0].astype(np.int32)
+    clipper = _feature_clipper(model_config)
+    imputer = SimpleImputer(strategy="median")
+    train_values = imputer.fit_transform(clipper.fit_transform(work[feature_columns]))
+    predict_values = imputer.transform(clipper.transform(predict[feature_columns]))
+    pair_top_k = int(model_config.get("ranking_pair_top_k", 8))
+    ranker = XGBRanker(
+        objective="rank:ndcg",
+        tree_method="hist",
+        n_estimators=int(model_config.get("ranking_n_estimators", model_config.get("max_iter", 180))),
+        learning_rate=float(model_config.get("learning_rate", 0.05)),
+        max_depth=int(model_config.get("max_depth", 4)),
+        min_child_weight=max(1.0, float(model_config.get("min_samples_leaf", 30)) / 5.0),
+        reg_lambda=float(model_config.get("l2_regularization", 1.0)),
+        lambdarank_pair_method="topk",
+        lambdarank_num_pair_per_sample=pair_top_k,
+        eval_metric=["ndcg@3", "ndcg@8"],
+        random_state=int(model_config.get("random_state", 42)),
+        n_jobs=-1,
+        verbosity=0,
+    )
+    ranker.fit(train_values, relevance, qid=qid, verbose=False)
+    prediction = np.asarray(ranker.predict(predict_values), dtype=float)
+    return prediction, {
+        "status": "ok",
+        "model": "XGBRanker(LambdaMART, rank:ndcg)",
+        "training_samples": int(len(work)),
+        "qid_groups": int(len(usable_dates)),
+        "relevance_grades": int(grades),
+        "pair_method": "topk",
+        "pairs_per_sample": int(pair_top_k),
+        "metrics": ["NDCG@3", "NDCG@8"],
+        "target": "同一交易日股票未来成本后收益的分档排名",
+    }
+
+
+def _daily_ndcg(
+    dates: pd.Series,
+    relevance: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    k: int,
+) -> tuple[float, int]:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, errors="coerce"),
+            "relevance": np.asarray(relevance, dtype=float),
+            "predicted": np.asarray(predicted, dtype=float),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    values: list[float] = []
+    for _, group in frame.groupby("date"):
+        if len(group) < 2 or group["relevance"].nunique() < 2:
+            continue
+        value = ndcg_score(
+            group[["relevance"]].to_numpy(dtype=float).T,
+            group[["predicted"]].to_numpy(dtype=float).T,
+            k=min(int(k), len(group)),
+        )
+        if math.isfinite(float(value)):
+            values.append(float(value))
+    return (float(np.mean(values)), len(values)) if values else (0.0, 0)
+
+
+def _confidence_label(score: float) -> str:
+    return _quality_label(float(score))
 
 
 def _select_stable_features(
@@ -1203,7 +1406,7 @@ def _nested_training_ensemble_weight(
 def _top_n_validation_metrics(
     validation_frame: pd.DataFrame,
     actual: np.ndarray,
-    predicted: np.ndarray,
+    ranking_score: np.ndarray,
     *,
     horizon: int,
     budget_yuan: float,
@@ -1216,36 +1419,23 @@ def _top_n_validation_metrics(
         column for column in ["amount_yuan", "atr_14_pct"] if column in validation_frame.columns
     )
     evaluation = validation_frame[evaluation_columns].copy()
-    evaluation["actual"] = actual
-    evaluation["predicted"] = predicted
-    net_actual: list[float] = []
-    net_predicted: list[float] = []
-    for _, row in evaluation.iterrows():
-        cost_rate, _ = _stock_roundtrip_cost(
-            str(row["ts_code"]),
-            float(row[f"entry_open_t{horizon}"]),
-            budget_yuan,
-            scenario,
-            daily_amount_yuan=_round_optional(row.get("amount_yuan")),
-            atr_pct=_round_optional(row.get("atr_14_pct")),
-            trading_settings=trading_settings,
-        )
-        if cost_rate is None:
-            net_actual.append(np.nan)
-            net_predicted.append(np.nan)
-        else:
-            net_actual.append(_apply_cost(float(row["actual"]), cost_rate))
-            net_predicted.append(_apply_cost(float(row["predicted"]), cost_rate))
-    evaluation["net_actual"] = net_actual
-    evaluation["net_predicted"] = net_predicted
-    evaluation = evaluation.dropna(subset=["net_actual", "net_predicted"])
+    evaluation["net_actual"] = _historical_net_returns(
+        validation_frame,
+        actual,
+        horizon=horizon,
+        budget_yuan=budget_yuan,
+        scenario=scenario,
+        trading_settings=trading_settings,
+    )
+    evaluation["ranking_score"] = np.asarray(ranking_score, dtype=float)
+    evaluation = evaluation.dropna(subset=["net_actual", "ranking_score"])
 
     selected_returns: list[float] = []
     excess_returns: list[float] = []
     for _, group in evaluation.groupby("trade_date"):
         if len(group) < 2:
             continue
-        selected = group.nlargest(min(int(top_n), len(group)), "net_predicted")
+        selected = group.nlargest(min(int(top_n), len(group)), "ranking_score")
         selected_return = float(selected["net_actual"].mean())
         selected_returns.append(selected_return)
         excess_returns.append(selected_return - float(group["net_actual"].mean()))
@@ -1335,15 +1525,24 @@ def xunlian_yuce_moxing(
                 f"验证 {len(validation_frame)}（至少 {minimum_validation}）"
             )
 
+        excess_target_column = f"_excess_target_t{horizon}"
+        train[excess_target_column] = train[target_column] - train.groupby("trade_date")[
+            target_column
+        ].transform("mean")
+        validation_frame[excess_target_column] = validation_frame[target_column] - validation_frame.groupby(
+            "trade_date"
+        )[target_column].transform("mean")
         y_train_raw = train[target_column].astype(float).to_numpy()
-        clip_low = float(np.nanquantile(y_train_raw, lower_q))
-        clip_high = float(np.nanquantile(y_train_raw, upper_q))
-        y_train = np.clip(y_train_raw, clip_low, clip_high)
+        y_train_excess_raw = train[excess_target_column].astype(float).to_numpy()
+        clip_low = float(np.nanquantile(y_train_excess_raw, lower_q))
+        clip_high = float(np.nanquantile(y_train_excess_raw, upper_q))
+        y_train = np.clip(y_train_excess_raw, clip_low, clip_high)
         y_validation = validation_frame[target_column].astype(float).to_numpy()
+        y_validation_excess = validation_frame[excess_target_column].astype(float).to_numpy()
         validation_features, factor_selection = _select_stable_features(
             train,
             feature_columns,
-            target_column,
+            excess_target_column,
             model_config,
         )
         if not validation_features:
@@ -1351,7 +1550,7 @@ def xunlian_yuce_moxing(
         validation_tree_weight, validation_ensemble = _nested_training_ensemble_weight(
             train=train,
             feature_columns=validation_features,
-            target_column=target_column,
+            target_column=excess_target_column,
             target_date_column=target_date_column,
             clip_low=clip_low,
             clip_high=clip_high,
@@ -1371,7 +1570,7 @@ def xunlian_yuce_moxing(
         )
         validation_tree_prediction = np.clip(validation_tree_prediction, clip_low, clip_high)
         validation_linear_prediction = np.clip(validation_linear_prediction, clip_low, clip_high)
-        validation_prediction = np.clip(
+        validation_excess_prediction = np.clip(
             _blend_component_predictions(
                 validation_tree_prediction,
                 validation_linear_prediction,
@@ -1379,6 +1578,19 @@ def xunlian_yuce_moxing(
             ),
             clip_low,
             clip_high,
+        )
+        validation_market_prediction, validation_market_model = _fit_market_baseline(
+            train=train,
+            predict=validation_frame,
+            target_column=target_column,
+            model_config=model_config,
+        )
+        gross_clip_low = float(np.nanquantile(y_train_raw, lower_q))
+        gross_clip_high = float(np.nanquantile(y_train_raw, upper_q))
+        validation_prediction = np.clip(
+            validation_excess_prediction + validation_market_prediction,
+            gross_clip_low,
+            gross_clip_high,
         )
         baseline_metrics = regression_baseline_metrics(
             actual=y_validation,
@@ -1389,22 +1601,73 @@ def xunlian_yuce_moxing(
         baseline_value = float(np.median(y_train))
         baseline_mae = float(baseline_metrics["baselines"]["training_median"]["mae"])
         direction_accuracy = float(np.mean((validation_prediction > 0) == (y_validation > 0)))
-        rank_ic, rank_ic_days = _daily_rank_ic(
+        return_rank_ic, return_rank_ic_days = _daily_rank_ic(
             validation_frame["trade_date"],
             y_validation,
             validation_prediction,
         )
         skill = 1.0 - mae / baseline_mae if baseline_mae > 0 else 0.0
-        quality = _quality_score(
+        return_quality = _quality_score(
             train_count=len(train),
             direction_accuracy=direction_accuracy,
-            rank_ic=rank_ic,
+            rank_ic=return_rank_ic,
             skill_vs_baseline=skill,
+        )
+        train_net_actual = _historical_net_returns(
+            train,
+            y_train_raw,
+            horizon=horizon,
+            budget_yuan=budget_yuan,
+            scenario=cost_scenario,
+            trading_settings=config.get("jiaoyi", {}),
+        )
+        validation_net_actual = _historical_net_returns(
+            validation_frame,
+            y_validation,
+            horizon=horizon,
+            budget_yuan=budget_yuan,
+            scenario=cost_scenario,
+            trading_settings=config.get("jiaoyi", {}),
+        )
+        if model_config.get("ranking_enabled", True):
+            validation_ranking_score, validation_ranking_model = _fit_ranking_model(
+                train=train,
+                predict=validation_frame,
+                feature_columns=validation_features,
+                net_target=train_net_actual,
+                model_config=model_config,
+            )
+        else:
+            validation_ranking_score = validation_prediction.copy()
+            validation_ranking_model = {
+                "status": "disabled",
+                "model": "return_prediction_fallback",
+            }
+        relevance_grades = int(model_config.get("ranking_relevance_grades", 5))
+        validation_relevance = _daily_relevance_labels(
+            validation_frame["trade_date"],
+            validation_net_actual,
+            grades=relevance_grades,
+        )
+        ndcg_at_3, ndcg_days = _daily_ndcg(
+            validation_frame["trade_date"], validation_relevance, validation_ranking_score, k=3
+        )
+        ndcg_at_8, _ = _daily_ndcg(
+            validation_frame["trade_date"], validation_relevance, validation_ranking_score, k=8
+        )
+        return_ndcg_at_3, _ = _daily_ndcg(
+            validation_frame["trade_date"], validation_relevance, validation_prediction, k=3
+        )
+        return_ndcg_at_8, _ = _daily_ndcg(
+            validation_frame["trade_date"], validation_relevance, validation_prediction, k=8
+        )
+        selection_rank_ic, selection_rank_ic_days = _daily_rank_ic(
+            validation_frame["trade_date"], validation_net_actual, validation_ranking_score
         )
         top_n_metrics = _top_n_validation_metrics(
             validation_frame,
             y_validation,
-            validation_prediction,
+            validation_ranking_score,
             horizon=horizon,
             budget_yuan=budget_yuan,
             scenario=cost_scenario,
@@ -1412,45 +1675,60 @@ def xunlian_yuce_moxing(
             trading_settings=config.get("jiaoyi", {}),
         )
         minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
-        minimum_skill = float(model_config.get("min_skill_vs_baseline", 0.01))
-        minimum_best_naive_skill = float(model_config.get("min_skill_vs_best_naive_baseline", 0.0))
-        minimum_direction = float(model_config.get("min_direction_accuracy", 0.52))
+        minimum_best_naive_skill = float(model_config.get("min_skill_vs_best_naive_baseline", 0.01))
         minimum_rank_days = int(model_config.get("min_rank_ic_days", 10))
         minimum_top_n_days = int(model_config.get("min_top_n_days", 10))
-        validation_passed = bool(
-            direction_accuracy >= minimum_direction
-            and rank_ic >= minimum_rank_ic
-            and rank_ic_days >= minimum_rank_days
-            and skill >= minimum_skill
-            and float(baseline_metrics["skill_vs_best_naive_baseline"]) >= minimum_best_naive_skill
+        minimum_ndcg_improvement = float(model_config.get("ranking_min_ndcg_improvement", 0.0))
+        selection_validation_passed = bool(
+            selection_rank_ic >= minimum_rank_ic
+            and selection_rank_ic_days >= minimum_rank_days
+            and ndcg_at_3 - return_ndcg_at_3 >= minimum_ndcg_improvement
+            and ndcg_at_8 - return_ndcg_at_8 >= minimum_ndcg_improvement
             and top_n_metrics["top_n_days"] >= minimum_top_n_days
             and top_n_metrics["top_n_mean_net_return"] > 0
             and top_n_metrics["top_n_mean_excess_vs_universe"] > 0
+        )
+        selection_confidence_score = float(
+            np.clip(
+                0.30 * ndcg_at_3
+                + 0.20 * ndcg_at_8
+                + 0.25 * np.clip(selection_rank_ic / 0.10, 0.0, 1.0)
+                + 0.15 * np.clip(top_n_metrics["top_n_mean_net_return"] / 0.02, 0.0, 1.0)
+                + 0.10 * np.clip(top_n_metrics["top_n_mean_excess_vs_universe"] / 0.01, 0.0, 1.0),
+                0.0,
+                1.0,
+            )
         )
 
         # Holdout metrics above stay untouched.  The production forecast is
         # refit on every label whose entry and exit are already known so the
         # freshest labelled observations are not discarded after validation.
         y_full_raw = usable[target_column].astype(float).to_numpy()
-        final_clip_low = float(np.nanquantile(y_full_raw, lower_q))
-        final_clip_high = float(np.nanquantile(y_full_raw, upper_q))
+        usable[excess_target_column] = usable[target_column] - usable.groupby("trade_date")[
+            target_column
+        ].transform("mean")
+        y_full_excess_raw = usable[excess_target_column].astype(float).to_numpy()
+        final_clip_low = float(np.nanquantile(y_full_excess_raw, lower_q))
+        final_clip_high = float(np.nanquantile(y_full_excess_raw, upper_q))
+        final_gross_clip_low = float(np.nanquantile(y_full_raw, lower_q))
+        final_gross_clip_high = float(np.nanquantile(y_full_raw, upper_q))
         production_features, production_factor_selection = _select_stable_features(
             usable,
             feature_columns,
-            target_column,
+            excess_target_column,
             model_config,
         )
         if not production_features:
             raise RuntimeError(f"T+{horizon} 全量训练窗口没有稳定可用因子")
         production_tree_weight, production_ensemble = _select_ensemble_weight(
-            y_validation,
+            y_validation_excess,
             validation_tree_prediction,
             validation_linear_prediction,
             model_config,
         )
         production_tree_prediction, production_linear_prediction = _fit_model_components(
             train_features=usable[production_features],
-            train_target=np.clip(y_full_raw, final_clip_low, final_clip_high),
+            train_target=np.clip(y_full_excess_raw, final_clip_low, final_clip_high),
             predict_features=latest[production_features],
             model_config=model_config,
         )
@@ -1466,7 +1744,7 @@ def xunlian_yuce_moxing(
         production_linear_prediction = np.clip(
             production_linear_prediction, final_clip_low, final_clip_high
         )
-        latest_prediction = np.clip(
+        latest_excess_prediction = np.clip(
             _blend_component_predictions(
                 production_tree_prediction,
                 production_linear_prediction,
@@ -1475,7 +1753,46 @@ def xunlian_yuce_moxing(
             final_clip_low,
             final_clip_high,
         )
+        latest_market_prediction, production_market_model = _fit_market_baseline(
+            train=usable,
+            predict=latest,
+            target_column=target_column,
+            model_config=model_config,
+        )
+        latest_prediction = np.clip(
+            latest_excess_prediction + latest_market_prediction,
+            final_gross_clip_low,
+            final_gross_clip_high,
+        )
         predictions[f"pred_t{horizon}"] = latest_prediction
+        predictions[f"pred_excess_t{horizon}"] = latest_excess_prediction
+        predictions[f"pred_market_baseline_t{horizon}"] = latest_market_prediction
+        full_net_actual = _historical_net_returns(
+            usable,
+            y_full_raw,
+            horizon=horizon,
+            budget_yuan=budget_yuan,
+            scenario=cost_scenario,
+            trading_settings=config.get("jiaoyi", {}),
+        )
+        if model_config.get("ranking_enabled", True):
+            latest_ranking_score, production_ranking_model = _fit_ranking_model(
+                train=usable,
+                predict=latest,
+                feature_columns=production_features,
+                net_target=full_net_actual,
+                model_config=model_config,
+            )
+        else:
+            latest_ranking_score = latest_prediction.copy()
+            production_ranking_model = {
+                "status": "disabled",
+                "model": "return_prediction_fallback",
+            }
+        predictions[f"ranking_score_t{horizon}"] = latest_ranking_score
+        predictions[f"ranking_percentile_t{horizon}"] = pd.Series(latest_ranking_score).rank(
+            method="average", pct=True
+        ).to_numpy(dtype=float)
         calibrated_probabilities: list[float] = []
         probability_calibration: dict[str, Any] = {}
         conformal_intervals: list[list[float] | None] = []
@@ -1509,6 +1826,56 @@ def xunlian_yuce_moxing(
         predictions[f"conformal_high_t{horizon}"] = [
             interval[1] if interval else np.nan for interval in conformal_intervals
         ]
+
+        direction_labels = (y_validation > 0).astype(int)
+        raw_direction_brier = float(
+            brier_score_loss(direction_labels, validation_direction_probability)
+        )
+        training_positive_rate = float(np.mean(y_train_raw > 0))
+        direction_baseline_brier = float(
+            np.mean((direction_labels - training_positive_rate) ** 2)
+        )
+        probability_brier_skill = (
+            1.0 - raw_direction_brier / direction_baseline_brier
+            if direction_baseline_brier > 0
+            else 0.0
+        )
+        empirical_coverage = _round_optional(
+            conformal_diagnostics.get("rolling_empirical_coverage")
+        )
+        coverage_range = [
+            float(value)
+            for value in model_config.get("return_interval_coverage_range", [0.75, 0.85])
+        ]
+        coverage_passed = bool(
+            empirical_coverage is not None
+            and coverage_range[0] <= empirical_coverage <= coverage_range[1]
+        )
+        return_validation_passed = bool(
+            float(baseline_metrics["skill_vs_best_naive_baseline"]) >= minimum_best_naive_skill
+            and probability_brier_skill > 0
+            and coverage_passed
+        )
+        coverage_score = (
+            float(np.clip(1.0 - abs(empirical_coverage - 0.80) / 0.20, 0.0, 1.0))
+            if empirical_coverage is not None
+            else 0.0
+        )
+        return_confidence_score = float(
+            np.clip(
+                0.50
+                * np.clip(
+                    float(baseline_metrics["skill_vs_best_naive_baseline"]) / 0.05,
+                    0.0,
+                    1.0,
+                )
+                + 0.25 * np.clip(probability_brier_skill / 0.10, 0.0, 1.0)
+                + 0.25 * coverage_score,
+                0.0,
+                1.0,
+            )
+        )
+        validation_passed = bool(selection_validation_passed and return_validation_passed)
 
         validation_dates = [pd.Timestamp(value) for value in sorted(validation_frame["trade_date"].unique())]
         temporal_folds: list[dict[str, Any]] = []
@@ -1559,13 +1926,18 @@ def xunlian_yuce_moxing(
             "skill_vs_median_baseline": round(skill, 6),
             "naive_baseline_comparison": baseline_metrics,
             "direction_accuracy": round(direction_accuracy, 6),
-            "mean_daily_rank_ic": round(rank_ic, 6),
-            "rank_ic_days": int(rank_ic_days),
+            "mean_daily_rank_ic": round(selection_rank_ic, 6),
+            "rank_ic_days": int(selection_rank_ic_days),
+            "return_model_mean_daily_rank_ic": round(return_rank_ic, 6),
+            "return_model_rank_ic_days": int(return_rank_ic_days),
             "factor_selection": factor_selection,
             "production_factor_selection": production_factor_selection,
             "experiment_fingerprint": _experiment_fingerprint(
                 feature_columns=production_features,
-                target_definition=f"next_session_open_to_{horizon}th_sellable_close_return",
+                target_definition=(
+                    f"board_neutral_excess_return_plus_modelled_board_baseline_t{horizon};"
+                    "ranking_target=daily_cost_adjusted_return_relevance"
+                ),
                 split_method="chronological_purged_holdout_with_three_oos_stability_subwindows",
                 model_config=model_config,
             ),
@@ -1579,19 +1951,30 @@ def xunlian_yuce_moxing(
                     float(np.mean((validation_direction_probability >= 0.5) == (y_validation > 0))),
                     6,
                 ),
+                "historical_positive_rate_baseline_brier": round(direction_baseline_brier, 6),
+                "brier_skill_vs_historical_positive_rate": round(probability_brier_skill, 6),
                 "production": production_direction_model,
             },
             "direction_probability_calibration": probability_calibration,
             "conformal_diagnostics": conformal_diagnostics,
             "fold_stability": _fold_stability(temporal_folds),
             "market_regime_stability": _regime_stability(regime_oof, regime_column=regime_column),
-            "prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
-            "final_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)],
+            "excess_prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
+            "gross_prediction_clip": [round(gross_clip_low, 6), round(gross_clip_high, 6)],
+            "final_excess_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)],
+            "final_gross_prediction_clip": [
+                round(final_gross_clip_low, 6),
+                round(final_gross_clip_high, 6),
+            ],
             "final_train_samples": int(len(usable)),
             "final_training_end": usable[target_date_column].max().strftime("%Y-%m-%d"),
             "retrained_on_all_labeled_data": True,
             "model_ensemble": {
-                "components": ["HistGradientBoostingRegressor", "Ridge"],
+                "components": [
+                    "HistGradientBoostingRegressor(loss=absolute_error)",
+                    "Ridge",
+                ],
+                "prediction_task": "股票相对板块的超额收益",
                 "outer_validation_weight": validation_ensemble,
                 "production_weight": production_ensemble,
                 "outer_validation_mean_absolute_disagreement": round(
@@ -1599,29 +1982,107 @@ def xunlian_yuce_moxing(
                     6,
                 ),
                 "latest_component_predictions": {
-                    "tree": [round(float(value), 6) for value in production_tree_prediction],
-                    "linear": [round(float(value), 6) for value in production_linear_prediction],
+                    "tree_excess_return": [
+                        round(float(value), 6) for value in production_tree_prediction
+                    ],
+                    "linear_excess_return": [
+                        round(float(value), 6) for value in production_linear_prediction
+                    ],
+                    "modelled_board_baseline_return": [
+                        round(float(value), 6) for value in latest_market_prediction
+                    ],
+                },
+            },
+            "market_baseline_model": {
+                "validation": validation_market_model,
+                "production": production_market_model,
+            },
+            "ranking_model": {
+                "validation": validation_ranking_model,
+                "production": production_ranking_model,
+                "validation_metrics": {
+                    "ndcg_at_3": round(ndcg_at_3, 6),
+                    "ndcg_at_8": round(ndcg_at_8, 6),
+                    "ndcg_days": int(ndcg_days),
+                    "return_model_ndcg_at_3": round(return_ndcg_at_3, 6),
+                    "return_model_ndcg_at_8": round(return_ndcg_at_8, 6),
+                    "ndcg_at_3_improvement": round(ndcg_at_3 - return_ndcg_at_3, 6),
+                    "ndcg_at_8_improvement": round(ndcg_at_8 - return_ndcg_at_8, 6),
                 },
             },
             **top_n_metrics,
-            "quality_score": round(quality, 4),
-            "quality_label": _quality_label(quality),
-            "validation_thresholds": {
-                "direction_accuracy": minimum_direction,
-                "mean_daily_rank_ic": minimum_rank_ic,
-                "rank_ic_days": minimum_rank_days,
-                "skill_vs_median_baseline": minimum_skill,
-                "skill_vs_best_naive_baseline": minimum_best_naive_skill,
-                "top_n_days": minimum_top_n_days,
-                "top_n_mean_net_return": "> 0",
-                "top_n_mean_excess_vs_universe": "> 0",
+            "selection_confidence": {
+                "score": round(selection_confidence_score, 4),
+                "label": _confidence_label(selection_confidence_score),
+                "validation_passed": selection_validation_passed,
+                "metrics": {
+                    "ndcg_at_3": round(ndcg_at_3, 6),
+                    "ndcg_at_8": round(ndcg_at_8, 6),
+                    "mean_daily_rank_ic": round(selection_rank_ic, 6),
+                    **top_n_metrics,
+                },
+                "thresholds": {
+                    "minimum_ndcg_improvement_vs_return_model": minimum_ndcg_improvement,
+                    "mean_daily_rank_ic": minimum_rank_ic,
+                    "rank_ic_days": minimum_rank_days,
+                    "top_n_days": minimum_top_n_days,
+                    "top_n_mean_net_return": "> 0",
+                    "top_n_mean_excess_vs_universe": "> 0",
+                },
             },
+            "return_confidence": {
+                "score": round(return_confidence_score, 4),
+                "label": _confidence_label(return_confidence_score),
+                "validation_passed": return_validation_passed,
+                "metrics": {
+                    "skill_vs_best_naive_baseline": baseline_metrics[
+                        "skill_vs_best_naive_baseline"
+                    ],
+                    "probability_brier_skill_vs_historical_rate": round(
+                        probability_brier_skill, 6
+                    ),
+                    "interval_empirical_coverage": empirical_coverage,
+                },
+                "thresholds": {
+                    "skill_vs_best_naive_baseline": minimum_best_naive_skill,
+                    "probability_brier_skill_vs_historical_rate": "> 0",
+                    "interval_empirical_coverage": coverage_range,
+                },
+            },
+            "quality_score": round((selection_confidence_score + return_confidence_score) / 2.0, 4),
+            "quality_label": _confidence_label(
+                (selection_confidence_score + return_confidence_score) / 2.0
+            ),
+            "selection_validation_passed": selection_validation_passed,
+            "return_validation_passed": return_validation_passed,
             "validation_passed": validation_passed,
         }
 
+    selection_values = [
+        float(item["selection_confidence"]["score"])
+        for item in validation["horizons"].values()
+    ]
+    return_values = [
+        float(item["return_confidence"]["score"])
+        for item in validation["horizons"].values()
+    ]
+    validation["overall_selection_confidence"] = {
+        "score": round(float(np.mean(selection_values)), 4),
+        "label": _confidence_label(float(np.mean(selection_values))),
+    }
+    validation["overall_return_confidence"] = {
+        "score": round(float(np.mean(return_values)), 4),
+        "label": _confidence_label(float(np.mean(return_values))),
+    }
     quality_values = [float(item["quality_score"]) for item in validation["horizons"].values()]
     validation["overall_quality_score"] = round(float(np.mean(quality_values)), 4)
-    validation["overall_quality_label"] = _quality_label(float(validation["overall_quality_score"]))
+    validation["overall_quality_label"] = _confidence_label(float(validation["overall_quality_score"]))
+    validation["selection_passed_horizons"] = sum(
+        bool(item["selection_validation_passed"]) for item in validation["horizons"].values()
+    )
+    validation["return_passed_horizons"] = sum(
+        bool(item["return_validation_passed"]) for item in validation["horizons"].values()
+    )
     validation["passed_horizons"] = sum(bool(item["validation_passed"]) for item in validation["horizons"].values())
     return predictions, validation
 
@@ -1635,7 +2096,12 @@ def _prediction_rows(
 ) -> list[dict[str, Any]]:
     horizons = [int(value) for value in config["moxing"]["horizons"]]
     weights = {int(key): float(value) for key, value in config["moxing"]["horizon_weights"].items()}
-    passed_horizons = {
+    selection_passed_horizons = {
+        int(label.split("+")[1])
+        for label, metrics in validation["horizons"].items()
+        if metrics.get("selection_validation_passed")
+    }
+    fully_passed_horizons = {
         int(label.split("+")[1])
         for label, metrics in validation["horizons"].items()
         if metrics.get("validation_passed")
@@ -1666,21 +2132,35 @@ def _prediction_rows(
             trading_settings=config.get("jiaoyi", {}),
         )
         forecasts: dict[str, Any] = {}
-        active_horizons = [
+        configured_horizons = [
             value
             for value in horizons
-            if value in passed_horizons and max(weights.get(value, 0.0), 0.0) > 0
+            if max(weights.get(value, 0.0), 0.0) > 0
         ]
+        validated_horizons = [
+            value for value in configured_horizons if value in selection_passed_horizons
+        ]
+        active_horizons = validated_horizons or configured_horizons
+        ranking_validation_mode = (
+            "validated_horizons" if validated_horizons else "unvalidated_model_fallback"
+        )
         active_weight_sum = sum(max(weights.get(value, 0.0), 0.0) for value in active_horizons)
         normalized_weights = {
             value: max(weights.get(value, 0.0), 0.0) / active_weight_sum
             for value in active_horizons
         } if active_weight_sum > 0 else {}
         weighted_net = 0.0 if active_horizons and stock_cost_rate is not None else None
+        weighted_ranking_score = 0.0 if active_horizons else None
         for horizon in horizons:
             gross = float(row[f"pred_t{horizon}"])
             net = _apply_cost(gross, stock_cost_rate) if stock_cost_rate is not None else None
             quality = validation["horizons"][f"T+{horizon}"]
+            ranking_score = _round_optional(row.get(f"ranking_score_t{horizon}"), 6)
+            ranking_percentile = _round_optional(row.get(f"ranking_percentile_t{horizon}"), 6)
+            predicted_excess = _round_optional(row.get(f"pred_excess_t{horizon}"), 6)
+            predicted_market_baseline = _round_optional(
+                row.get(f"pred_market_baseline_t{horizon}"), 6
+            )
             direction_probability = _round_optional(row.get(f"direction_prob_t{horizon}"), 6)
             conformal_low = _round_optional(row.get(f"conformal_low_t{horizon}"), 6)
             conformal_high = _round_optional(row.get(f"conformal_high_t{horizon}"), 6)
@@ -1702,6 +2182,12 @@ def _prediction_rows(
                 "direction_probability_method": (
                     quality.get("direction_probability_calibration") or {}
                 ).get("method"),
+                "predicted_board_neutral_excess_return": predicted_excess,
+                "predicted_board_baseline_return": predicted_market_baseline,
+                "selection_ranking_score": ranking_score,
+                "selection_ranking_percentile": ranking_percentile,
+                "selection_confidence": quality.get("selection_confidence"),
+                "return_confidence": quality.get("return_confidence"),
                 "conformal_return_interval_80": [conformal_low, conformal_high]
                 if conformal_low is not None and conformal_high is not None
                 else None,
@@ -1721,6 +2207,12 @@ def _prediction_rows(
             }
             if weighted_net is not None and horizon in normalized_weights and net is not None:
                 weighted_net += normalized_weights[horizon] * net
+            if (
+                weighted_ranking_score is not None
+                and horizon in normalized_weights
+                and ranking_percentile is not None
+            ):
+                weighted_ranking_score += normalized_weights[horizon] * ranking_percentile
         best_horizon = (
             max(
                 active_horizons,
@@ -1738,7 +2230,8 @@ def _prediction_rows(
         )
         holding_volatility = max(annualized_volatility, 0.0) / math.sqrt(252.0) * math.sqrt(holding_sessions)
         risk_scale = max(holding_volatility, max(atr_pct, 0.0), 0.01)
-        selection_score = weighted_net / risk_scale if weighted_net is not None else None
+        return_risk_adjusted_score = weighted_net / risk_scale if weighted_net is not None else None
+        selection_score = weighted_ranking_score
         current = constituent_map.get(code, {})
         strongest_label = f"T+{best_horizon}" if best_horizon is not None else None
         strongest_forecast = forecasts.get(strongest_label, {}) if strongest_label else {}
@@ -1757,6 +2250,16 @@ def _prediction_rows(
             ),
             minimum_quality_score=float(config["moxing"].get("abstain_min_quality_score", 0.40)),
         )
+        ranking_net_return = _round_optional(weighted_net)
+        if ranking_net_return is None:
+            recommendation_decision = "watch"
+            recommendation_reason = "模型缺少完整的成本后收益，暂列观察"
+        elif ranking_net_return > 0:
+            recommendation_decision = "recommend"
+            recommendation_reason = "当前模型参与排名周期的加权成本后预测收益为正"
+        else:
+            recommendation_decision = "avoid"
+            recommendation_reason = "当前模型参与排名周期的加权成本后预测收益不为正"
         rows.append(
             {
                 "ts_code": code,
@@ -1766,8 +2269,15 @@ def _prediction_rows(
                 "latest_close": round(close, 3),
                 "selection_score": round(selection_score, 6) if selection_score is not None else None,
                 "selection_score_definition": (
-                    "通过验证周期的加权成本后收益 / max(持有期历史波动率, ATR占比, 1%)"
+                    "参与排名周期的XGBRanker横截面百分位加权值；排序任务与收益点预测相互独立"
                 ),
+                "return_risk_adjusted_score": round(return_risk_adjusted_score, 6)
+                if return_risk_adjusted_score is not None
+                else None,
+                "return_risk_adjusted_score_definition": (
+                    "参与排名周期的加权成本后预测收益 / max(持有期历史波动率, ATR占比, 1%)"
+                ),
+                "ranking_validation_mode": ranking_validation_mode,
                 "selection_expected_holding_sessions": round(float(holding_sessions), 4),
                 "selection_risk_scale": round(risk_scale, 6),
                 "weighted_expected_net_return": round(weighted_net, 6) if weighted_net is not None else None,
@@ -1777,9 +2287,23 @@ def _prediction_rows(
                 },
                 "strongest_forecast_horizon": f"T+{best_horizon}" if best_horizon is not None else None,
                 "strongest_horizon_trading_days": int(best_horizon) if best_horizon is not None else None,
-                "strongest_horizon_validation_passed": bool(best_horizon in passed_horizons)
+                "strongest_horizon_validation_passed": bool(
+                    best_horizon in fully_passed_horizons
+                )
                 if best_horizon is not None
                 else False,
+                "strongest_horizon_selection_validation_passed": bool(
+                    best_horizon in selection_passed_horizons
+                )
+                if best_horizon is not None
+                else False,
+                "model_recommendation": {
+                    "decision": recommendation_decision,
+                    "reason": recommendation_reason,
+                    "selection_confidence": strongest_validation.get("selection_confidence"),
+                    "return_confidence": strongest_validation.get("return_confidence"),
+                    "validation_passed": bool(strongest_validation.get("validation_passed")),
+                },
                 "signal_gate": signal_gate,
                 "forecast": forecasts,
                 "position_and_cost": position_cost,
@@ -1868,19 +2392,27 @@ def _save_artifacts(run_dir: str, result: dict[str, Any]) -> dict[str, str]:
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     csv_path = artifact_dir / "bankuai_xuangu.csv"
     flat_rows: list[dict[str, Any]] = []
-    for item in result.get("validated_candidates", []):
+    for item in result.get("recommended_candidates", []):
         row = {
             "ts_code": item["ts_code"],
             "name": item["name"],
             "as_of": item["as_of"],
             "latest_close": item["latest_close"],
             "selection_score": item["selection_score"],
+            "return_risk_adjusted_score": item.get("return_risk_adjusted_score"),
             "strongest_forecast_horizon": item["strongest_forecast_horizon"],
         }
         for horizon in [1, 2, 3]:
             forecast = item["forecast"][f"T+{horizon}"]
             row[f"t{horizon}_entry_to_exit_gross_return"] = forecast["entry_to_exit_gross_return"]
             row[f"t{horizon}_net_return"] = forecast["estimated_net_return_after_cost"]
+            row[f"t{horizon}_ranking_percentile"] = forecast.get("selection_ranking_percentile")
+            row[f"t{horizon}_selection_confidence"] = (
+                forecast.get("selection_confidence") or {}
+            ).get("label")
+            row[f"t{horizon}_return_confidence"] = (
+                forecast.get("return_confidence") or {}
+            ).get("label")
         flat_rows.append(row)
     pd.DataFrame(flat_rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
     return {"json": str(json_path), "csv": str(csv_path)}
@@ -2156,7 +2688,17 @@ def bankuai_xuangu(
         for label, metrics in validation["horizons"].items()
         if metrics.get("validation_passed")
     ]
-    eligible = [
+    selection_passed_horizon_labels = [
+        label
+        for label, metrics in validation["horizons"].items()
+        if metrics.get("selection_validation_passed")
+    ]
+    return_passed_horizon_labels = [
+        label
+        for label, metrics in validation["horizons"].items()
+        if metrics.get("return_validation_passed")
+    ]
+    validated_eligible = [
         item
         for item in ranked
         if passed_horizon_labels
@@ -2169,12 +2711,22 @@ def bankuai_xuangu(
         and float(item["selection_score"]) > 0
         and float(item["forecast"][item["strongest_forecast_horizon"]]["estimated_net_return_after_cost"]) > 0
     ]
+    recommendation_pool = [
+        item
+        for item in ranked
+        if item["position_and_cost"]["execution_feasible"]
+        and item["weighted_expected_net_return"] is not None
+        and math.isfinite(float(item["weighted_expected_net_return"]))
+        and item["selection_score"] is not None
+        and math.isfinite(float(item["selection_score"]))
+        and item["strongest_forecast_horizon"] is not None
+    ]
     current_selection_id = _selection_sequence_id(
         board_meta=board_meta,
         as_of=global_as_of,
         source=source,
         config_path=resolved_config,
-        eligible=eligible,
+        eligible=recommendation_pool,
     )
     if selection_id is not None and selection_id != current_selection_id:
         return {
@@ -2187,11 +2739,15 @@ def bankuai_xuangu(
             "current_selection_id": current_selection_id,
             "restart_offset": 0,
         }
-    validated_candidates, next_offset, has_more = _paginate_candidates(
-        eligible,
+    recommended_candidates, next_offset, has_more = _paginate_candidates(
+        recommendation_pool,
         offset=offset,
         batch_size=top_n,
     )
+    validated_codes = {str(item["ts_code"]) for item in validated_eligible}
+    validated_candidates = [
+        item for item in recommended_candidates if str(item["ts_code"]) in validated_codes
+    ]
     limit_notice = (
         f"单批最多返回8只；请求的{requested_top_n}只已按Top 8执行"
         if requested_top_n > 8
@@ -2248,9 +2804,19 @@ def bankuai_xuangu(
             for item in stale_latest.to_dict("records")[:20]
         ],
         "model_sample_count": int(len(panel)),
+        "recommended_candidates": recommended_candidates,
+        "recommended_candidate_count": int(len(recommended_candidates)),
+        "recommended_candidate_total": int(len(recommendation_pool)),
         "validated_candidates": validated_candidates,
         "validated_candidate_count": int(len(validated_candidates)),
-        "validated_candidate_total": int(len(eligible)),
+        "validated_candidate_total": int(len(validated_eligible)),
+        "recommendation_mode": (
+            "selection_and_return_validated"
+            if validated_eligible
+            else "selection_validated_return_low_confidence"
+            if selection_passed_horizon_labels
+            else "unvalidated_model_ranked"
+        ),
         "selection": {
             "selection_id": current_selection_id,
             "offset": offset,
@@ -2258,8 +2824,8 @@ def bankuai_xuangu(
             "applied_top_n": top_n,
             "max_batch_size": 8,
             "limit_notice": limit_notice,
-            "rank_start": offset + 1 if validated_candidates else None,
-            "rank_end": offset + len(validated_candidates) if validated_candidates else None,
+            "rank_start": offset + 1 if recommended_candidates else None,
+            "rank_end": offset + len(recommended_candidates) if recommended_candidates else None,
             "has_more": has_more,
             "next_offset": next_offset if has_more else None,
         },
@@ -2267,13 +2833,15 @@ def bankuai_xuangu(
         "validation": validation,
         "candidate_evidence_gate": {
             "passed_horizons": passed_horizon_labels,
+            "selection_passed_horizons": selection_passed_horizon_labels,
+            "return_passed_horizons": return_passed_horizon_labels,
             "rules": [
-                "至少一个预测周期通过样本外验证",
-                "只有通过验证的预测周期才参与加权收益和排名，剩余权重重新归一化",
-                "模型最强预测周期必须是已通过验证的周期",
+                "XGBRanker按交易日qid学习未来成本后收益的分档排名，只负责决定推荐顺序",
+                "收益模型预测板块中性超额收益，并与独立市场/板块基准预测合成为总收益",
+                "有通过选股验证的周期时优先使用这些周期计算排名，否则使用全部配置周期",
                 "给定测算资金必须覆盖所属板块最低申报数量，且不超过配置的成交额参与率上限",
-                "加权成本后收益、最强周期成本后收益、风险调整分数都必须为正",
-                "最强周期还必须达到配置的成本后收益、校准上涨概率和样本外质量分弃权门槛",
+                "所有入选股票都返回T+1、T+2、T+3成本前后收益预测",
+                "selection_confidence与return_confidence独立展示；低可信度不隐藏可用预测",
             ],
             "abstention_thresholds": {
                 "minimum_net_return_after_cost": float(
@@ -2311,13 +2879,13 @@ def bankuai_xuangu(
         "warnings": result_warnings,
         "fetch_errors": fetch_errors[:30],
         "methodology": {
-            "model": "日K因子的HistGradientBoostingRegressor + 稳健缩放Ridge小型集成，T+1/T+2/T+3分别训练",
+            "model": "T+1/T+2/T+3分别训练：XGBRanker负责横截面选股，绝对误差HistGradientBoostingRegressor与Ridge负责收益数值",
             "ensemble_weighting": "验证预测只使用训练期尾部校准的权重；生产权重再由完整样本外预测选择，禁止用同一外层验证真实值反向优化其自身预测",
-            "validation": "按交易日期顺序切分并清除跨越切分点样本；同时要求Top-N扣成本收益为正且优于当日候选池；验证后用全部已知标签重训",
-            "target": "T日收盘后生成信号，下一市场交易日开盘入场；预测入场后第1/2/3个可卖出交易日收盘相对入场开盘的收益",
+            "validation": "按交易日期顺序切分并清除跨越切分点样本；选股验证看NDCG、Rank IC和Top-N成本后收益，收益验证看朴素基准提升、Brier技能和区间覆盖",
+            "target": "排序目标为同日股票未来成本后收益分档；数值目标为板块中性超额收益，再加独立预测的市场/板块基准收益",
             "calendar_alignment": "入口和出口按板块共同市场日期定位；停牌、缺行情、一字涨停入口或一字跌停退出均不生成收益标签",
             "daily_factor_scope": "同日历史估值精确匹配，叠加上证/沪深300/中证1000日K、板块宽度、相对强弱和流通市值中性化因子",
-            "ranking": "只对通过验证的周期归一化加权成本后预测收益，再除以持有期波动率、ATR占比和1%下限中的最大值",
+            "ranking": "各周期XGBRanker分数先转为最新横截面百分位，再按配置周期权重合成；收益点预测不再直接决定推荐顺序",
             "survivorship_bias": (
                 "每次运行会把真实成分写入本地快照并报告成员变化；积累多个快照后可识别后续变化，"
                 "但仓库建立前的历史成分仍不能倒推，当前训练继续明确标记该限制"
@@ -2329,16 +2897,24 @@ def bankuai_xuangu(
             "max_holding": "最多输出入场后第3个可卖出交易日；系统不会输出更远预测",
             "price_limits": "不输出目标收盘价；仅展示模型未约束参考价和从信号收盘逐日推导、按0.01元取整的合法价格区间，实际T+1开盘确定后必须重算",
         },
-        "scope_note": "产品永久只做日K分析与三交易日内预测；结果带验证指标和成本假设，不是价格承诺。验证质量低只表示证据较弱。",
+        "scope_note": "产品永久只做日K分析与三交易日内选股和收益预测；验证质量用于标记预测可信度，不再隐藏可用的模型估计。",
         "execution_policy": "analysis_only：只输出分析候选和预测，永不连接券商、永不提交订单、永不自动交易。",
     }
-    if not validated_candidates:
-        if offset >= len(eligible) and eligible:
-            result["no_validated_candidate_reason"] = "候选序列已经到末尾，没有更多通过证据门槛且未重复的股票。"
-        elif not passed_horizon_labels:
-            result["no_validated_candidate_reason"] = "T+1、T+2、T+3 均未通过样本外验证，没有形成有效候选证据。"
+    if not validated_eligible:
+        if not passed_horizon_labels:
+            result["no_validated_candidate_reason"] = "T+1、T+2、T+3 均未通过样本外验证。"
         else:
-            result["no_validated_candidate_reason"] = "程序已弃权：通过验证的周期内，没有股票同时满足动态成本、成交容量、上涨概率和样本外质量门槛。"
+            result["no_validated_candidate_reason"] = "通过验证的周期内，没有股票同时满足原验证后候选门槛。"
+        result["recommendation_notice"] = (
+            "当前没有验证后候选，已按模型预测收益返回低可信度推荐排序；"
+            "每只股票仍包含完整T+1、T+2、T+3收益预测。"
+        )
+    elif not validated_candidates:
+        result["recommendation_notice"] = "本页没有验证后候选，但仍按模型预测收益返回排序结果。"
+    if not recommended_candidates:
+        result["no_recommended_candidate_reason"] = (
+            "候选序列已结束，或当前没有满足最低交易数量和成交容量要求的可排名股票。"
+        )
     if validation["overall_quality_label"] == "low":
         result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也只能视为低强度分析证据。"
     if run_dir:

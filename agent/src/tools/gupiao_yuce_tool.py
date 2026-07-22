@@ -142,20 +142,21 @@ def build_requested_forecast(
             unavailable_reason = str(scenario_timing.get("reason") or "持有期测算入口已经失效")
 
     validation_passed = bool(diagnostics.get("validation_passed"))
+    forecast_notice = ""
     if unavailable_reason:
         forecast_status = "obsolete_or_unavailable"
-    elif not validation_passed:
-        forecast_status = "not_validated"
-        unavailable_reason = "指定周期没有通过样本外验证，原始点预测不向用户发布"
     elif not raw_forecast:
         forecast_status = "unavailable"
         unavailable_reason = "指定周期没有可用预测"
+    elif not validation_passed:
+        forecast_status = "model_estimate"
+        forecast_notice = "指定周期未通过样本外验证；仍发布当前模型估计，可信度按验证结果标注"
     else:
         forecast_status = "validated"
 
     published_forecast: dict[str, Any] | None = None
     projected_price = None
-    if forecast_status == "validated":
+    if forecast_status in {"validated", "model_estimate"}:
         if mode == "future_close":
             gross = raw_forecast.get("cumulative_return_from_signal_close")
             cost_rate = (quantitative.get("cost_assumption") or {}).get("estimated_roundtrip_cost_rate")
@@ -201,6 +202,37 @@ def build_requested_forecast(
                 "conformal_net_return_interval_80": raw_forecast.get("conformal_net_return_interval_80"),
                 "position_and_cost": raw_forecast.get("position_and_cost"),
             }
+        published_forecast.update(
+            {
+                "prediction_type": "validated_forecast" if validation_passed else "unvalidated_model_estimate",
+                "validation_passed": validation_passed,
+                "model_quality": diagnostics.get("quality_label", "low"),
+            }
+        )
+
+    model_recommendation: dict[str, Any] | None = None
+    if published_forecast is not None:
+        net_return_key = (
+            "estimated_return_after_roundtrip_cost"
+            if mode == "future_close"
+            else "estimated_net_return_after_cost"
+        )
+        estimated_net_return = published_forecast.get(net_return_key)
+        if estimated_net_return is None:
+            recommendation_decision = "watch"
+            recommendation_reason = "模型已给出方向预测，但当前缺少完整成本后收益"
+        elif float(estimated_net_return) > 0:
+            recommendation_decision = "recommend"
+            recommendation_reason = "当前模型预测扣除往返交易成本后的收益为正"
+        else:
+            recommendation_decision = "avoid"
+            recommendation_reason = "当前模型预测扣除往返交易成本后的收益不为正"
+        model_recommendation = {
+            "decision": recommendation_decision,
+            "reason": recommendation_reason,
+            "confidence": diagnostics.get("quality_label", "low"),
+            "validation_passed": validation_passed,
+        }
 
     scenario_name = str((quantitative.get("cost_assumption") or {}).get("scenario") or "normal_cost")
     from src.ashare.bankuai_yuce import _load_cost_assumption
@@ -230,8 +262,8 @@ def build_requested_forecast(
     )
 
     return {
-        "status": "ok" if forecast_status == "validated" else "unavailable",
-        "tool_contract_version": 2,
+        "status": "ok" if published_forecast is not None else "unavailable",
+        "tool_contract_version": 3,
         "analysis_id": analysis_id,
         "analysis_stage_required": "gupiao_fenxi completed",
         "stock": stock,
@@ -240,6 +272,8 @@ def build_requested_forecast(
         "request": {"mode": mode, "intent": intent, "horizon": label},
         "forecast_status": forecast_status,
         "forecast": published_forecast,
+        "model_recommendation": model_recommendation,
+        "forecast_notice": forecast_notice or None,
         "unavailable_reason": unavailable_reason or None,
         "validation_diagnostics": {
             key: diagnostics.get(key)
@@ -269,7 +303,8 @@ def build_requested_forecast(
         },
         "interpretation": (
             "买入问题解释为扣除广义交易成本后的上涨空间；卖出问题先分析后续空间，"
-            "提供买入价和持仓股数或金额后再计算持仓净收益。"
+            "提供买入价和持仓股数或金额后再计算持仓净收益。样本外验证用于标注可信度，"
+            "不再隐藏已经生成的模型收益预测。"
         ),
     }
 
@@ -280,7 +315,8 @@ class GupiaoYuceTool(BaseTool):
         "Second-stage request-specific T+1/T+2/T+3 forecast. It requires an analysis_id returned by gupiao_fenxi. "
         "Use future_close for '未来几天/几天后走势' and holding_return for '买入后持有几天'. Interpret buy questions "
         "as after-cost upside. Interpret sell questions as remaining upside; include buy_price and shares or position_value_yuan "
-        "when known to calculate net position return. Unvalidated or obsolete point forecasts are deliberately withheld."
+        "when known to calculate net position return. Available model estimates are returned even when validation fails; "
+        "validation status and model quality must be reported as confidence information."
     )
     parameters = {
         "type": "object",

@@ -151,7 +151,7 @@ def test_second_stage_publishes_only_validated_horizon_and_position_costs(
     assert result["position_return_analysis"]["projected_exit_estimate"]["net_profit_yuan"] > 0
 
 
-def test_second_stage_withholds_unvalidated_raw_prediction(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_second_stage_publishes_unvalidated_model_estimate(monkeypatch: pytest.MonkeyPatch) -> None:
     full = copy.deepcopy(_full_result())
     full["future_3_trading_days"]["validation"]["horizons"]["T+2"]["validation_passed"] = False
     full["future_3_trading_days"]["forecast"]["T+2"]["cumulative_return_from_signal_close"] = 9.99
@@ -166,10 +166,12 @@ def test_second_stage_withholds_unvalidated_raw_prediction(monkeypatch: pytest.M
         )
     )
 
-    assert result["status"] == "unavailable"
-    assert result["forecast_status"] == "not_validated"
-    assert result["forecast"] is None
-    assert "原始点预测不向用户发布" in result["unavailable_reason"]
+    assert result["status"] == "ok"
+    assert result["forecast_status"] == "model_estimate"
+    assert result["forecast"]["cumulative_return_from_signal_close"] == 9.99
+    assert result["forecast"]["prediction_type"] == "unvalidated_model_estimate"
+    assert result["forecast"]["validation_passed"] is False
+    assert "仍发布当前模型估计" in result["forecast_notice"]
 
 
 def test_second_stage_requires_live_analysis_id() -> None:

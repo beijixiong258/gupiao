@@ -309,7 +309,7 @@ def test_only_validated_horizons_drive_weighted_return_and_price_is_bounded() ->
     assert "实际T+1开盘价尚未知" in row["forecast"]["T+1"]["predicted_close_unavailable_reason"]
 
 
-def test_validated_zero_weight_horizon_does_not_silently_become_equal_weight() -> None:
+def test_weighted_unvalidated_horizon_is_used_as_ranking_fallback() -> None:
     config, _ = jiazai_lianghua_peizhi()
     config = copy.deepcopy(config)
     config["moxing"]["horizon_weights"] = {"1": 0.0, "2": 1.0, "3": 0.0}
@@ -342,10 +342,11 @@ def test_validated_zero_weight_horizon_does_not_silently_become_equal_weight() -
         0.0,
     )[0]
 
-    assert row["ranking_horizons"] == []
-    assert row["weighted_expected_net_return"] is None
-    assert row["strongest_forecast_horizon"] is None
-    assert row["strongest_horizon_trading_days"] is None
+    assert row["ranking_horizons"] == ["T+2"]
+    assert row["ranking_validation_mode"] == "unvalidated_model_fallback"
+    assert row["weighted_expected_net_return"] == row["forecast"]["T+2"]["estimated_net_return_after_cost"]
+    assert row["strongest_forecast_horizon"] == "T+2"
+    assert row["strongest_horizon_trading_days"] == 2
     assert row["strongest_horizon_validation_passed"] is False
 
 

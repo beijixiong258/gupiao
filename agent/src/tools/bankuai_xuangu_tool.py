@@ -11,6 +11,10 @@ class BankuaiXuanguTool(BaseTool):
     description = (
         "Select mainland China A-shares only from a user-specified industry or concept board. "
         "Runs chronological out-of-sample validation and returns cost-adjusted T+1, T+2, and T+3 sellable-horizon forecasts. "
+        "Uses a per-date XGBRanker for recommendation order and a separate board-neutral return model for numeric forecasts; "
+        "selection_confidence and return_confidence must be explained separately. "
+        "Always returns model-ranked recommendations when forecast data is available; failed validation lowers confidence "
+        "but does not suppress recommendations or numeric return estimates. "
         "Signals use the completed close, entry is the next session open, and T+1 is the first later session when the new shares can be sold. "
         "Use this for natural-language requests to pick stocks from a sector and compare those three sellable horizons. "
         "One batch returns at most 8 candidates. For a later batch, reuse selection_id and pass next_offset so ranking "

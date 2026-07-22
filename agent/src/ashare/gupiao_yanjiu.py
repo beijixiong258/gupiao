@@ -163,6 +163,9 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             "direction_logistic_max_iter": 500,
             "probability_calibration_min_samples": 120,
             "conformal_min_samples": 80,
+            "ranking_relevance_grades": 5,
+            "ranking_pair_top_k": 8,
+            "ranking_n_estimators": 180,
         }
         positive_integer_fields = {
             key: int(model.get(key, default)) for key, default in integer_defaults.items()
@@ -191,6 +194,10 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         calibration_evaluation_ratio = float(model.get("probability_calibration_evaluation_ratio", 0.30))
         calibration_min_improvement = float(model.get("probability_calibration_min_brier_improvement", 0.0005))
         conformal_coverage = float(model.get("conformal_coverage", 0.80))
+        ranking_min_ndcg_improvement = float(model.get("ranking_min_ndcg_improvement", 0.0))
+        return_interval_coverage_range = [
+            float(item) for item in model.get("return_interval_coverage_range", [0.75, 0.85])
+        ]
     except (TypeError, ValueError) as exc:
         raise ValueError(f"moxing 数值配置无效：{exc}") from exc
     if not 0.05 <= validation_ratio <= 0.4:
@@ -205,6 +212,10 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.horizon_weights 必须为 T+1/T+2/T+3 提供非负权重且总和大于0")
     if any(item <= 0 for item in positive_integer_fields.values()):
         raise ValueError("moxing 的样本数、验证天数和 Top-N 配置必须为正整数")
+    if not 2 <= positive_integer_fields["ranking_relevance_grades"] <= 31:
+        raise ValueError("moxing.ranking_relevance_grades 必须在 2 到 31 之间")
+    if positive_integer_fields["ranking_pair_top_k"] > 100:
+        raise ValueError("moxing.ranking_pair_top_k 不能大于 100")
     if positive_integer_fields["factor_min_valid_slices"] > positive_integer_fields["factor_stability_slices"]:
         raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
     if not 0.5 <= min_direction <= 1:
@@ -221,6 +232,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.ensemble_enabled 必须是 true 或 false")
     if not isinstance(model.get("factor_stability_enabled", True), bool):
         raise ValueError("moxing.factor_stability_enabled 必须是 true 或 false")
+    if not isinstance(model.get("ranking_enabled", True), bool):
+        raise ValueError("moxing.ranking_enabled 必须是 true 或 false")
     if not 0 < model_feature_coverage <= 1:
         raise ValueError("moxing.min_feature_coverage 必须在 0 到 1 之间")
     if not 0.5 <= factor_min_sign_agreement <= 1:
@@ -235,6 +248,13 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.probability_calibration_min_brier_improvement 必须在 0 到 0.2 之间")
     if not 0.5 < conformal_coverage < 1:
         raise ValueError("moxing.conformal_coverage 必须在 0.5 到 1 之间")
+    if not -1 <= ranking_min_ndcg_improvement <= 1:
+        raise ValueError("moxing.ranking_min_ndcg_improvement 必须在 -1 到 1 之间")
+    if (
+        len(return_interval_coverage_range) != 2
+        or not 0 < return_interval_coverage_range[0] < return_interval_coverage_range[1] < 1
+    ):
+        raise ValueError("moxing.return_interval_coverage_range 必须是两个递增的 0~1 数值")
     if not math.isfinite(ridge_alpha) or ridge_alpha <= 0:
         raise ValueError("moxing.ridge_alpha 必须是正有限数")
     if not 0 <= ensemble_default_tree_weight <= 1:
@@ -1767,7 +1787,6 @@ def fenxi_gupiao(
         "risks": risks,
         "configuration": {
             "quant_config_path": resolved_config,
-            "config_version": config.get("banben"),
             "cost_scenario": config.get("jiaoyi", {}).get("cost_scenario"),
             "dynamic_slippage_enabled": config.get("jiaoyi", {}).get("dynamic_slippage_enabled", True),
         },

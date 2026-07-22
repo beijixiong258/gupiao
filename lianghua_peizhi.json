@@ -1,5 +1,4 @@
 {
-  "banben": 4,
   "shuju": {
     "frequency": "daily_only",
     "minute_bars_enabled": false,
@@ -54,12 +53,21 @@
     "min_training_samples": 500,
     "min_validation_samples": 100,
     "min_direction_accuracy": 0.52,
-    "min_mean_daily_rank_ic": 0.01,
+    "min_mean_daily_rank_ic": 0.03,
     "min_rank_ic_days": 10,
     "min_skill_vs_baseline": 0.01,
-    "min_skill_vs_best_naive_baseline": 0.0,
+    "min_skill_vs_best_naive_baseline": 0.01,
     "validation_top_n": 3,
     "min_top_n_days": 10,
+    "ranking_enabled": true,
+    "ranking_relevance_grades": 5,
+    "ranking_pair_top_k": 8,
+    "ranking_n_estimators": 180,
+    "ranking_min_ndcg_improvement": 0.0,
+    "return_interval_coverage_range": [
+      0.75,
+      0.85
+    ],
     "learning_rate": 0.05,
     "max_iter": 180,
     "max_leaf_nodes": 15,
