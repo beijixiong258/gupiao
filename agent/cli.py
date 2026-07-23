@@ -547,6 +547,82 @@ def cmd_warehouse_sync(
     return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
 
 
+def cmd_warehouse_update(
+    *,
+    max_sessions: int,
+    pause_seconds: float,
+    workers: int,
+    json_mode: bool,
+) -> int:
+    """Incrementally update completed market sessions without requiring dates."""
+    from datetime import date, timedelta
+
+    from src.ashare.gupiao_yanjiu import _latest_expected_market_date
+    from src.ashare.riping_cangku import daily_warehouse_status, sync_price_warehouse
+
+    try:
+        status = daily_warehouse_status()
+        date_range = status.get("price_complete_date_range") or []
+        if len(date_range) != 2 or not date_range[1]:
+            result = {
+                "status": "error",
+                "error_code": "warehouse_not_initialized",
+                "error": "日线仓库还没有完整日期；请先使用 warehouse sync --start 建立历史仓库",
+            }
+        else:
+            latest = date.fromisoformat(str(date_range[1]))
+            expected = _latest_expected_market_date().date()
+            start = latest + timedelta(days=1)
+            if start > expected:
+                result = {
+                    "status": "ok",
+                    "update_status": "up_to_date",
+                    "latest_price_date": latest.isoformat(),
+                    "expected_latest_completed_date": expected.isoformat(),
+                    "attempted_sessions": 0,
+                    "message": "日线仓库已经覆盖最近应完成的交易日",
+                    "warehouse_status": status,
+                }
+            else:
+                result = sync_price_warehouse(
+                    start_date=start.isoformat(),
+                    end_date=expected.isoformat(),
+                    max_sessions=max_sessions,
+                    newest_first=True,
+                    force=False,
+                    pause_seconds=pause_seconds,
+                    workers=workers,
+                )
+                result["update_status"] = (
+                    "updated"
+                    if int(result.get("attempted_sessions", 0)) > 0
+                    else "up_to_date"
+                )
+                result["automatic_range"] = [start.isoformat(), expected.isoformat()]
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
+
+
+def cmd_warehouse_enrich(*, json_mode: bool) -> int:
+    """Fill one recent daily_basic session without consuming a large quota burst."""
+    from src.ashare.riping_cangku import enrich_latest_daily_basic
+
+    try:
+        result = enrich_latest_daily_basic()
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A 股 T+3 量化研究员")
     sub = parser.add_subparsers(dest="command")
@@ -611,6 +687,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     warehouse_sub = warehouse.add_subparsers(dest="warehouse_command", required=True)
     warehouse_status = warehouse_sub.add_parser("status", help="查看日频仓库覆盖范围和可用状态")
     warehouse_status.add_argument("--json", action="store_true")
+    warehouse_update = warehouse_sub.add_parser("update", help="自动补齐最近已收盘交易日的全市场日线")
+    warehouse_update.add_argument(
+        "--max-sessions",
+        type=int,
+        default=10,
+        help="本次最多补多少个交易日；默认10，0表示全部缺口",
+    )
+    warehouse_update.add_argument("--pause-seconds", type=float, default=0.08, help="交易日之间的请求间隔")
+    warehouse_update.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="日线下载并发数，范围1到8；低额度账号建议保持1",
+    )
+    warehouse_update.add_argument("--json", action="store_true")
+    warehouse_enrich = warehouse_sub.add_parser(
+        "enrich",
+        help="低额度渐进补齐：每次只补一个最近交易日的估值和换手率",
+    )
+    warehouse_enrich.add_argument("--json", action="store_true")
     warehouse_sync = warehouse_sub.add_parser("sync", help="按交易日增量同步全市场日频数据")
     warehouse_sync.add_argument("--start", dest="start_date", required=True, help="开始日期，例如2022-01-01")
     warehouse_sync.add_argument("--end", dest="end_date", help="结束日期；默认今天")
@@ -689,6 +785,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "warehouse":
         if args.warehouse_command == "status":
             return cmd_warehouse_status(json_mode=args.json)
+        if args.warehouse_command == "update":
+            return cmd_warehouse_update(
+                max_sessions=args.max_sessions,
+                pause_seconds=args.pause_seconds,
+                workers=args.workers,
+                json_mode=args.json,
+            )
+        if args.warehouse_command == "enrich":
+            return cmd_warehouse_enrich(json_mode=args.json)
         return cmd_warehouse_sync(
             start_date=args.start_date,
             end_date=args.end_date,

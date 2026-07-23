@@ -1196,6 +1196,96 @@ def sync_daily_warehouse(
     }
 
 
+def enrich_latest_daily_basic(
+    path: Path | str = DAILY_WAREHOUSE_PATH,
+    pro: Any | None = None,
+) -> dict[str, Any]:
+    """Fill one newest missing daily_basic session for low-quota accounts."""
+    resolved = Path(path).expanduser().resolve()
+    initialize_daily_warehouse(resolved)
+    provider = pro or _tushare_pro()
+    fields = (
+        "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pe_ttm,pb,ps,ps_ttm,"
+        "dv_ratio,dv_ttm,total_share,float_share,free_share,total_mv,circ_mv"
+    )
+    with _connect(resolved) as connection:
+        pending = connection.execute(
+            """
+            SELECT trade_date
+            FROM sync_status
+            WHERE bars_status='complete'
+              AND COALESCE(basic_status,'pending')<>'complete'
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if pending is None:
+            return {
+                "status": "ok",
+                "enrich_status": "up_to_date",
+                "attempted_sessions": 0,
+                "message": "已有日线交易日的 daily_basic 已全部补齐",
+                "warehouse_status": daily_warehouse_status(resolved),
+            }
+        trade_date = str(pending["trade_date"])
+        with connection:
+            connection.execute(
+                """
+                UPDATE sync_status
+                SET last_error=NULL,attempt_count=attempt_count+1,last_attempt_at=?,updated_at=?
+                WHERE trade_date=?
+                """,
+                (_now_text(), _now_text(), trade_date),
+            )
+        try:
+            frame = provider.daily_basic(trade_date=trade_date, fields=fields)
+            with connection:
+                row_count = _upsert_daily_basic(connection, frame, trade_date)
+                _set_sync_result(
+                    connection,
+                    trade_date=trade_date,
+                    endpoint="basic",
+                    status="complete",
+                    rows=row_count,
+                    error=None,
+                )
+                connection.execute(
+                    "UPDATE sync_status SET last_error=NULL,updated_at=? WHERE trade_date=?",
+                    (_now_text(), trade_date),
+                )
+            session = {
+                "trade_date": _display_date(trade_date),
+                "status": "complete",
+                "rows": int(row_count),
+            }
+            status = "ok"
+        except Exception as exc:
+            error = str(exc)
+            with connection:
+                _set_sync_result(
+                    connection,
+                    trade_date=trade_date,
+                    endpoint="basic",
+                    status="failed",
+                    rows=0,
+                    error=error,
+                )
+            session = {
+                "trade_date": _display_date(trade_date),
+                "status": "failed",
+                "error": error,
+            }
+            status = "partial"
+    return {
+        "status": status,
+        "enrich_status": "updated" if status == "ok" else "rate_limited_or_failed",
+        "attempted_sessions": 1,
+        "session": session,
+        "message": "每次只补一个最近交易日，适合低额度账号重复渐进执行",
+        "warehouse_status": daily_warehouse_status(resolved),
+    }
+
+
 def daily_warehouse_status(path: Path | str = DAILY_WAREHOUSE_PATH) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -1708,6 +1798,7 @@ __all__ = [
     "DAILY_WAREHOUSE_PATH",
     "board_constituent_history_status",
     "daily_warehouse_status",
+    "enrich_latest_daily_basic",
     "initialize_daily_warehouse",
     "load_daily_basic_from_warehouse",
     "load_board_membership_history",

@@ -701,6 +701,74 @@ def _build_linear_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
     )
 
 
+def _build_quantile_model_pipeline(
+    model_config: dict[str, Any],
+    quantile: float,
+) -> Pipeline:
+    return Pipeline(
+        [
+            ("training_window_winsorizer", _feature_clipper(model_config)),
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    loss="quantile",
+                    quantile=float(quantile),
+                    learning_rate=float(model_config.get("learning_rate", 0.05)),
+                    max_iter=int(model_config.get("max_iter", 180)),
+                    max_leaf_nodes=int(model_config.get("max_leaf_nodes", 15)),
+                    max_depth=int(model_config.get("max_depth", 4)),
+                    min_samples_leaf=int(model_config.get("min_samples_leaf", 30)),
+                    l2_regularization=float(model_config.get("l2_regularization", 1.0)),
+                    random_state=int(model_config.get("random_state", 42)),
+                ),
+            ),
+        ]
+    )
+
+
+def _fit_quantile_model_components(
+    *,
+    train_features: pd.DataFrame,
+    train_target: np.ndarray,
+    predict_features: pd.DataFrame,
+    model_config: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    levels = [
+        float(value)
+        for value in model_config.get("quantile_levels", [0.10, 0.50, 0.90])
+    ]
+    if not model_config.get("quantile_interval_enabled", True):
+        return {}, {"status": "disabled"}
+    if levels != sorted(levels) or len(levels) != 3:
+        raise ValueError("moxing.quantile_levels 必须是三个递增分位数")
+    raw_predictions: list[np.ndarray] = []
+    for level in levels:
+        model = _build_quantile_model_pipeline(model_config, level)
+        model.fit(train_features, np.asarray(train_target, dtype=float))
+        raw_predictions.append(
+            np.asarray(model.predict(predict_features), dtype=float)
+        )
+    stacked = np.vstack(raw_predictions)
+    crossings = int(
+        np.sum(
+            (stacked[0] > stacked[1])
+            | (stacked[1] > stacked[2])
+        )
+    )
+    ordered = np.sort(stacked, axis=0)
+    return {
+        "lower": ordered[0],
+        "median": ordered[1],
+        "upper": ordered[2],
+    }, {
+        "status": "ok",
+        "model": "HistGradientBoostingRegressor(loss=quantile)",
+        "quantile_levels": levels,
+        "predictions_reordered_for_crossing": crossings,
+    }
+
+
 def _fit_model_components(
     *,
     train_features: pd.DataFrame,
@@ -1109,38 +1177,84 @@ def _calibrate_direction_probability(
         return raw_latest, base
     split = max(minimum_samples // 2, int(len(frame) * (1.0 - evaluation_ratio)))
     split = min(split, len(frame) - max(30, minimum_samples // 4))
-    train_labels, evaluation_labels = labels[:split], labels[split:]
-    if len(np.unique(train_labels)) < 2 or len(np.unique(evaluation_labels)) < 2:
-        base["reason"] = "时间校准窗或后段评估窗只有单一方向类别"
+    evaluation_start = pd.Timestamp(frame["date"].iloc[split])
+    evaluation_dates = [
+        pd.Timestamp(value)
+        for value in sorted(frame.loc[frame["date"] >= evaluation_start, "date"].unique())
+    ]
+    evaluation_indices: list[int] = []
+    evaluation_calibrated_values: list[float] = []
+    evaluation_baseline_values: list[float] = []
+    for evaluation_date in evaluation_dates:
+        train_mask = frame["date"] < evaluation_date
+        evaluation_mask = frame["date"] == evaluation_date
+        train_index = np.flatnonzero(train_mask.to_numpy())
+        current_index = np.flatnonzero(evaluation_mask.to_numpy())
+        if (
+            len(train_index) < minimum_samples // 2
+            or not len(current_index)
+            or len(np.unique(labels[train_index])) < 2
+            or len(np.unique(raw[train_index])) < 2
+        ):
+            continue
+        calibration = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        calibration.fit(raw[train_index], labels[train_index])
+        current_calibrated = np.asarray(
+            calibration.predict(raw[current_index]),
+            dtype=float,
+        ).clip(0.0, 1.0)
+        evaluation_indices.extend(int(value) for value in current_index)
+        evaluation_calibrated_values.extend(float(value) for value in current_calibrated)
+        historical_rate = float(np.mean(labels[train_index]))
+        evaluation_baseline_values.extend([historical_rate] * len(current_index))
+    if not evaluation_indices:
+        base["reason"] = "没有形成只使用更早日期样本的滚动概率校准评估"
         return raw_latest, base
-    calibration = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    calibration.fit(raw[:split], train_labels)
-    evaluation_calibrated = np.asarray(calibration.predict(raw[split:]), dtype=float).clip(0.0, 1.0)
-    raw_brier = float(brier_score_loss(evaluation_labels, raw[split:]))
+    evaluation_index = np.asarray(evaluation_indices, dtype=int)
+    evaluation_labels = labels[evaluation_index]
+    evaluation_raw = raw[evaluation_index]
+    evaluation_calibrated = np.asarray(evaluation_calibrated_values, dtype=float)
+    evaluation_baseline = np.asarray(evaluation_baseline_values, dtype=float)
+    if len(np.unique(evaluation_labels)) < 2:
+        base["reason"] = "滚动校准评估窗只有单一方向类别"
+        return raw_latest, base
+    raw_brier = float(brier_score_loss(evaluation_labels, evaluation_raw))
     calibrated_brier = float(brier_score_loss(evaluation_labels, evaluation_calibrated))
+    historical_rate_brier = float(
+        brier_score_loss(evaluation_labels, evaluation_baseline)
+    )
     base["time_ordered_evaluation"] = {
-        "calibration_samples": int(split),
-        "evaluation_samples": int(len(frame) - split),
+        "method": "rolling_cross_fitted_isotonic_by_date",
+        "initial_calibration_samples": int(split),
+        "evaluation_samples": int(len(evaluation_index)),
+        "evaluation_dates": int(len(set(frame["date"].iloc[evaluation_index]))),
         "raw_brier_score": round(raw_brier, 6),
         "isotonic_brier_score": round(calibrated_brier, 6),
+        "historical_positive_rate_brier_score": round(historical_rate_brier, 6),
         "improvement": round(raw_brier - calibrated_brier, 6),
+        "improvement_vs_historical_positive_rate": round(
+            historical_rate_brier - calibrated_brier,
+            6,
+        ),
     }
-    if raw_brier - calibrated_brier < minimum_improvement:
-        base["reason"] = "保序校准未在后段时间窗稳定改善Brier分数"
+    if (
+        raw_brier - calibrated_brier < minimum_improvement
+        or historical_rate_brier - calibrated_brier < minimum_improvement
+    ):
+        base["reason"] = "滚动保序校准未同时优于原始概率和历史上涨比例基准"
         return raw_latest, base
     production_calibration = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     production_calibration.fit(raw, labels)
     calibrated_latest = float(production_calibration.predict([raw_latest])[0])
-    calibrated_oos = np.asarray(production_calibration.predict(raw), dtype=float).clip(0.0, 1.0)
     return calibrated_latest, {
         **base,
         "status": "calibrated",
-        "method": "time_ordered_isotonic_then_refit_on_all_oos",
+        "method": "rolling_cross_fitted_isotonic_then_refit_on_all_oos",
         "latest_raw_probability": round(raw_latest, 6),
         "latest_calibrated_probability": round(calibrated_latest, 6),
         "reliability_bins": _probability_reliability_bins(
-            frame["actual"].to_numpy(dtype=float),
-            calibrated_oos,
+            frame["actual"].to_numpy(dtype=float)[evaluation_index],
+            evaluation_calibrated,
         ),
     }
 
@@ -1189,6 +1303,89 @@ def _rolling_conformal_interval(
         "rolling_evaluation_samples": int(len(hits)),
         "rolling_empirical_coverage": round(float(np.mean(hits)), 6) if hits else None,
         "latest_radius": round(latest_radius, 6),
+    }
+
+
+def _rolling_cqr_interval(
+    *,
+    actual: np.ndarray,
+    lower_prediction: np.ndarray,
+    upper_prediction: np.ndarray,
+    dates: pd.Series,
+    latest_lower: float,
+    latest_upper: float,
+    model_config: dict[str, Any],
+) -> tuple[list[float] | None, dict[str, Any]]:
+    coverage = float(model_config.get("conformal_coverage", 0.80))
+    minimum_samples = int(model_config.get("conformal_min_samples", 80))
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, errors="coerce"),
+            "actual": np.asarray(actual, dtype=float),
+            "lower": np.asarray(lower_prediction, dtype=float),
+            "upper": np.asarray(upper_prediction, dtype=float),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("date")
+    if len(frame) < minimum_samples:
+        return None, {
+            "status": "insufficient_oos_samples",
+            "samples": int(len(frame)),
+            "minimum_samples": minimum_samples,
+            "target_coverage": coverage,
+        }
+    lower = np.minimum(
+        frame["lower"].to_numpy(dtype=float),
+        frame["upper"].to_numpy(dtype=float),
+    )
+    upper = np.maximum(
+        frame["lower"].to_numpy(dtype=float),
+        frame["upper"].to_numpy(dtype=float),
+    )
+    actual_values = frame["actual"].to_numpy(dtype=float)
+    scores = np.maximum(lower - actual_values, actual_values - upper)
+
+    def correction(values: np.ndarray) -> float:
+        adjusted = min(1.0, math.ceil((len(values) + 1) * coverage) / len(values))
+        return max(0.0, float(np.quantile(values, adjusted, method="higher")))
+
+    hits: list[bool] = []
+    evaluation_dates = 0
+    for current_date in sorted(frame["date"].unique()):
+        prior_mask = frame["date"] < current_date
+        current_mask = frame["date"] == current_date
+        prior_count = int(prior_mask.sum())
+        if prior_count < minimum_samples:
+            continue
+        current_correction = correction(scores[prior_mask.to_numpy()])
+        current_indices = np.flatnonzero(current_mask.to_numpy())
+        hits.extend(
+            bool(
+                lower[index] - current_correction
+                <= actual_values[index]
+                <= upper[index] + current_correction
+            )
+            for index in current_indices
+        )
+        evaluation_dates += 1
+    latest_correction = correction(scores)
+    raw_lower = min(float(latest_lower), float(latest_upper))
+    raw_upper = max(float(latest_lower), float(latest_upper))
+    interval = [
+        raw_lower - latest_correction,
+        raw_upper + latest_correction,
+    ]
+    raw_coverage = float(np.mean((actual_values >= lower) & (actual_values <= upper)))
+    return interval, {
+        "status": "ok",
+        "method": "rolling_conformalized_quantile_regression",
+        "target_coverage": coverage,
+        "calibration_samples": int(len(frame)),
+        "rolling_evaluation_samples": int(len(hits)),
+        "rolling_evaluation_dates": int(evaluation_dates),
+        "rolling_empirical_coverage": round(float(np.mean(hits)), 6) if hits else None,
+        "raw_quantile_interval_coverage": round(raw_coverage, 6),
+        "latest_correction": round(latest_correction, 6),
+        "latest_raw_interval": [round(raw_lower, 6), round(raw_upper, 6)],
     }
 
 
@@ -1482,7 +1679,7 @@ def xunlian_yuce_moxing(
     cutoff = pd.Timestamp(dates[cutoff_index])
     predictions = latest[["ts_code", "name", "trade_date", "close"] + feature_columns].copy()
     validation: dict[str, Any] = {
-        "split_method": "chronological_purged_holdout_with_three_oos_stability_subwindows",
+        "split_method": "chronological_purged_holdout_with_six_oos_stability_subwindows",
         "cutoff_date": cutoff.strftime("%Y-%m-%d"),
         "signal_and_execution": {
             "signal": "T日收盘后",
@@ -1568,6 +1765,12 @@ def xunlian_yuce_moxing(
             predict_features=validation_frame[validation_features],
             model_config=model_config,
         )
+        validation_quantile_prediction, validation_quantile_model = _fit_quantile_model_components(
+            train_features=train[validation_features],
+            train_target=y_train_raw,
+            predict_features=validation_frame[validation_features],
+            model_config=model_config,
+        )
         validation_tree_prediction = np.clip(validation_tree_prediction, clip_low, clip_high)
         validation_linear_prediction = np.clip(validation_linear_prediction, clip_low, clip_high)
         validation_excess_prediction = np.clip(
@@ -1598,7 +1801,7 @@ def xunlian_yuce_moxing(
             training_target=y_train_raw,
         )
         mae = float(baseline_metrics["model_mae"])
-        baseline_value = float(np.median(y_train))
+        baseline_value = float(np.median(y_train_raw))
         baseline_mae = float(baseline_metrics["baselines"]["training_median"]["mae"])
         direction_accuracy = float(np.mean((validation_prediction > 0) == (y_validation > 0)))
         return_rank_ic, return_rank_ic_days = _daily_rank_ic(
@@ -1738,6 +1941,12 @@ def xunlian_yuce_moxing(
             predict_features=latest[production_features],
             model_config=model_config,
         )
+        production_quantile_prediction, production_quantile_model = _fit_quantile_model_components(
+            train_features=usable[production_features],
+            train_target=y_full_raw,
+            predict_features=latest[production_features],
+            model_config=model_config,
+        )
         production_tree_prediction = np.clip(
             production_tree_prediction, final_clip_low, final_clip_high
         )
@@ -1767,6 +1976,18 @@ def xunlian_yuce_moxing(
         predictions[f"pred_t{horizon}"] = latest_prediction
         predictions[f"pred_excess_t{horizon}"] = latest_excess_prediction
         predictions[f"pred_market_baseline_t{horizon}"] = latest_market_prediction
+        predictions[f"quantile_low_t{horizon}"] = production_quantile_prediction.get(
+            "lower",
+            np.full(len(latest), np.nan),
+        )
+        predictions[f"quantile_median_t{horizon}"] = production_quantile_prediction.get(
+            "median",
+            np.full(len(latest), np.nan),
+        )
+        predictions[f"quantile_high_t{horizon}"] = production_quantile_prediction.get(
+            "upper",
+            np.full(len(latest), np.nan),
+        )
         full_net_actual = _historical_net_returns(
             usable,
             y_full_raw,
@@ -1797,6 +2018,8 @@ def xunlian_yuce_moxing(
         probability_calibration: dict[str, Any] = {}
         conformal_intervals: list[list[float] | None] = []
         conformal_diagnostics: dict[str, Any] = {}
+        cqr_intervals: list[list[float] | None] = []
+        cqr_diagnostics: dict[str, Any] = {}
         for latest_index, (raw_probability, point_prediction) in enumerate(
             zip(production_direction_probability, latest_prediction)
         ):
@@ -1814,17 +2037,37 @@ def xunlian_yuce_moxing(
                 latest_prediction=float(point_prediction),
                 model_config=model_config,
             )
+            if validation_quantile_prediction and production_quantile_prediction:
+                cqr_interval, cqr_meta = _rolling_cqr_interval(
+                    actual=y_validation,
+                    lower_prediction=validation_quantile_prediction["lower"],
+                    upper_prediction=validation_quantile_prediction["upper"],
+                    dates=validation_frame["trade_date"],
+                    latest_lower=float(production_quantile_prediction["lower"][latest_index]),
+                    latest_upper=float(production_quantile_prediction["upper"][latest_index]),
+                    model_config=model_config,
+                )
+            else:
+                cqr_interval, cqr_meta = None, {"status": "disabled"}
             calibrated_probabilities.append(float(calibrated))
             conformal_intervals.append(interval)
+            cqr_intervals.append(cqr_interval)
             if latest_index == 0:
                 probability_calibration = calibration_meta
                 conformal_diagnostics = interval_meta
+                cqr_diagnostics = cqr_meta
         predictions[f"direction_prob_t{horizon}"] = calibrated_probabilities
         predictions[f"conformal_low_t{horizon}"] = [
             interval[0] if interval else np.nan for interval in conformal_intervals
         ]
         predictions[f"conformal_high_t{horizon}"] = [
             interval[1] if interval else np.nan for interval in conformal_intervals
+        ]
+        predictions[f"cqr_low_t{horizon}"] = [
+            interval[0] if interval else np.nan for interval in cqr_intervals
+        ]
+        predictions[f"cqr_high_t{horizon}"] = [
+            interval[1] if interval else np.nan for interval in cqr_intervals
         ]
 
         direction_labels = (y_validation > 0).astype(int)
@@ -1840,8 +2083,13 @@ def xunlian_yuce_moxing(
             if direction_baseline_brier > 0
             else 0.0
         )
+        preferred_interval_diagnostics = (
+            cqr_diagnostics
+            if cqr_diagnostics.get("status") == "ok"
+            else conformal_diagnostics
+        )
         empirical_coverage = _round_optional(
-            conformal_diagnostics.get("rolling_empirical_coverage")
+            preferred_interval_diagnostics.get("rolling_empirical_coverage")
         )
         coverage_range = [
             float(value)
@@ -1875,11 +2123,18 @@ def xunlian_yuce_moxing(
                 1.0,
             )
         )
-        validation_passed = bool(selection_validation_passed and return_validation_passed)
-
         validation_dates = [pd.Timestamp(value) for value in sorted(validation_frame["trade_date"].unique())]
+        subwindow_count = max(2, int(model_config.get("validation_subwindows", 6)))
+        minimum_passed_subwindows = max(
+            1,
+            int(model_config.get("min_passed_subwindows", 4)),
+        )
         temporal_folds: list[dict[str, Any]] = []
-        for fold_number, date_slice in enumerate(np.array_split(np.asarray(validation_dates, dtype=object), 3), start=1):
+        date_subwindows = np.array_split(
+            np.asarray(validation_dates, dtype=object),
+            subwindow_count,
+        )
+        for fold_number, date_slice in enumerate(date_subwindows, start=1):
             if not len(date_slice):
                 continue
             mask = validation_frame["trade_date"].isin(list(date_slice)).to_numpy()
@@ -1892,21 +2147,142 @@ def xunlian_yuce_moxing(
             fold_mae = float(mean_absolute_error(fold_actual, fold_prediction))
             fold_skill = 1.0 - fold_mae / fold_baseline_mae if fold_baseline_mae > 0 else 0.0
             fold_direction = float(np.mean((fold_prediction > 0) == (fold_actual > 0)))
-            fold_rank_ic, _ = _daily_rank_ic(
+            fold_return_rank_ic, fold_return_rank_days = _daily_rank_ic(
                 validation_frame.loc[mask, "trade_date"],
                 fold_actual,
                 fold_prediction,
             )
+            fold_return_baselines = regression_baseline_metrics(
+                actual=fold_actual,
+                predicted=fold_prediction,
+                training_target=y_train_raw,
+            )
+            fold_ranking_score = np.asarray(validation_ranking_score, dtype=float)[mask]
+            fold_net_actual = np.asarray(validation_net_actual, dtype=float)[mask]
+            fold_selection_rank_ic, fold_selection_rank_days = _daily_rank_ic(
+                validation_frame.loc[mask, "trade_date"],
+                fold_net_actual,
+                fold_ranking_score,
+            )
+            fold_relevance = np.asarray(validation_relevance, dtype=float)[mask]
+            fold_ndcg_at_3, fold_ndcg_days = _daily_ndcg(
+                validation_frame.loc[mask, "trade_date"],
+                fold_relevance,
+                fold_ranking_score,
+                k=3,
+            )
+            fold_ndcg_at_8, _ = _daily_ndcg(
+                validation_frame.loc[mask, "trade_date"],
+                fold_relevance,
+                fold_ranking_score,
+                k=8,
+            )
+            fold_return_ndcg_at_3, _ = _daily_ndcg(
+                validation_frame.loc[mask, "trade_date"],
+                fold_relevance,
+                fold_prediction,
+                k=3,
+            )
+            fold_return_ndcg_at_8, _ = _daily_ndcg(
+                validation_frame.loc[mask, "trade_date"],
+                fold_relevance,
+                fold_prediction,
+                k=8,
+            )
+            fold_top_n = _top_n_validation_metrics(
+                validation_frame.loc[mask],
+                fold_actual,
+                fold_ranking_score,
+                horizon=horizon,
+                budget_yuan=budget_yuan,
+                scenario=cost_scenario,
+                top_n=validation_top_n,
+                trading_settings=config.get("jiaoyi", {}),
+            )
+            fold_direction_labels = (fold_actual > 0).astype(int)
+            fold_raw_probability = np.asarray(validation_direction_probability, dtype=float)[mask]
+            fold_brier = float(brier_score_loss(fold_direction_labels, fold_raw_probability))
+            fold_baseline_brier = float(
+                np.mean((fold_direction_labels - training_positive_rate) ** 2)
+            )
+            fold_brier_skill = (
+                1.0 - fold_brier / fold_baseline_brier
+                if fold_baseline_brier > 0
+                else 0.0
+            )
+            fold_selection_passed = bool(
+                fold_selection_rank_ic >= 0
+                and fold_selection_rank_days >= minimum_rank_days
+                and fold_ndcg_at_3 >= fold_return_ndcg_at_3
+                and fold_ndcg_at_8 >= fold_return_ndcg_at_8
+                and fold_top_n["top_n_days"] >= minimum_top_n_days
+                and fold_top_n["top_n_mean_net_return"] > 0
+                and fold_top_n["top_n_mean_excess_vs_universe"] > 0
+            )
+            fold_return_passed = bool(
+                float(fold_return_baselines["skill_vs_best_naive_baseline"]) > 0
+                and fold_brier_skill > 0
+                and fold_direction >= 0.50
+            )
             temporal_folds.append(
                 {
                     "fold": fold_number,
+                    "role": "final_holdout"
+                    if fold_number == subwindow_count
+                    else "stability_validation",
                     "status": "ok",
-                    "fold_passed": bool(fold_direction >= 0.50 and fold_skill > 0 and fold_rank_ic >= 0),
+                    "fold_passed": bool(fold_selection_passed and fold_return_passed),
+                    "selection_passed": fold_selection_passed,
+                    "return_passed": fold_return_passed,
                     "direction_accuracy": fold_direction,
                     "skill_vs_median_baseline": fold_skill,
-                    "mean_daily_rank_ic": fold_rank_ic,
+                    "skill_vs_best_naive_baseline": fold_return_baselines[
+                        "skill_vs_best_naive_baseline"
+                    ],
+                    "mean_daily_rank_ic": fold_selection_rank_ic,
+                    "return_model_mean_daily_rank_ic": fold_return_rank_ic,
+                    "return_model_rank_ic_days": int(fold_return_rank_days),
+                    "selection_rank_ic_days": int(fold_selection_rank_days),
+                    "probability_brier_skill_vs_historical_rate": round(
+                        fold_brier_skill,
+                        6,
+                    ),
+                    "ndcg_at_3": round(fold_ndcg_at_3, 6),
+                    "ndcg_at_8": round(fold_ndcg_at_8, 6),
+                    "ndcg_days": int(fold_ndcg_days),
+                    **fold_top_n,
                 }
             )
+        successful_subwindows = [item for item in temporal_folds if item.get("status") == "ok"]
+        selection_passed_subwindows = sum(
+            bool(item.get("selection_passed")) for item in successful_subwindows
+        )
+        return_passed_subwindows = sum(
+            bool(item.get("return_passed")) for item in successful_subwindows
+        )
+        final_subwindow = next(
+            (item for item in successful_subwindows if item.get("role") == "final_holdout"),
+            None,
+        )
+        selection_stability_passed = bool(
+            len(successful_subwindows) == subwindow_count
+            and selection_passed_subwindows >= minimum_passed_subwindows
+            and final_subwindow
+            and final_subwindow.get("selection_passed")
+        )
+        return_stability_passed = bool(
+            len(successful_subwindows) == subwindow_count
+            and return_passed_subwindows >= minimum_passed_subwindows
+            and final_subwindow
+            and final_subwindow.get("return_passed")
+        )
+        selection_validation_passed = bool(
+            selection_validation_passed and selection_stability_passed
+        )
+        return_validation_passed = bool(
+            return_validation_passed and return_stability_passed
+        )
+        validation_passed = bool(selection_validation_passed and return_validation_passed)
         regime_column = (
             "market_csi300_ret_20"
             if "market_csi300_ret_20" in validation_frame.columns
@@ -1938,7 +2314,7 @@ def xunlian_yuce_moxing(
                     f"board_neutral_excess_return_plus_modelled_board_baseline_t{horizon};"
                     "ranking_target=daily_cost_adjusted_return_relevance"
                 ),
-                split_method="chronological_purged_holdout_with_three_oos_stability_subwindows",
+                split_method="chronological_purged_holdout_with_six_oos_stability_subwindows",
                 model_config=model_config,
             ),
             "direction_model": {
@@ -1957,7 +2333,30 @@ def xunlian_yuce_moxing(
             },
             "direction_probability_calibration": probability_calibration,
             "conformal_diagnostics": conformal_diagnostics,
+            "quantile_interval_model": {
+                "validation": validation_quantile_model,
+                "production": production_quantile_model,
+            },
+            "cqr_diagnostics": cqr_diagnostics,
+            "preferred_interval_method": (
+                "rolling_conformalized_quantile_regression"
+                if cqr_diagnostics.get("status") == "ok"
+                else conformal_diagnostics.get("method")
+            ),
             "fold_stability": _fold_stability(temporal_folds),
+            "subwindow_validation": {
+                "requested": int(subwindow_count),
+                "completed": int(len(successful_subwindows)),
+                "minimum_passed": int(minimum_passed_subwindows),
+                "selection_passed": int(selection_passed_subwindows),
+                "return_passed": int(return_passed_subwindows),
+                "final_holdout_selection_passed": bool(
+                    final_subwindow and final_subwindow.get("selection_passed")
+                ),
+                "final_holdout_return_passed": bool(
+                    final_subwindow and final_subwindow.get("return_passed")
+                ),
+            },
             "market_regime_stability": _regime_stability(regime_oof, regime_column=regime_column),
             "excess_prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
             "gross_prediction_clip": [round(gross_clip_low, 6), round(gross_clip_high, 6)],
@@ -2164,6 +2563,26 @@ def _prediction_rows(
             direction_probability = _round_optional(row.get(f"direction_prob_t{horizon}"), 6)
             conformal_low = _round_optional(row.get(f"conformal_low_t{horizon}"), 6)
             conformal_high = _round_optional(row.get(f"conformal_high_t{horizon}"), 6)
+            quantile_low = _round_optional(row.get(f"quantile_low_t{horizon}"), 6)
+            quantile_median = _round_optional(row.get(f"quantile_median_t{horizon}"), 6)
+            quantile_high = _round_optional(row.get(f"quantile_high_t{horizon}"), 6)
+            cqr_low = _round_optional(row.get(f"cqr_low_t{horizon}"), 6)
+            cqr_high = _round_optional(row.get(f"cqr_high_t{horizon}"), 6)
+            preferred_interval = (
+                [cqr_low, cqr_high]
+                if cqr_low is not None and cqr_high is not None
+                else [conformal_low, conformal_high]
+                if conformal_low is not None and conformal_high is not None
+                else None
+            )
+            preferred_net_interval = (
+                [
+                    round(_apply_cost(float(value), stock_cost_rate), 6)
+                    for value in preferred_interval
+                ]
+                if preferred_interval is not None and stock_cost_rate is not None
+                else None
+            )
             # The reference path starts at the signal close.  The first
             # sellable exit spans the T+1 entry session and T+2 exit session,
             # hence horizon + 1 daily-limit steps.
@@ -2191,6 +2610,19 @@ def _prediction_rows(
                 "conformal_return_interval_80": [conformal_low, conformal_high]
                 if conformal_low is not None and conformal_high is not None
                 else None,
+                "quantile_return_estimates": {
+                    "q10": quantile_low,
+                    "q50": quantile_median,
+                    "q90": quantile_high,
+                },
+                "conformalized_quantile_return_interval_80": [cqr_low, cqr_high]
+                if cqr_low is not None and cqr_high is not None
+                else None,
+                "preferred_return_interval_80": preferred_interval,
+                "preferred_net_return_interval_80": preferred_net_interval,
+                "preferred_return_interval_method": quality.get(
+                    "preferred_interval_method"
+                ),
                 "predicted_close": None,
                 "predicted_close_unavailable_reason": "实际T+1开盘价尚未知，不能把模型收益可靠换算成目标收盘价",
                 "signal_close_reference_price": _round_price_tick(close),
@@ -2717,9 +3149,11 @@ def bankuai_xuangu(
         if item["position_and_cost"]["execution_feasible"]
         and item["weighted_expected_net_return"] is not None
         and math.isfinite(float(item["weighted_expected_net_return"]))
+        and float(item["weighted_expected_net_return"]) > 0
         and item["selection_score"] is not None
         and math.isfinite(float(item["selection_score"]))
         and item["strongest_forecast_horizon"] is not None
+        and item.get("model_recommendation", {}).get("decision") == "recommend"
     ]
     current_selection_id = _selection_sequence_id(
         board_meta=board_meta,
@@ -2811,7 +3245,9 @@ def bankuai_xuangu(
         "validated_candidate_count": int(len(validated_candidates)),
         "validated_candidate_total": int(len(validated_eligible)),
         "recommendation_mode": (
-            "selection_and_return_validated"
+            "no_positive_after_cost_candidate"
+            if not recommendation_pool
+            else "selection_and_return_validated"
             if validated_eligible
             else "selection_validated_return_low_confidence"
             if selection_passed_horizon_labels
@@ -2840,7 +3276,8 @@ def bankuai_xuangu(
                 "收益模型预测板块中性超额收益，并与独立市场/板块基准预测合成为总收益",
                 "有通过选股验证的周期时优先使用这些周期计算排名，否则使用全部配置周期",
                 "给定测算资金必须覆盖所属板块最低申报数量，且不超过配置的成交额参与率上限",
-                "所有入选股票都返回T+1、T+2、T+3成本前后收益预测",
+                "只有加权成本后预测收益为正且可执行的股票进入推荐名单；其余股票仍保留在model_ranking中",
+                "所有推荐股票都返回T+1、T+2、T+3成本前后收益预测",
                 "selection_confidence与return_confidence独立展示；低可信度不隐藏可用预测",
             ],
             "abstention_thresholds": {
@@ -2900,21 +3337,25 @@ def bankuai_xuangu(
         "scope_note": "产品永久只做日K分析与三交易日内选股和收益预测；验证质量用于标记预测可信度，不再隐藏可用的模型估计。",
         "execution_policy": "analysis_only：只输出分析候选和预测，永不连接券商、永不提交订单、永不自动交易。",
     }
-    if not validated_eligible:
+    if recommendation_pool and not validated_eligible:
         if not passed_horizon_labels:
             result["no_validated_candidate_reason"] = "T+1、T+2、T+3 均未通过样本外验证。"
         else:
             result["no_validated_candidate_reason"] = "通过验证的周期内，没有股票同时满足原验证后候选门槛。"
         result["recommendation_notice"] = (
-            "当前没有验证后候选，已按模型预测收益返回低可信度推荐排序；"
+            "当前没有验证后候选，已返回加权成本后预测收益为正的低可信度模型推荐；"
             "每只股票仍包含完整T+1、T+2、T+3收益预测。"
         )
-    elif not validated_candidates:
+    elif recommendation_pool and not validated_candidates:
         result["recommendation_notice"] = "本页没有验证后候选，但仍按模型预测收益返回排序结果。"
     if not recommended_candidates:
-        result["no_recommended_candidate_reason"] = (
-            "候选序列已结束，或当前没有满足最低交易数量和成交容量要求的可排名股票。"
-        )
+        if recommendation_pool and offset >= len(recommendation_pool):
+            result["no_recommended_candidate_reason"] = "候选序列已结束。"
+        else:
+            result["no_recommended_candidate_reason"] = (
+                "当前没有同时满足执行约束且加权成本后预测收益为正的股票；"
+                "完整模型排名仍保留在model_ranking中。"
+            )
     if validation["overall_quality_label"] == "low":
         result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也只能视为低强度分析证据。"
     if run_dir:

@@ -24,11 +24,13 @@ from src.ashare.bankuai_yuce import (
     _experiment_fingerprint,
     _fit_direction_probabilities,
     _fit_model_components,
+    _fit_quantile_model_components,
     _fold_stability,
     _quality_label,
     _quality_score,
     _regime_stability,
     _rolling_conformal_interval,
+    _rolling_cqr_interval,
     _select_stable_features,
     _select_ensemble_weight,
     _top_n_validation_metrics,
@@ -783,7 +785,7 @@ def _add_single_stock_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 def _walk_forward_boundaries(dates: list[pd.Timestamp], config: dict[str, Any]) -> list[tuple[pd.Timestamp, pd.Timestamp | None]]:
     settings = config.get("dangu", {})
-    folds = max(2, int(settings.get("walk_forward_folds", 3)))
+    folds = max(2, int(settings.get("walk_forward_folds", 6)))
     requested_window = max(20, int(settings.get("validation_window_days", 45)))
     minimum_training_dates = max(80, int(settings.get("minimum_training_dates", 120)))
     available = len(dates) - minimum_training_dates
@@ -837,8 +839,8 @@ def _fit_single_stock_models(
     lower_q, upper_q = float(quantiles[0]), float(quantiles[1])
     minimum_train = int(single_config.get("min_fold_training_samples", model_config.get("min_training_samples", 500)))
     minimum_validation = int(single_config.get("min_fold_validation_samples", 80))
-    expected_folds = max(2, int(single_config.get("walk_forward_folds", 3)))
-    min_passed_folds = max(1, int(single_config.get("min_passed_folds", 2)))
+    expected_folds = max(2, int(single_config.get("walk_forward_folds", 6)))
+    min_passed_folds = max(1, int(single_config.get("min_passed_folds", 4)))
     validation_top_n = max(1, int(model_config.get("validation_top_n", 3)))
     cost_scenario_name = str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
     _, cost_scenario, _, _ = _load_cost_assumption(cost_scenario_name)
@@ -919,6 +921,12 @@ def _fit_single_stock_models(
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
             )
+            quantile_prediction, quantile_model = _fit_quantile_model_components(
+                train_features=train[fold_features],
+                train_target=y_train_raw,
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
             tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
             linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
             actual = validation_frame[target_column].astype(float).to_numpy()
@@ -983,6 +991,7 @@ def _fit_single_stock_models(
                         6,
                     ),
                 },
+                "quantile_interval_model": quantile_model,
                 "model_ensemble": {
                     **ensemble_diagnostics,
                     "weight_uses_only_prior_folds": True,
@@ -1007,6 +1016,10 @@ def _fit_single_stock_models(
             oof["tree_prediction"] = tree_prediction
             oof["linear_prediction"] = linear_prediction
             oof["raw_direction_probability"] = raw_direction_probability
+            if quantile_prediction:
+                oof["quantile_lower"] = quantile_prediction["lower"]
+                oof["quantile_median"] = quantile_prediction["median"]
+                oof["quantile_upper"] = quantile_prediction["upper"]
             oof_frames.append(oof)
             prior_actual.append(actual)
             prior_tree_prediction.append(tree_prediction)
@@ -1018,6 +1031,8 @@ def _fit_single_stock_models(
         final_clip_low = None
         final_clip_high = None
         latest_raw_direction_probability = None
+        latest_quantile_prediction: dict[str, np.ndarray] = {}
+        production_quantile_model: dict[str, Any] = {"status": "unavailable"}
         production_factor_selection: dict[str, Any] | None = None
         production_features: list[str] = []
         if len(usable) >= minimum_train:
@@ -1047,6 +1062,14 @@ def _fit_single_stock_models(
                 train_target=full_y,
                 predict_features=latest[production_features],
                 model_config=model_config,
+            )
+            latest_quantile_prediction, production_quantile_model = (
+                _fit_quantile_model_components(
+                    train_features=usable[production_features],
+                    train_target=full_y,
+                    predict_features=latest[production_features],
+                    model_config=model_config,
+                )
             )
             latest_raw_direction_probability = float(latest_direction_array[0])
             latest_tree_prediction = np.clip(
@@ -1109,6 +1132,7 @@ def _fit_single_stock_models(
                 if latest_raw_direction_probability is not None
                 else None,
             },
+            "production_quantile_interval_model": production_quantile_model,
         }
         if oof_frames and latest_prediction is not None:
             oof = pd.concat(oof_frames, ignore_index=True)
@@ -1160,6 +1184,32 @@ def _fit_single_stock_models(
                 dates=oof["trade_date"],
                 latest_prediction=float(latest_prediction),
                 model_config=model_config,
+            )
+            cqr_interval = None
+            cqr_diagnostics: dict[str, Any] = {
+                "status": "unavailable",
+                "reason": "分位数样本外预测不可用",
+            }
+            if (
+                {"quantile_lower", "quantile_upper"}.issubset(oof.columns)
+                and latest_quantile_prediction
+            ):
+                cqr_interval, cqr_diagnostics = _rolling_cqr_interval(
+                    actual=actual,
+                    lower_prediction=oof["quantile_lower"].to_numpy(dtype=float),
+                    upper_prediction=oof["quantile_upper"].to_numpy(dtype=float),
+                    dates=oof["trade_date"],
+                    latest_lower=float(latest_quantile_prediction["lower"][0]),
+                    latest_upper=float(latest_quantile_prediction["upper"][0]),
+                    model_config=model_config,
+                )
+            preferred_interval = cqr_interval or conformal_interval
+            preferred_interval_method = (
+                "rolling_conformalized_quantile_regression"
+                if cqr_interval
+                else "rolling_symmetric_conformal"
+                if conformal_interval
+                else "nearest_oos_empirical_quantile"
             )
             quality = _quality_score(
                 train_count=len(usable),
@@ -1213,6 +1263,32 @@ def _fit_single_stock_models(
                 if conformal_interval
                 else None,
                 "conformal_diagnostics": conformal_diagnostics,
+                "quantile_prediction_interval_80": [
+                    round(float(latest_quantile_prediction["lower"][0]), 6),
+                    round(float(latest_quantile_prediction["upper"][0]), 6),
+                ]
+                if latest_quantile_prediction
+                else None,
+                "quantile_median_prediction": round(
+                    float(latest_quantile_prediction["median"][0]), 6
+                )
+                if latest_quantile_prediction
+                else None,
+                "conformalized_quantile_prediction_interval_80": [
+                    round(float(value), 6) for value in cqr_interval
+                ]
+                if cqr_interval
+                else None,
+                "cqr_diagnostics": cqr_diagnostics,
+                "preferred_prediction_interval_80": [
+                    round(float(value), 6) for value in preferred_interval
+                ]
+                if preferred_interval
+                else [
+                    round(float(empirical_low), 6),
+                    round(float(empirical_high), 6),
+                ],
+                "preferred_prediction_interval_method": preferred_interval_method,
                 "fold_stability": _fold_stability(fold_records),
                 "market_regime_stability": _regime_stability(oof, regime_column=regime_column),
                 "quality_score": round(quality, 4),
@@ -1293,8 +1369,8 @@ def _fit_future_session_models(
         single_config.get("min_fold_training_samples", model_config.get("min_training_samples", 500))
     )
     minimum_validation = int(single_config.get("min_fold_validation_samples", 80))
-    expected_folds = max(2, int(single_config.get("walk_forward_folds", 3)))
-    min_passed_folds = max(1, int(single_config.get("min_passed_folds", 2)))
+    expected_folds = max(2, int(single_config.get("walk_forward_folds", 6)))
+    min_passed_folds = max(1, int(single_config.get("min_passed_folds", 4)))
     minimum_direction = float(model_config.get("min_direction_accuracy", 0.52))
     minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
     minimum_rank_days = int(model_config.get("min_rank_ic_days", 10))
@@ -1381,6 +1457,12 @@ def _fit_future_session_models(
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
             )
+            quantile_prediction, quantile_model = _fit_quantile_model_components(
+                train_features=train[fold_features],
+                train_target=y_train_raw,
+                predict_features=validation_frame[fold_features],
+                model_config=model_config,
+            )
             tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
             linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
             actual = validation_frame[target_column].astype(float).to_numpy()
@@ -1424,6 +1506,7 @@ def _fit_future_session_models(
                             6,
                         ),
                     },
+                    "quantile_interval_model": quantile_model,
                     "model_ensemble": {
                         **ensemble_diagnostics,
                         "weight_uses_only_prior_folds": True,
@@ -1445,6 +1528,10 @@ def _fit_future_session_models(
             oof["tree_prediction"] = tree_prediction
             oof["linear_prediction"] = linear_prediction
             oof["raw_direction_probability"] = raw_direction_probability
+            if quantile_prediction:
+                oof["quantile_lower"] = quantile_prediction["lower"]
+                oof["quantile_median"] = quantile_prediction["median"]
+                oof["quantile_upper"] = quantile_prediction["upper"]
             oof_frames.append(oof)
             prior_actual.append(actual)
             prior_tree_prediction.append(tree_prediction)
@@ -1456,6 +1543,8 @@ def _fit_future_session_models(
         final_clip_low = None
         final_clip_high = None
         latest_raw_direction_probability = None
+        latest_quantile_prediction: dict[str, np.ndarray] = {}
+        production_quantile_model: dict[str, Any] = {"status": "unavailable"}
         production_factor_selection: dict[str, Any] | None = None
         production_features: list[str] = []
         if len(usable) >= minimum_train:
@@ -1485,6 +1574,14 @@ def _fit_future_session_models(
                 train_target=full_y,
                 predict_features=latest[production_features],
                 model_config=model_config,
+            )
+            latest_quantile_prediction, production_quantile_model = (
+                _fit_quantile_model_components(
+                    train_features=usable[production_features],
+                    train_target=full_y,
+                    predict_features=latest[production_features],
+                    model_config=model_config,
+                )
             )
             latest_raw_direction_probability = float(latest_direction_array[0])
             latest_tree_prediction = np.clip(
@@ -1554,6 +1651,7 @@ def _fit_future_session_models(
                 if latest_raw_direction_probability is not None
                 else None,
             },
+            "production_quantile_interval_model": production_quantile_model,
         }
 
         if oof_frames and latest_prediction is not None:
@@ -1588,6 +1686,32 @@ def _fit_future_session_models(
                 dates=oof["trade_date"],
                 latest_prediction=float(latest_prediction),
                 model_config=model_config,
+            )
+            cqr_interval = None
+            cqr_diagnostics: dict[str, Any] = {
+                "status": "unavailable",
+                "reason": "分位数样本外预测不可用",
+            }
+            if (
+                {"quantile_lower", "quantile_upper"}.issubset(oof.columns)
+                and latest_quantile_prediction
+            ):
+                cqr_interval, cqr_diagnostics = _rolling_cqr_interval(
+                    actual=actual,
+                    lower_prediction=oof["quantile_lower"].to_numpy(dtype=float),
+                    upper_prediction=oof["quantile_upper"].to_numpy(dtype=float),
+                    dates=oof["trade_date"],
+                    latest_lower=float(latest_quantile_prediction["lower"][0]),
+                    latest_upper=float(latest_quantile_prediction["upper"][0]),
+                    model_config=model_config,
+                )
+            preferred_interval = cqr_interval or conformal_interval
+            preferred_interval_method = (
+                "rolling_conformalized_quantile_regression"
+                if cqr_interval
+                else "rolling_symmetric_conformal"
+                if conformal_interval
+                else "nearest_oos_empirical_quantile"
             )
             quality = _quality_score(
                 train_count=len(usable),
@@ -1633,6 +1757,32 @@ def _fit_future_session_models(
                     if conformal_interval
                     else None,
                     "conformal_diagnostics": conformal_diagnostics,
+                    "quantile_prediction_interval_80": [
+                        round(float(latest_quantile_prediction["lower"][0]), 6),
+                        round(float(latest_quantile_prediction["upper"][0]), 6),
+                    ]
+                    if latest_quantile_prediction
+                    else None,
+                    "quantile_median_prediction": round(
+                        float(latest_quantile_prediction["median"][0]), 6
+                    )
+                    if latest_quantile_prediction
+                    else None,
+                    "conformalized_quantile_prediction_interval_80": [
+                        round(float(value), 6) for value in cqr_interval
+                    ]
+                    if cqr_interval
+                    else None,
+                    "cqr_diagnostics": cqr_diagnostics,
+                    "preferred_prediction_interval_80": [
+                        round(float(value), 6) for value in preferred_interval
+                    ]
+                    if preferred_interval
+                    else [
+                        round(float(empirical_low), 6),
+                        round(float(empirical_high), 6),
+                    ],
+                    "preferred_prediction_interval_method": preferred_interval_method,
                     "fold_stability": _fold_stability(fold_records),
                     "market_regime_stability": _regime_stability(oof, regime_column=regime_column),
                     "quality_score": round(quality, 4),
@@ -2038,12 +2188,22 @@ def yanjiu_dangu_yuce(
         net = _apply_cost(float(gross), stock_cost_rate) if gross is not None and stock_cost_rate is not None else None
         interval = metrics.get("prediction_interval_80")
         conformal_interval = metrics.get("conformal_prediction_interval_80")
+        quantile_interval = metrics.get("quantile_prediction_interval_80")
+        cqr_interval = metrics.get("conformalized_quantile_prediction_interval_80")
+        preferred_interval = (
+            metrics.get("preferred_prediction_interval_80")
+            or conformal_interval
+            or interval
+        )
         net_interval = [
             round(_apply_cost(float(value), stock_cost_rate), 6) for value in interval
         ] if interval and stock_cost_rate is not None else None
         conformal_net_interval = [
             round(_apply_cost(float(value), stock_cost_rate), 6) for value in conformal_interval
         ] if conformal_interval and stock_cost_rate is not None else None
+        preferred_net_interval = [
+            round(_apply_cost(float(value), stock_cost_rate), 6) for value in preferred_interval
+        ] if preferred_interval and stock_cost_rate is not None else None
         forecast[f"T+{horizon}"] = {
             "entry_to_exit_gross_return": round(float(gross), 6) if gross is not None else None,
             "entry_to_exit_gross_return_pct": round(float(gross) * 100.0, 3) if gross is not None else None,
@@ -2056,6 +2216,14 @@ def yanjiu_dangu_yuce(
             "empirical_net_return_interval_80": net_interval,
             "conformal_return_interval_80": conformal_interval,
             "conformal_net_return_interval_80": conformal_net_interval,
+            "quantile_return_interval_80": quantile_interval,
+            "quantile_median_return": metrics.get("quantile_median_prediction"),
+            "conformalized_quantile_return_interval_80": cqr_interval,
+            "preferred_return_interval_80": preferred_interval,
+            "preferred_net_return_interval_80": preferred_net_interval,
+            "preferred_return_interval_method": metrics.get(
+                "preferred_prediction_interval_method"
+            ),
             "validation_passed": bool(metrics.get("validation_passed")),
             "model_quality": metrics.get("quality_label", "low"),
             "position_and_cost": position_cost,
@@ -2078,7 +2246,13 @@ def yanjiu_dangu_yuce(
             metrics = future_validation.get("horizons", {}).get(f"T+{horizon}", {})
             interval = metrics.get("prediction_interval_80")
             conformal_interval = metrics.get("conformal_prediction_interval_80")
-            preferred_interval = conformal_interval or interval
+            quantile_interval = metrics.get("quantile_prediction_interval_80")
+            cqr_interval = metrics.get("conformalized_quantile_prediction_interval_80")
+            preferred_interval = (
+                metrics.get("preferred_prediction_interval_80")
+                or conformal_interval
+                or interval
+            )
             lower_price, upper_price = _price_limit_bounds(signal_close, limit_rate, horizon)
             predicted_close = None
             predicted_close_interval = None
@@ -2101,11 +2275,16 @@ def yanjiu_dangu_yuce(
                 ),
                 "predicted_close_reference": predicted_close,
                 "predicted_close_interval_80": predicted_close_interval,
-                "predicted_close_interval_method": (
-                    "rolling_split_conformal" if conformal_interval else "nearest_oos_empirical"
+                "predicted_close_interval_method": metrics.get(
+                    "preferred_prediction_interval_method",
+                    "nearest_oos_empirical_quantile",
                 ),
                 "empirical_return_interval_80": interval,
                 "conformal_return_interval_80": conformal_interval,
+                "quantile_return_interval_80": quantile_interval,
+                "quantile_median_return": metrics.get("quantile_median_prediction"),
+                "conformalized_quantile_return_interval_80": cqr_interval,
+                "preferred_return_interval_80": preferred_interval,
                 "empirical_positive_probability": metrics.get("latest_empirical_positive_probability"),
                 "direction_model_positive_probability": metrics.get("latest_direction_positive_probability"),
                 "direction_probability_method": metrics.get("direction_probability_method"),
@@ -2166,7 +2345,7 @@ def yanjiu_dangu_yuce(
             "model": "HistGradientBoostingRegressor + 稳健缩放Ridge的小型集成",
             "ensemble_weighting": "每个滚动折只使用更早折的样本外预测选权重；最终生产权重使用全部滚动样本外预测",
             "training_universe": "目标股票的当前同行优先，加少量全市场高流动性参考股票",
-            "validation": "三段扩展窗口、标签跨界清除的滚动样本外验证，最后一段作为最终保留测试窗口",
+            "validation": "六折扩展窗口、标签跨界清除的滚动样本外验证，最后一折作为最终保留测试窗口",
             "signal": "只使用已确认收盘的日线、同日精确匹配的历史估值、市场指数日K和当日横截面特征",
             "execution_scenario": "假设下一交易日开盘作为收益测算基准，并按A股T+1比较指定T+1/T+2/T+3收盘",
             "future_forecast": "另行预测从最近完整收盘到未来第1/2/3个交易日收盘，两类结果都只用于分析",

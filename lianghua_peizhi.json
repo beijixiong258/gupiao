@@ -20,12 +20,12 @@
     "min_listing_calendar_days": 180,
     "min_amount_yuan": 30000000,
     "request_pause_seconds": 0.08,
-    "walk_forward_folds": 3,
+    "walk_forward_folds": 6,
     "validation_window_days": 45,
     "minimum_training_dates": 120,
     "min_fold_training_samples": 500,
     "min_fold_validation_samples": 80,
-    "min_passed_folds": 2,
+    "min_passed_folds": 4,
     "min_feature_coverage": 0.2,
     "assessment_min_net_return": 0.003,
     "assessment_min_positive_probability": 0.55
@@ -59,6 +59,8 @@
     "min_skill_vs_best_naive_baseline": 0.01,
     "validation_top_n": 3,
     "min_top_n_days": 10,
+    "validation_subwindows": 6,
+    "min_passed_subwindows": 4,
     "ranking_enabled": true,
     "ranking_relevance_grades": 5,
     "ranking_pair_top_k": 8,
@@ -67,6 +69,12 @@
     "return_interval_coverage_range": [
       0.75,
       0.85
+    ],
+    "quantile_interval_enabled": true,
+    "quantile_levels": [
+      0.1,
+      0.5,
+      0.9
     ],
     "learning_rate": 0.05,
     "max_iter": 180,

@@ -155,6 +155,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             "min_rank_ic_days": 10,
             "validation_top_n": 3,
             "min_top_n_days": 10,
+            "validation_subwindows": 6,
+            "min_passed_subwindows": 4,
             "ensemble_min_calibration_samples": 80,
             "ensemble_min_calibration_dates": 20,
             "factor_stability_slices": 3,
@@ -198,6 +200,9 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         return_interval_coverage_range = [
             float(item) for item in model.get("return_interval_coverage_range", [0.75, 0.85])
         ]
+        quantile_levels = [
+            float(item) for item in model.get("quantile_levels", [0.10, 0.50, 0.90])
+        ]
     except (TypeError, ValueError) as exc:
         raise ValueError(f"moxing 数值配置无效：{exc}") from exc
     if not 0.05 <= validation_ratio <= 0.4:
@@ -216,6 +221,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.ranking_relevance_grades 必须在 2 到 31 之间")
     if positive_integer_fields["ranking_pair_top_k"] > 100:
         raise ValueError("moxing.ranking_pair_top_k 不能大于 100")
+    if positive_integer_fields["min_passed_subwindows"] > positive_integer_fields["validation_subwindows"]:
+        raise ValueError("moxing.min_passed_subwindows 不能大于 validation_subwindows")
     if positive_integer_fields["factor_min_valid_slices"] > positive_integer_fields["factor_stability_slices"]:
         raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
     if not 0.5 <= min_direction <= 1:
@@ -234,6 +241,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.factor_stability_enabled 必须是 true 或 false")
     if not isinstance(model.get("ranking_enabled", True), bool):
         raise ValueError("moxing.ranking_enabled 必须是 true 或 false")
+    if not isinstance(model.get("quantile_interval_enabled", True), bool):
+        raise ValueError("moxing.quantile_interval_enabled 必须是 true 或 false")
     if not 0 < model_feature_coverage <= 1:
         raise ValueError("moxing.min_feature_coverage 必须在 0 到 1 之间")
     if not 0.5 <= factor_min_sign_agreement <= 1:
@@ -255,6 +264,12 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         or not 0 < return_interval_coverage_range[0] < return_interval_coverage_range[1] < 1
     ):
         raise ValueError("moxing.return_interval_coverage_range 必须是两个递增的 0~1 数值")
+    if (
+        len(quantile_levels) != 3
+        or quantile_levels != sorted(quantile_levels)
+        or not 0 < quantile_levels[0] < quantile_levels[1] < quantile_levels[2] < 1
+    ):
+        raise ValueError("moxing.quantile_levels 必须是三个递增的 0~1 数值")
     if not math.isfinite(ridge_alpha) or ridge_alpha <= 0:
         raise ValueError("moxing.ridge_alpha 必须是正有限数")
     if not 0 <= ensemble_default_tree_weight <= 1:
@@ -320,8 +335,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         warehouse_maximum_peers = int(single.get("warehouse_max_peer_stocks", 60))
         warehouse_same_industry_peers = int(single.get("warehouse_same_industry_stocks", 45))
         minimum_peers = int(single.get("minimum_peer_stocks", 8))
-        walk_forward_folds = int(single.get("walk_forward_folds", 3))
-        minimum_passed_folds = int(single.get("min_passed_folds", 2))
+        walk_forward_folds = int(single.get("walk_forward_folds", 6))
+        minimum_passed_folds = int(single.get("min_passed_folds", 4))
         minimum_feature_coverage = float(single.get("min_feature_coverage", 0.2))
         minimum_net_return = float(single.get("assessment_min_net_return", 0.003))
         minimum_probability = float(single.get("assessment_min_positive_probability", 0.55))
