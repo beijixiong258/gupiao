@@ -540,6 +540,16 @@ def cmd_warehouse_sync(
         result = sync_function(**sync_kwargs)
     except Exception as exc:
         result = {"status": "error", "error": str(exc)}
+    if result.get("status") in {"ok", "partial"}:
+        try:
+            from src.ashare.yuce_liushui import settle_predictions
+
+            result["prediction_settlement"] = settle_predictions()
+        except Exception as exc:
+            result["prediction_settlement"] = {
+                "status": "error",
+                "error": f"预测流水账揭晓失败：{exc}",
+            }
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
     else:
@@ -601,6 +611,16 @@ def cmd_warehouse_update(
                 result["automatic_range"] = [start.isoformat(), expected.isoformat()]
     except Exception as exc:
         result = {"status": "error", "error": str(exc)}
+    if result.get("status") in {"ok", "partial"}:
+        try:
+            from src.ashare.yuce_liushui import settle_predictions
+
+            result["prediction_settlement"] = settle_predictions()
+        except Exception as exc:
+            result["prediction_settlement"] = {
+                "status": "error",
+                "error": f"预测流水账揭晓失败：{exc}",
+            }
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
     else:
@@ -614,6 +634,27 @@ def cmd_warehouse_enrich(*, json_mode: bool) -> int:
 
     try:
         result = enrich_latest_daily_basic()
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        console.print_json(json.dumps(result, ensure_ascii=False))
+    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
+
+
+def cmd_performance(
+    *,
+    window: int | None,
+    source_kind: str,
+    json_mode: bool,
+) -> int:
+    """Settle frozen forecasts and report genuine forward performance."""
+    from src.ashare.yuce_liushui import performance_report
+
+    try:
+        windows = [window] if window is not None else [20, 60, 120]
+        result = performance_report(windows=windows, source_kind=source_kind)
     except Exception as exc:
         result = {"status": "error", "error": str(exc)}
     if json_mode:
@@ -736,6 +777,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     warehouse_sync.add_argument("--json", action="store_true")
 
+    performance = sub.add_parser(
+        "performance",
+        help="揭晓已冻结预测并报告近20/60/120个交易日的真实表现",
+    )
+    performance.add_argument(
+        "--window",
+        type=int,
+        choices=[20, 60, 120],
+        help="只查看一个交易日窗口；默认同时返回20、60、120日",
+    )
+    performance.add_argument(
+        "--kind",
+        dest="source_kind",
+        choices=["all", "single", "board"],
+        default="all",
+        help="查看全部、单股或板块预测；默认全部",
+    )
+    performance.add_argument("--json", action="store_true")
+
     sub.add_parser("settings", help="查看当前运行配置")
     openai_login = sub.add_parser("openai-login", help="使用 ChatGPT OAuth 登录 OpenAI Provider")
     openai_login.add_argument("--no-browser", action="store_true", help="不自动打开登录网页")
@@ -804,6 +864,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             json_mode=args.json,
             price_only=args.price_only,
             workers=args.workers,
+        )
+    if args.command == "performance":
+        return cmd_performance(
+            window=args.window,
+            source_kind=args.source_kind,
+            json_mode=args.json,
         )
     if args.command == "settings":
         return cmd_settings()

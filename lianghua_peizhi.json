@@ -113,6 +113,17 @@
     "ensemble_min_calibration_samples": 80,
     "ensemble_calibration_ratio": 0.15,
     "ensemble_min_calibration_dates": 20,
+    "time_decay_enabled": true,
+    "time_decay_half_life_candidates": [
+      0,
+      252,
+      504
+    ],
+    "time_decay_calibration_ratio": 0.15,
+    "time_decay_min_calibration_dates": 20,
+    "time_decay_min_calibration_samples": 80,
+    "time_decay_min_relative_improvement": 0.002,
+    "time_decay_min_weight": 0.1,
     "random_state": 42,
     "prediction_clip_quantiles": [
       0.01,

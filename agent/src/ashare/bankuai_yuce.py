@@ -701,6 +701,138 @@ def _build_linear_model_pipeline(model_config: dict[str, Any]) -> Pipeline:
     )
 
 
+def _time_decay_weights(
+    dates: pd.Series | np.ndarray,
+    half_life_dates: float,
+    minimum_weight: float = 0.10,
+) -> np.ndarray:
+    """Return mean-one exponential weights based on trading-date age."""
+    values = pd.to_datetime(pd.Series(dates).reset_index(drop=True), errors="coerce").dt.normalize()
+    if values.empty or not math.isfinite(float(half_life_dates)) or float(half_life_dates) <= 0:
+        return np.ones(len(values), dtype=float)
+    ordered_dates = list(pd.Index(values.dropna().unique()).sort_values())
+    if not ordered_dates:
+        return np.ones(len(values), dtype=float)
+    age_by_date = {
+        pd.Timestamp(value): len(ordered_dates) - index - 1
+        for index, value in enumerate(ordered_dates)
+    }
+    ages = values.map(age_by_date).fillna(len(ordered_dates) - 1).to_numpy(dtype=float)
+    weights = np.power(0.5, ages / float(half_life_dates))
+    weights = np.maximum(weights, float(minimum_weight))
+    mean_weight = float(np.mean(weights))
+    return weights / mean_weight if mean_weight > 0 else np.ones(len(values), dtype=float)
+
+
+def _select_time_decay_half_life(
+    *,
+    train_features: pd.DataFrame,
+    train_target: np.ndarray,
+    train_dates: pd.Series | np.ndarray,
+    model_config: dict[str, Any],
+    train_target_dates: pd.Series | np.ndarray | None = None,
+) -> tuple[float, dict[str, Any]]:
+    """Choose recency weighting on a purged tail inside the active training window."""
+    if not model_config.get("time_decay_enabled", True):
+        return 0.0, {"status": "disabled", "selected_half_life_dates": 0.0}
+
+    candidates = sorted(
+        {
+            float(value)
+            for value in model_config.get("time_decay_half_life_candidates", [0, 252, 504])
+        }
+    )
+    signal_dates = pd.to_datetime(pd.Series(train_dates).reset_index(drop=True), errors="coerce").dt.normalize()
+    target = np.asarray(train_target, dtype=float)
+    if len(train_features) != len(signal_dates) or len(target) != len(signal_dates):
+        raise ValueError("时间衰减选择的特征、目标和日期长度不一致")
+    target_dates = (
+        pd.to_datetime(pd.Series(train_target_dates).reset_index(drop=True), errors="coerce").dt.normalize()
+        if train_target_dates is not None
+        else signal_dates
+    )
+    unique_dates = [pd.Timestamp(value) for value in sorted(signal_dates.dropna().unique())]
+    ratio = float(model_config.get("time_decay_calibration_ratio", 0.15))
+    minimum_dates = int(model_config.get("time_decay_min_calibration_dates", 20))
+    minimum_samples = int(model_config.get("time_decay_min_calibration_samples", 80))
+    fallback = {
+        "status": "insufficient_nested_data",
+        "selection_scope": "purged_tail_of_active_training_only",
+        "selected_half_life_dates": 0.0,
+        "candidate_half_life_dates": candidates,
+    }
+    if len(unique_dates) < minimum_dates * 2:
+        fallback["training_dates"] = int(len(unique_dates))
+        return 0.0, fallback
+
+    calibration_date_count = max(minimum_dates, int(len(unique_dates) * ratio))
+    calibration_date_count = min(calibration_date_count, len(unique_dates) - minimum_dates)
+    cutoff = unique_dates[-calibration_date_count]
+    inner_mask = signal_dates.lt(cutoff) & target_dates.lt(cutoff)
+    calibration_mask = signal_dates.ge(cutoff)
+    if int(inner_mask.sum()) < minimum_samples or int(calibration_mask.sum()) < minimum_samples:
+        fallback.update(
+            {
+                "calibration_start": cutoff.strftime("%Y-%m-%d"),
+                "nested_train_samples": int(inner_mask.sum()),
+                "nested_calibration_samples": int(calibration_mask.sum()),
+            }
+        )
+        return 0.0, fallback
+
+    inner_features = train_features.reset_index(drop=True).loc[inner_mask.to_numpy()]
+    calibration_features = train_features.reset_index(drop=True).loc[calibration_mask.to_numpy()]
+    inner_target = target[inner_mask.to_numpy()]
+    calibration_target = target[calibration_mask.to_numpy()]
+    minimum_weight = float(model_config.get("time_decay_min_weight", 0.10))
+    candidate_mae: dict[str, float] = {}
+    for candidate in candidates:
+        try:
+            model = _build_linear_model_pipeline(model_config)
+            sample_weight = _time_decay_weights(
+                signal_dates.loc[inner_mask],
+                candidate,
+                minimum_weight,
+            )
+            model.fit(inner_features, inner_target, model__sample_weight=sample_weight)
+            prediction = np.asarray(model.predict(calibration_features), dtype=float)
+            candidate_mae[f"{candidate:g}"] = float(mean_absolute_error(calibration_target, prediction))
+        except Exception:
+            continue
+    baseline_mae = candidate_mae.get("0")
+    if baseline_mae is None or not candidate_mae:
+        fallback.update(
+            {
+                "status": "selection_failed",
+                "calibration_start": cutoff.strftime("%Y-%m-%d"),
+                "candidate_mae": {key: round(value, 8) for key, value in candidate_mae.items()},
+            }
+        )
+        return 0.0, fallback
+
+    best_key, best_mae = min(candidate_mae.items(), key=lambda item: item[1])
+    best_half_life = float(best_key)
+    relative_improvement = (
+        (baseline_mae - best_mae) / abs(baseline_mae)
+        if abs(baseline_mae) > 1e-12
+        else 0.0
+    )
+    minimum_improvement = float(model_config.get("time_decay_min_relative_improvement", 0.002))
+    selected = best_half_life if best_half_life > 0 and relative_improvement >= minimum_improvement else 0.0
+    return selected, {
+        "status": "selected" if selected > 0 else "kept_uniform_weights",
+        "selection_scope": "purged_tail_of_active_training_only",
+        "calibration_start": cutoff.strftime("%Y-%m-%d"),
+        "nested_train_samples": int(inner_mask.sum()),
+        "nested_calibration_samples": int(calibration_mask.sum()),
+        "candidate_mae": {key: round(value, 8) for key, value in candidate_mae.items()},
+        "best_candidate_half_life_dates": best_half_life,
+        "relative_mae_improvement": round(float(relative_improvement), 8),
+        "minimum_relative_improvement": minimum_improvement,
+        "selected_half_life_dates": selected,
+    }
+
+
 def _build_quantile_model_pipeline(
     model_config: dict[str, Any],
     quantile: float,
@@ -733,6 +865,7 @@ def _fit_quantile_model_components(
     train_target: np.ndarray,
     predict_features: pd.DataFrame,
     model_config: dict[str, Any],
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     levels = [
         float(value)
@@ -743,9 +876,10 @@ def _fit_quantile_model_components(
     if levels != sorted(levels) or len(levels) != 3:
         raise ValueError("moxing.quantile_levels 必须是三个递增分位数")
     raw_predictions: list[np.ndarray] = []
+    fit_kwargs = {"model__sample_weight": np.asarray(sample_weight, dtype=float)} if sample_weight is not None else {}
     for level in levels:
         model = _build_quantile_model_pipeline(model_config, level)
-        model.fit(train_features, np.asarray(train_target, dtype=float))
+        model.fit(train_features, np.asarray(train_target, dtype=float), **fit_kwargs)
         raw_predictions.append(
             np.asarray(model.predict(predict_features), dtype=float)
         )
@@ -775,11 +909,13 @@ def _fit_model_components(
     train_target: np.ndarray,
     predict_features: pd.DataFrame,
     model_config: dict[str, Any],
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     tree = _build_model_pipeline(model_config)
     linear = _build_linear_model_pipeline(model_config)
-    tree.fit(train_features, train_target)
-    linear.fit(train_features, train_target)
+    fit_kwargs = {"model__sample_weight": np.asarray(sample_weight, dtype=float)} if sample_weight is not None else {}
+    tree.fit(train_features, train_target, **fit_kwargs)
+    linear.fit(train_features, train_target, **fit_kwargs)
     return (
         np.asarray(tree.predict(predict_features), dtype=float),
         np.asarray(linear.predict(predict_features), dtype=float),
@@ -792,6 +928,7 @@ def _fit_market_baseline(
     predict: pd.DataFrame,
     target_column: str,
     model_config: dict[str, Any],
+    time_decay_half_life: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Predict the board-wide return separately from stock-specific excess return."""
     candidate_features = [
@@ -830,7 +967,16 @@ def _fit_market_baseline(
             "constant_return": round(fallback, 6),
         }
     model = _build_model_pipeline(model_config)
-    model.fit(date_level[feature_columns], date_level[target_column].to_numpy(dtype=float))
+    sample_weight = _time_decay_weights(
+        date_level["trade_date"],
+        time_decay_half_life,
+        float(model_config.get("time_decay_min_weight", 0.10)),
+    )
+    model.fit(
+        date_level[feature_columns],
+        date_level[target_column].to_numpy(dtype=float),
+        model__sample_weight=sample_weight,
+    )
     prediction = np.asarray(model.predict(predict[feature_columns]), dtype=float)
     return prediction, {
         "status": "modelled",
@@ -838,6 +984,7 @@ def _fit_market_baseline(
         "training_dates": int(len(date_level)),
         "features": feature_columns,
         "target": "同一交易日板块股票平均持有期收益",
+        "time_decay_half_life_dates": float(time_decay_half_life),
     }
 
 
@@ -895,6 +1042,7 @@ def _fit_ranking_model(
     feature_columns: list[str],
     net_target: np.ndarray,
     model_config: dict[str, Any],
+    time_decay_half_life: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Fit one LambdaMART ranker with each signal date used as a qid group."""
     try:
@@ -936,7 +1084,19 @@ def _fit_ranking_model(
         n_jobs=-1,
         verbosity=0,
     )
-    ranker.fit(train_values, relevance, qid=qid, verbose=False)
+    group_dates = work["trade_date"].drop_duplicates().reset_index(drop=True)
+    group_weight = _time_decay_weights(
+        group_dates,
+        time_decay_half_life,
+        float(model_config.get("time_decay_min_weight", 0.10)),
+    )
+    ranker.fit(
+        train_values,
+        relevance,
+        qid=qid,
+        sample_weight=group_weight,
+        verbose=False,
+    )
     prediction = np.asarray(ranker.predict(predict_values), dtype=float)
     return prediction, {
         "status": "ok",
@@ -948,6 +1108,7 @@ def _fit_ranking_model(
         "pairs_per_sample": int(pair_top_k),
         "metrics": ["NDCG@3", "NDCG@8"],
         "target": "同一交易日股票未来成本后收益的分档排名",
+        "time_decay_half_life_dates": float(time_decay_half_life),
     }
 
 
@@ -1083,6 +1244,7 @@ def _fit_direction_probabilities(
     train_target: np.ndarray,
     predict_features: pd.DataFrame,
     model_config: dict[str, Any],
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     labels = (np.asarray(train_target, dtype=float) > 0).astype(int)
     if len(np.unique(labels)) < 2:
@@ -1107,7 +1269,8 @@ def _fit_direction_probabilities(
         ]
     )
     try:
-        model.fit(train_features, labels)
+        fit_kwargs = {"model__sample_weight": np.asarray(sample_weight, dtype=float)} if sample_weight is not None else {}
+        model.fit(train_features, labels, **fit_kwargs)
         probability = np.asarray(model.predict_proba(predict_features)[:, 1], dtype=float)
         return probability, {
             "status": "ok",
@@ -1543,6 +1706,7 @@ def _nested_training_ensemble_weight(
     clip_low: float,
     clip_high: float,
     model_config: dict[str, Any],
+    time_decay_half_life: float = 0.0,
 ) -> tuple[float, dict[str, Any]]:
     """Calibrate a holdout-safe ensemble weight on the tail of the training period."""
     dates = [pd.Timestamp(value) for value in sorted(train["trade_date"].dropna().unique())]
@@ -1580,6 +1744,11 @@ def _nested_training_ensemble_weight(
         train_target=inner_target,
         predict_features=calibration[feature_columns],
         model_config=model_config,
+        sample_weight=_time_decay_weights(
+            inner_train["trade_date"],
+            time_decay_half_life,
+            float(model_config.get("time_decay_min_weight", 0.10)),
+        ),
     )
     tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
     linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
@@ -1744,6 +1913,18 @@ def xunlian_yuce_moxing(
         )
         if not validation_features:
             raise RuntimeError(f"T+{horizon} 训练窗口没有稳定可用因子")
+        validation_decay_half_life, validation_time_decay = _select_time_decay_half_life(
+            train_features=train[validation_features],
+            train_target=y_train,
+            train_dates=train["trade_date"],
+            train_target_dates=train[target_date_column],
+            model_config=model_config,
+        )
+        validation_sample_weight = _time_decay_weights(
+            train["trade_date"],
+            validation_decay_half_life,
+            float(model_config.get("time_decay_min_weight", 0.10)),
+        )
         validation_tree_weight, validation_ensemble = _nested_training_ensemble_weight(
             train=train,
             feature_columns=validation_features,
@@ -1752,24 +1933,28 @@ def xunlian_yuce_moxing(
             clip_low=clip_low,
             clip_high=clip_high,
             model_config=model_config,
+            time_decay_half_life=validation_decay_half_life,
         )
         validation_tree_prediction, validation_linear_prediction = _fit_model_components(
             train_features=train[validation_features],
             train_target=y_train,
             predict_features=validation_frame[validation_features],
             model_config=model_config,
+            sample_weight=validation_sample_weight,
         )
         validation_direction_probability, validation_direction_model = _fit_direction_probabilities(
             train_features=train[validation_features],
             train_target=y_train_raw,
             predict_features=validation_frame[validation_features],
             model_config=model_config,
+            sample_weight=validation_sample_weight,
         )
         validation_quantile_prediction, validation_quantile_model = _fit_quantile_model_components(
             train_features=train[validation_features],
             train_target=y_train_raw,
             predict_features=validation_frame[validation_features],
             model_config=model_config,
+            sample_weight=validation_sample_weight,
         )
         validation_tree_prediction = np.clip(validation_tree_prediction, clip_low, clip_high)
         validation_linear_prediction = np.clip(validation_linear_prediction, clip_low, clip_high)
@@ -1787,6 +1972,7 @@ def xunlian_yuce_moxing(
             predict=validation_frame,
             target_column=target_column,
             model_config=model_config,
+            time_decay_half_life=validation_decay_half_life,
         )
         gross_clip_low = float(np.nanquantile(y_train_raw, lower_q))
         gross_clip_high = float(np.nanquantile(y_train_raw, upper_q))
@@ -1839,6 +2025,7 @@ def xunlian_yuce_moxing(
                 feature_columns=validation_features,
                 net_target=train_net_actual,
                 model_config=model_config,
+                time_decay_half_life=validation_decay_half_life,
             )
         else:
             validation_ranking_score = validation_prediction.copy()
@@ -1923,6 +2110,18 @@ def xunlian_yuce_moxing(
         )
         if not production_features:
             raise RuntimeError(f"T+{horizon} 全量训练窗口没有稳定可用因子")
+        production_decay_half_life, production_time_decay = _select_time_decay_half_life(
+            train_features=usable[production_features],
+            train_target=np.clip(y_full_excess_raw, final_clip_low, final_clip_high),
+            train_dates=usable["trade_date"],
+            train_target_dates=usable[target_date_column],
+            model_config=model_config,
+        )
+        production_sample_weight = _time_decay_weights(
+            usable["trade_date"],
+            production_decay_half_life,
+            float(model_config.get("time_decay_min_weight", 0.10)),
+        )
         production_tree_weight, production_ensemble = _select_ensemble_weight(
             y_validation_excess,
             validation_tree_prediction,
@@ -1934,18 +2133,21 @@ def xunlian_yuce_moxing(
             train_target=np.clip(y_full_excess_raw, final_clip_low, final_clip_high),
             predict_features=latest[production_features],
             model_config=model_config,
+            sample_weight=production_sample_weight,
         )
         production_direction_probability, production_direction_model = _fit_direction_probabilities(
             train_features=usable[production_features],
             train_target=y_full_raw,
             predict_features=latest[production_features],
             model_config=model_config,
+            sample_weight=production_sample_weight,
         )
         production_quantile_prediction, production_quantile_model = _fit_quantile_model_components(
             train_features=usable[production_features],
             train_target=y_full_raw,
             predict_features=latest[production_features],
             model_config=model_config,
+            sample_weight=production_sample_weight,
         )
         production_tree_prediction = np.clip(
             production_tree_prediction, final_clip_low, final_clip_high
@@ -1967,6 +2169,7 @@ def xunlian_yuce_moxing(
             predict=latest,
             target_column=target_column,
             model_config=model_config,
+            time_decay_half_life=production_decay_half_life,
         )
         latest_prediction = np.clip(
             latest_excess_prediction + latest_market_prediction,
@@ -2003,6 +2206,7 @@ def xunlian_yuce_moxing(
                 feature_columns=production_features,
                 net_target=full_net_actual,
                 model_config=model_config,
+                time_decay_half_life=production_decay_half_life,
             )
         else:
             latest_ranking_score = latest_prediction.copy()
@@ -2358,6 +2562,11 @@ def xunlian_yuce_moxing(
                 ),
             },
             "market_regime_stability": _regime_stability(regime_oof, regime_column=regime_column),
+            "time_decay": {
+                "validation_training_window": validation_time_decay,
+                "production_training_window": production_time_decay,
+                "weighting_rule": "按交易日年龄指数衰减，权重均值归一为1；半衰期只在当前训练窗的净化尾部选择",
+            },
             "excess_prediction_clip": [round(clip_low, 6), round(clip_high, 6)],
             "gross_prediction_clip": [round(gross_clip_low, 6), round(gross_clip_high, 6)],
             "final_excess_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)],
@@ -3358,6 +3567,19 @@ def bankuai_xuangu(
             )
     if validation["overall_quality_label"] == "low":
         result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也只能视为低强度分析证据。"
+    try:
+        from src.ashare.yuce_liushui import record_board_predictions, settle_predictions
+
+        ledger_record = record_board_predictions(result)
+        result["prediction_ledger"] = {
+            **ledger_record,
+            "settlement": settle_predictions(),
+        }
+    except Exception as exc:
+        result["prediction_ledger"] = {
+            "status": "error",
+            "error": f"预测流水账写入失败：{exc}",
+        }
     if run_dir:
         try:
             result["artifacts"] = _save_artifacts(run_dir, result)

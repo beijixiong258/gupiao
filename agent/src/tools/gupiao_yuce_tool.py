@@ -184,6 +184,15 @@ def build_requested_forecast(
                 "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
                 "empirical_return_interval_80": raw_forecast.get("empirical_return_interval_80"),
                 "conformal_return_interval_80": raw_forecast.get("conformal_return_interval_80"),
+                "quantile_return_interval_80": raw_forecast.get("quantile_return_interval_80"),
+                "quantile_median_return": raw_forecast.get("quantile_median_return"),
+                "conformalized_quantile_return_interval_80": raw_forecast.get(
+                    "conformalized_quantile_return_interval_80"
+                ),
+                "preferred_return_interval_80": raw_forecast.get("preferred_return_interval_80"),
+                "preferred_return_interval_method": raw_forecast.get(
+                    "predicted_close_interval_method"
+                ),
             }
         else:
             published_forecast = {
@@ -200,6 +209,18 @@ def build_requested_forecast(
                 "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
                 "empirical_net_return_interval_80": raw_forecast.get("empirical_net_return_interval_80"),
                 "conformal_net_return_interval_80": raw_forecast.get("conformal_net_return_interval_80"),
+                "quantile_return_interval_80": raw_forecast.get("quantile_return_interval_80"),
+                "quantile_median_return": raw_forecast.get("quantile_median_return"),
+                "conformalized_quantile_return_interval_80": raw_forecast.get(
+                    "conformalized_quantile_return_interval_80"
+                ),
+                "preferred_return_interval_80": raw_forecast.get("preferred_return_interval_80"),
+                "preferred_net_return_interval_80": raw_forecast.get(
+                    "preferred_net_return_interval_80"
+                ),
+                "preferred_return_interval_method": raw_forecast.get(
+                    "preferred_return_interval_method"
+                ),
                 "position_and_cost": raw_forecast.get("position_and_cost"),
             }
         published_forecast.update(
@@ -362,6 +383,19 @@ class GupiaoYuceTool(BaseTool):
             shares=kwargs.get("shares"),
             position_value_yuan=kwargs.get("position_value_yuan"),
         )
+        try:
+            from src.ashare.yuce_liushui import record_single_prediction, settle_predictions
+
+            ledger_record = record_single_prediction(result)
+            result["prediction_ledger"] = {
+                **ledger_record,
+                "settlement": settle_predictions(),
+            }
+        except Exception as exc:
+            result["prediction_ledger"] = {
+                "status": "error",
+                "error": f"预测流水账写入失败：{exc}",
+            }
         return json.dumps(result, ensure_ascii=False)
 
 

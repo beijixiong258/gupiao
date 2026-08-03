@@ -64,6 +64,12 @@ DAILY_FACTOR_FEATURE_COLUMNS = [
     "size_neutral_volume_ratio_5_20",
     "size_neutral_volatility_20",
     "size_neutral_log_amount_yuan",
+    "market_regime_score",
+    "market_regime_weak",
+    "market_regime_sideways",
+    "market_regime_strong",
+    "market_regime_trend_breadth_interaction",
+    "market_regime_volatility_stress",
 ] + BENCHMARK_FEATURE_COLUMNS
 
 _DAILY_BASIC_FIELDS = ["turnover_rate", "pe_ttm", "pb", "total_mv", "circ_mv"]
@@ -387,6 +393,34 @@ def _group_snapshot(data: pd.DataFrame, mask: pd.Series, prefix: str) -> pd.Data
     return result
 
 
+def _add_market_regime_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Build point-in-time market-state features from fixed, interpretable thresholds."""
+    result = data.copy()
+    trend = (pd.to_numeric(result.get("market_csi300_ret_20"), errors="coerce") / 0.10).clip(-1.0, 1.0)
+    breadth = (
+        (pd.to_numeric(result.get("universe_breadth_above_ma20"), errors="coerce") - 0.50)
+        / 0.30
+    ).clip(-1.0, 1.0)
+    volatility_stress = (
+        (pd.to_numeric(result.get("market_csi300_volatility_20"), errors="coerce") - 0.20)
+        / 0.25
+    ).clip(0.0, 1.0)
+
+    core_weight = 0.55 * trend.notna().astype(float) + 0.35 * breadth.notna().astype(float)
+    core_score = (
+        0.55 * trend.fillna(0.0) + 0.35 * breadth.fillna(0.0)
+    ) / core_weight.replace(0.0, np.nan)
+    score = (core_score - 0.10 * volatility_stress.fillna(0.0)).clip(-1.0, 1.0)
+
+    result["market_regime_score"] = score
+    result["market_regime_weak"] = score.le(-0.20).astype(float).where(score.notna())
+    result["market_regime_sideways"] = score.gt(-0.20).mul(score.lt(0.20)).astype(float).where(score.notna())
+    result["market_regime_strong"] = score.ge(0.20).astype(float).where(score.notna())
+    result["market_regime_trend_breadth_interaction"] = trend * breadth
+    result["market_regime_volatility_stress"] = volatility_stress
+    return result
+
+
 def _size_neutral_residual(group: pd.DataFrame, feature: str) -> pd.Series:
     result = pd.Series(np.nan, index=group.index, dtype=float)
     values = pd.to_numeric(group.get(feature), errors="coerce")
@@ -468,6 +502,7 @@ def enrich_daily_factor_panel(
 
     universe = _group_snapshot(data, pd.Series(True, index=data.index), "universe")
     data = data.merge(universe, on="trade_date", how="left")
+    data = _add_market_regime_features(data)
     if "peer_role" in data.columns and data["peer_role"].notna().any():
         roles = data["peer_role"].fillna("").astype(str)
         industry_mask = roles.isin(["target", "same_industry"])
@@ -531,6 +566,7 @@ def enrich_daily_factor_panel(
         "industry_factor_method": industry_method,
         "industry_membership_bias": "当前同行或当前板块成分回看历史，不能冒充历史时点成分快照",
         "size_neutralization": "逐交易日用历史流通市值对指定因子做线性残差化；不足5只有效股票时留空",
+        "market_regime_method": "仅使用当日可见的沪深300近20日收益、市场宽度和20日波动率，按固定阈值生成弱市/震荡市/强市状态",
         "feature_coverage": feature_coverage,
         "warnings": warnings,
     }

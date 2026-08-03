@@ -159,6 +159,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             "min_passed_subwindows": 4,
             "ensemble_min_calibration_samples": 80,
             "ensemble_min_calibration_dates": 20,
+            "time_decay_min_calibration_samples": 80,
+            "time_decay_min_calibration_dates": 20,
             "factor_stability_slices": 3,
             "factor_min_valid_slices": 2,
             "factor_min_features": 12,
@@ -186,6 +188,13 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             float(item)
             for item in model.get("ensemble_tree_weight_grid", [0.0, 0.25, 0.5, 0.75, 1.0])
         ]
+        time_decay_candidates = [
+            float(item)
+            for item in model.get("time_decay_half_life_candidates", [0, 252, 504])
+        ]
+        time_decay_calibration_ratio = float(model.get("time_decay_calibration_ratio", 0.15))
+        time_decay_min_improvement = float(model.get("time_decay_min_relative_improvement", 0.002))
+        time_decay_min_weight = float(model.get("time_decay_min_weight", 0.10))
         feature_winsor_quantiles = [
             float(item) for item in model.get("feature_winsor_quantiles", [0.01, 0.99])
         ]
@@ -237,6 +246,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.abstain_min_quality_score 必须在 0 到 1 之间")
     if not isinstance(model.get("ensemble_enabled", True), bool):
         raise ValueError("moxing.ensemble_enabled 必须是 true 或 false")
+    if not isinstance(model.get("time_decay_enabled", True), bool):
+        raise ValueError("moxing.time_decay_enabled 必须是 true 或 false")
     if not isinstance(model.get("factor_stability_enabled", True), bool):
         raise ValueError("moxing.factor_stability_enabled 必须是 true 或 false")
     if not isinstance(model.get("ranking_enabled", True), bool):
@@ -276,6 +287,20 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.ensemble_default_tree_weight 必须在 0 到 1 之间")
     if not 0.05 <= ensemble_calibration_ratio <= 0.4:
         raise ValueError("moxing.ensemble_calibration_ratio 必须在 0.05 到 0.4 之间")
+    if (
+        not time_decay_candidates
+        or 0.0 not in time_decay_candidates
+        or len(time_decay_candidates) != len(set(time_decay_candidates))
+        or time_decay_candidates != sorted(time_decay_candidates)
+        or any(not math.isfinite(item) or item < 0 for item in time_decay_candidates)
+    ):
+        raise ValueError("moxing.time_decay_half_life_candidates 必须是包含0的非负递增无重复数值数组")
+    if not 0.05 <= time_decay_calibration_ratio <= 0.4:
+        raise ValueError("moxing.time_decay_calibration_ratio 必须在 0.05 到 0.4 之间")
+    if not 0 <= time_decay_min_improvement <= 0.2:
+        raise ValueError("moxing.time_decay_min_relative_improvement 必须在 0 到 0.2 之间")
+    if not 0 < time_decay_min_weight <= 1:
+        raise ValueError("moxing.time_decay_min_weight 必须在 0 到 1 之间")
     if (
         not ensemble_weight_grid
         or any(not math.isfinite(item) or not 0 <= item <= 1 for item in ensemble_weight_grid)

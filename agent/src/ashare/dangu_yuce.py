@@ -31,8 +31,10 @@ from src.ashare.bankuai_yuce import (
     _regime_stability,
     _rolling_conformal_interval,
     _rolling_cqr_interval,
+    _select_time_decay_half_life,
     _select_stable_features,
     _select_ensemble_weight,
+    _time_decay_weights,
     _top_n_validation_metrics,
     goujian_moxing_shuju,
 )
@@ -903,6 +905,18 @@ def _fit_single_stock_models(
                     "factor_selection": factor_selection,
                 })
                 continue
+            decay_half_life, time_decay = _select_time_decay_half_life(
+                train_features=train[fold_features],
+                train_target=np.clip(y_train_raw, clip_low, clip_high),
+                train_dates=train["trade_date"],
+                train_target_dates=train[target_date_column],
+                model_config=model_config,
+            )
+            sample_weight = _time_decay_weights(
+                train["trade_date"],
+                decay_half_life,
+                float(model_config.get("time_decay_min_weight", 0.10)),
+            )
             tree_weight, ensemble_diagnostics = _select_ensemble_weight(
                 np.concatenate(prior_actual) if prior_actual else np.array([]),
                 np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
@@ -914,18 +928,21 @@ def _fit_single_stock_models(
                 train_target=np.clip(y_train_raw, clip_low, clip_high),
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             raw_direction_probability, direction_model = _fit_direction_probabilities(
                 train_features=train[fold_features],
                 train_target=y_train_raw,
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             quantile_prediction, quantile_model = _fit_quantile_model_components(
                 train_features=train[fold_features],
                 train_target=y_train_raw,
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
             linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
@@ -980,6 +997,7 @@ def _fit_single_stock_models(
                 "mean_daily_rank_ic": round(rank_ic, 6),
                 "rank_ic_days": int(rank_days),
                 "factor_selection": factor_selection,
+                "time_decay": time_decay,
                 "direction_model": {
                     **direction_model,
                     "brier_score": round(
@@ -1034,6 +1052,7 @@ def _fit_single_stock_models(
         latest_quantile_prediction: dict[str, np.ndarray] = {}
         production_quantile_model: dict[str, Any] = {"status": "unavailable"}
         production_factor_selection: dict[str, Any] | None = None
+        production_time_decay: dict[str, Any] = {"status": "not_trained"}
         production_features: list[str] = []
         if len(usable) >= minimum_train:
             full_y = usable[target_column].astype(float).to_numpy()
@@ -1051,17 +1070,31 @@ def _fit_single_stock_models(
                 target_column,
                 model_config,
             )
+            production_decay_half_life, production_time_decay = _select_time_decay_half_life(
+                train_features=usable[production_features],
+                train_target=np.clip(full_y, final_clip_low, final_clip_high),
+                train_dates=usable["trade_date"],
+                train_target_dates=usable[target_date_column],
+                model_config=model_config,
+            )
+            production_sample_weight = _time_decay_weights(
+                usable["trade_date"],
+                production_decay_half_life,
+                float(model_config.get("time_decay_min_weight", 0.10)),
+            )
             latest_tree_prediction, latest_linear_prediction = _fit_model_components(
                 train_features=usable[production_features],
                 train_target=np.clip(full_y, final_clip_low, final_clip_high),
                 predict_features=latest[production_features],
                 model_config=model_config,
+                sample_weight=production_sample_weight,
             )
             latest_direction_array, production_direction_model = _fit_direction_probabilities(
                 train_features=usable[production_features],
                 train_target=full_y,
                 predict_features=latest[production_features],
                 model_config=model_config,
+                sample_weight=production_sample_weight,
             )
             latest_quantile_prediction, production_quantile_model = (
                 _fit_quantile_model_components(
@@ -1069,6 +1102,7 @@ def _fit_single_stock_models(
                     train_target=full_y,
                     predict_features=latest[production_features],
                     model_config=model_config,
+                    sample_weight=production_sample_weight,
                 )
             )
             latest_raw_direction_probability = float(latest_direction_array[0])
@@ -1115,6 +1149,7 @@ def _fit_single_stock_models(
             "final_prediction_clip": [round(final_clip_low, 6), round(final_clip_high, 6)] if final_clip_low is not None else None,
             "retrained_on_all_labeled_data": latest_prediction is not None,
             "production_factor_selection": production_factor_selection,
+            "production_time_decay": production_time_decay,
             "experiment_fingerprint": _experiment_fingerprint(
                 feature_columns=production_features,
                 target_definition=f"next_session_open_to_{horizon}th_sellable_close_return",
@@ -1439,6 +1474,18 @@ def _fit_future_session_models(
                     }
                 )
                 continue
+            decay_half_life, time_decay = _select_time_decay_half_life(
+                train_features=train[fold_features],
+                train_target=np.clip(y_train_raw, clip_low, clip_high),
+                train_dates=train["trade_date"],
+                train_target_dates=train[target_date_column],
+                model_config=model_config,
+            )
+            sample_weight = _time_decay_weights(
+                train["trade_date"],
+                decay_half_life,
+                float(model_config.get("time_decay_min_weight", 0.10)),
+            )
             tree_weight, ensemble_diagnostics = _select_ensemble_weight(
                 np.concatenate(prior_actual) if prior_actual else np.array([]),
                 np.concatenate(prior_tree_prediction) if prior_tree_prediction else np.array([]),
@@ -1450,18 +1497,21 @@ def _fit_future_session_models(
                 train_target=np.clip(y_train_raw, clip_low, clip_high),
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             raw_direction_probability, direction_model = _fit_direction_probabilities(
                 train_features=train[fold_features],
                 train_target=y_train_raw,
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             quantile_prediction, quantile_model = _fit_quantile_model_components(
                 train_features=train[fold_features],
                 train_target=y_train_raw,
                 predict_features=validation_frame[fold_features],
                 model_config=model_config,
+                sample_weight=sample_weight,
             )
             tree_prediction = np.clip(tree_prediction, clip_low, clip_high)
             linear_prediction = np.clip(linear_prediction, clip_low, clip_high)
@@ -1495,6 +1545,7 @@ def _fit_future_session_models(
                     "mean_daily_rank_ic": round(rank_ic, 6),
                     "rank_ic_days": int(rank_days),
                     "factor_selection": factor_selection,
+                    "time_decay": time_decay,
                     "direction_model": {
                         **direction_model,
                         "brier_score": round(
@@ -1546,6 +1597,7 @@ def _fit_future_session_models(
         latest_quantile_prediction: dict[str, np.ndarray] = {}
         production_quantile_model: dict[str, Any] = {"status": "unavailable"}
         production_factor_selection: dict[str, Any] | None = None
+        production_time_decay: dict[str, Any] = {"status": "not_trained"}
         production_features: list[str] = []
         if len(usable) >= minimum_train:
             full_y = usable[target_column].astype(float).to_numpy()
@@ -1563,17 +1615,31 @@ def _fit_future_session_models(
                 target_column,
                 model_config,
             )
+            production_decay_half_life, production_time_decay = _select_time_decay_half_life(
+                train_features=usable[production_features],
+                train_target=np.clip(full_y, final_clip_low, final_clip_high),
+                train_dates=usable["trade_date"],
+                train_target_dates=usable[target_date_column],
+                model_config=model_config,
+            )
+            production_sample_weight = _time_decay_weights(
+                usable["trade_date"],
+                production_decay_half_life,
+                float(model_config.get("time_decay_min_weight", 0.10)),
+            )
             latest_tree_prediction, latest_linear_prediction = _fit_model_components(
                 train_features=usable[production_features],
                 train_target=np.clip(full_y, final_clip_low, final_clip_high),
                 predict_features=latest[production_features],
                 model_config=model_config,
+                sample_weight=production_sample_weight,
             )
             latest_direction_array, production_direction_model = _fit_direction_probabilities(
                 train_features=usable[production_features],
                 train_target=full_y,
                 predict_features=latest[production_features],
                 model_config=model_config,
+                sample_weight=production_sample_weight,
             )
             latest_quantile_prediction, production_quantile_model = (
                 _fit_quantile_model_components(
@@ -1581,6 +1647,7 @@ def _fit_future_session_models(
                     train_target=full_y,
                     predict_features=latest[production_features],
                     model_config=model_config,
+                    sample_weight=production_sample_weight,
                 )
             )
             latest_raw_direction_probability = float(latest_direction_array[0])
@@ -1634,6 +1701,7 @@ def _fit_future_session_models(
                 else None
             ),
             "production_factor_selection": production_factor_selection,
+            "production_time_decay": production_time_decay,
             "experiment_fingerprint": _experiment_fingerprint(
                 feature_columns=production_features,
                 target_definition=f"signal_close_to_future_market_session_{horizon}_close_return",
