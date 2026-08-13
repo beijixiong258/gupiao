@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI for the A-share T+3 quantitative researcher."""
+"""CLI for the personal A-share analysis and three-trading-day forecast tool."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
     if content := result.get("content"):
         body.append("")
         body.append(_console_safe(content))
-    console.print(Panel(_console_safe("\n".join(body)), title="A股 T+3 量化研究员"))
+    console.print(Panel(_console_safe("\n".join(body)), title="A股分析与三交易日预测"))
     return EXIT_SUCCESS if status == "success" else EXIT_RUN_FAILED
 
 
@@ -149,9 +149,8 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
-        "gupiao_fenxi": "正在核对单股时点、拉取同行历史并训练三周期模型...",
-        "gupiao_yuce": "正在计算指定周期预测、交易费用和收益空间...",
-        "bankuai_xuangu": "正在拉取板块成分并训练 T+3 模型...",
+        "gupiao_fenxi": "正在核对股票时点、整理方向证据并训练模型...",
+        "gupiao_yuce": "正在生成未来三个交易日预测...",
     }
 
     def callback(event_type: str, data: dict[str, Any]) -> None:
@@ -209,7 +208,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             "/history        查看当前会话最近内容\n"
             "/help           再次显示命令说明\n"
             "/exit           保存并退出",
-            title="A股 T+3 量化研究员 | 连续对话",
+            title="A股分析与三交易日预测 | 连续对话",
         )
     )
 
@@ -342,10 +341,6 @@ def cmd_settings() -> int:
     _ensure_dotenv()
     provider = _provider_name()
     oauth_status = codex_auth_status()
-    from src.ashare.riping_cangku import daily_warehouse_status
-
-    warehouse = daily_warehouse_status()
-
     console.print(
         Panel(
             "\n".join(
@@ -358,11 +353,6 @@ def cmd_settings() -> int:
                     f"OpenAI API key: {'set' if os.getenv('OPENAI_API_KEY') else 'not set'}",
                     f"ChatGPT OAuth: {'ready' if oauth_status['configured'] else 'not logged in'}",
                     f"Tushare token: {'set' if os.getenv('TUSHARE_TOKEN') else 'not set'}",
-                    (
-                        f"Daily warehouse: {warehouse.get('status')} | "
-                        f"price-complete sessions: {warehouse.get('price_complete_sessions', 0)} | "
-                        f"full-market ready: {warehouse.get('full_market_training_ready', False)}"
-                    ),
                 ]
             ),
             title="Settings",
@@ -403,8 +393,6 @@ def cmd_gupiao(
     gupiao: str,
     source: str,
     history_calendar_days: int,
-    holding_days: int,
-    budget_yuan: float | None,
     config_path: str | None,
     json_mode: bool,
 ) -> int:
@@ -414,8 +402,6 @@ def cmd_gupiao(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
-        holding_days=holding_days,
-        budget_yuan=budget_yuan,
         config_path=config_path,
     ))
     if json_mode:
@@ -440,27 +426,20 @@ def cmd_yuce(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
-        holding_days=2,
         config_path=config_path,
     ))
-    predictions: dict[str, Any] = {}
+    prediction: dict[str, Any] = {}
     analysis_id = diagnosis.get("analysis_id")
     if diagnosis.get("status") == "ok" and analysis_id:
-        predictor = GupiaoYuceTool()
-        for horizon in (1, 2, 3):
-            predictions[f"T+{horizon}"] = json.loads(predictor.execute(
-                analysis_id=analysis_id,
-                horizon=horizon,
-                mode="future_close",
-                intent="forecast",
-            ))
+        prediction = json.loads(GupiaoYuceTool().execute(analysis_id=analysis_id))
     compact = {
         "status": diagnosis.get("status"),
         "stock": diagnosis.get("stock"),
         "as_of": diagnosis.get("as_of"),
         "generated_at": diagnosis.get("generated_at"),
         "analysis_id": analysis_id,
-        "predictions": predictions,
+        "direction_analysis": diagnosis.get("direction_analysis"),
+        "prediction": prediction,
         "market_data": diagnosis.get("market_data"),
         "error": diagnosis.get("error"),
     }
@@ -468,204 +447,12 @@ def cmd_yuce(
         print(json.dumps(compact, ensure_ascii=False))
     else:
         console.print_json(json.dumps(compact, ensure_ascii=False))
-    has_forecast = any(item.get("forecast") is not None for item in predictions.values())
+    has_forecast = bool(prediction.get("forecast"))
     return EXIT_SUCCESS if compact.get("status") == "ok" and has_forecast else EXIT_RUN_FAILED
 
 
-def cmd_bankuai(
-    bankuai: str,
-    bankuai_leixing: str,
-    top_n: int,
-    offset: int,
-    selection_id: str | None,
-    source: str,
-    config_path: str | None,
-    json_mode: bool,
-) -> int:
-    from src.ashare.bankuai_yuce import bankuai_xuangu
-
-    result = bankuai_xuangu(
-        bankuai=bankuai,
-        bankuai_leixing=bankuai_leixing,
-        top_n=top_n,
-        offset=offset,
-        selection_id=selection_id,
-        source=source,
-        config_path=config_path,
-    )
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
-def cmd_warehouse_status(*, json_mode: bool = False) -> int:
-    from src.ashare.riping_cangku import daily_warehouse_status
-
-    result = daily_warehouse_status()
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS
-
-
-def cmd_warehouse_sync(
-    *,
-    start_date: str,
-    end_date: str | None,
-    max_sessions: int,
-    newest_first: bool,
-    force: bool,
-    pause_seconds: float,
-    json_mode: bool,
-    price_only: bool = False,
-    workers: int = 1,
-) -> int:
-    from src.ashare.riping_cangku import sync_daily_warehouse, sync_price_warehouse
-
-    try:
-        sync_function = sync_price_warehouse if price_only else sync_daily_warehouse
-        sync_kwargs = dict(
-            start_date=start_date,
-            end_date=end_date,
-            max_sessions=max_sessions,
-            newest_first=newest_first,
-            force=force,
-            pause_seconds=pause_seconds,
-        )
-        if price_only:
-            sync_kwargs["workers"] = workers
-        result = sync_function(**sync_kwargs)
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
-    if result.get("status") in {"ok", "partial"}:
-        try:
-            from src.ashare.yuce_liushui import settle_predictions
-
-            result["prediction_settlement"] = settle_predictions()
-        except Exception as exc:
-            result["prediction_settlement"] = {
-                "status": "error",
-                "error": f"预测流水账揭晓失败：{exc}",
-            }
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
-def cmd_warehouse_update(
-    *,
-    max_sessions: int,
-    pause_seconds: float,
-    workers: int,
-    json_mode: bool,
-) -> int:
-    """Incrementally update completed market sessions without requiring dates."""
-    from datetime import date, timedelta
-
-    from src.ashare.gupiao_yanjiu import _latest_expected_market_date
-    from src.ashare.riping_cangku import daily_warehouse_status, sync_price_warehouse
-
-    try:
-        status = daily_warehouse_status()
-        date_range = status.get("price_complete_date_range") or []
-        if len(date_range) != 2 or not date_range[1]:
-            result = {
-                "status": "error",
-                "error_code": "warehouse_not_initialized",
-                "error": "日线仓库还没有完整日期；请先使用 warehouse sync --start 建立历史仓库",
-            }
-        else:
-            latest = date.fromisoformat(str(date_range[1]))
-            expected = _latest_expected_market_date().date()
-            start = latest + timedelta(days=1)
-            if start > expected:
-                result = {
-                    "status": "ok",
-                    "update_status": "up_to_date",
-                    "latest_price_date": latest.isoformat(),
-                    "expected_latest_completed_date": expected.isoformat(),
-                    "attempted_sessions": 0,
-                    "message": "日线仓库已经覆盖最近应完成的交易日",
-                    "warehouse_status": status,
-                }
-            else:
-                result = sync_price_warehouse(
-                    start_date=start.isoformat(),
-                    end_date=expected.isoformat(),
-                    max_sessions=max_sessions,
-                    newest_first=True,
-                    force=False,
-                    pause_seconds=pause_seconds,
-                    workers=workers,
-                )
-                result["update_status"] = (
-                    "updated"
-                    if int(result.get("attempted_sessions", 0)) > 0
-                    else "up_to_date"
-                )
-                result["automatic_range"] = [start.isoformat(), expected.isoformat()]
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
-    if result.get("status") in {"ok", "partial"}:
-        try:
-            from src.ashare.yuce_liushui import settle_predictions
-
-            result["prediction_settlement"] = settle_predictions()
-        except Exception as exc:
-            result["prediction_settlement"] = {
-                "status": "error",
-                "error": f"预测流水账揭晓失败：{exc}",
-            }
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
-def cmd_warehouse_enrich(*, json_mode: bool) -> int:
-    """Fill one recent daily_basic session without consuming a large quota burst."""
-    from src.ashare.riping_cangku import enrich_latest_daily_basic
-
-    try:
-        result = enrich_latest_daily_basic()
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
-def cmd_performance(
-    *,
-    window: int | None,
-    source_kind: str,
-    json_mode: bool,
-) -> int:
-    """Settle frozen forecasts and report genuine forward performance."""
-    from src.ashare.yuce_liushui import performance_report
-
-    try:
-        windows = [window] if window is not None else [20, 60, 120]
-        result = performance_report(windows=windows, source_kind=source_kind)
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="A 股 T+3 量化研究员")
+    parser = argparse.ArgumentParser(description="个人 A 股日 K 分析与未来三交易日预测工具")
     sub = parser.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="执行一次自然语言研究")
@@ -692,8 +479,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
     )
     gupiao.add_argument("--history-calendar-days", type=int, default=1440)
-    gupiao.add_argument("--holding-days", type=int, choices=[1, 2, 3], default=2)
-    gupiao.add_argument("--budget-yuan", type=float, help="用于整手和最低佣金估算；不填写则使用成本配置默认资金")
     gupiao.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     gupiao.add_argument("--json", action="store_true")
 
@@ -708,93 +493,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     yuce.add_argument("--history-calendar-days", type=int, default=1440)
     yuce.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     yuce.add_argument("--json", action="store_true")
-
-    bankuai = sub.add_parser("bankuai", help="从指定板块选股并预测 T+1/T+2/T+3")
-    bankuai.add_argument("bankuai", help="中国大陆行业或概念板块名称")
-    bankuai.add_argument("--type", dest="bankuai_leixing", choices=["auto", "hangye", "gainian"], default="auto")
-    bankuai.add_argument("--top-n", type=int, default=8, help="每批候选数量，默认8且最多8")
-    bankuai.add_argument("--offset", type=int, default=0, help="顺延批次的起始偏移；第一批为0")
-    bankuai.add_argument("--selection-id", help="上一批返回的候选序列ID；offset大于0时必填")
-    bankuai.add_argument(
-        "--source",
-        choices=["auto", "tushare", "akshare"],
-        default="auto",
-        help="个股日线行情来源；板块成分仍按独立的数据源顺序获取",
-    )
-    bankuai.add_argument("--config", dest="config_path", help="Path to lianghua_peizhi.json")
-    bankuai.add_argument("--json", action="store_true")
-
-    warehouse = sub.add_parser("warehouse", help="管理全A股日频PIT仓库")
-    warehouse_sub = warehouse.add_subparsers(dest="warehouse_command", required=True)
-    warehouse_status = warehouse_sub.add_parser("status", help="查看日频仓库覆盖范围和可用状态")
-    warehouse_status.add_argument("--json", action="store_true")
-    warehouse_update = warehouse_sub.add_parser("update", help="自动补齐最近已收盘交易日的全市场日线")
-    warehouse_update.add_argument(
-        "--max-sessions",
-        type=int,
-        default=10,
-        help="本次最多补多少个交易日；默认10，0表示全部缺口",
-    )
-    warehouse_update.add_argument("--pause-seconds", type=float, default=0.08, help="交易日之间的请求间隔")
-    warehouse_update.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="日线下载并发数，范围1到8；低额度账号建议保持1",
-    )
-    warehouse_update.add_argument("--json", action="store_true")
-    warehouse_enrich = warehouse_sub.add_parser(
-        "enrich",
-        help="低额度渐进补齐：每次只补一个最近交易日的估值和换手率",
-    )
-    warehouse_enrich.add_argument("--json", action="store_true")
-    warehouse_sync = warehouse_sub.add_parser("sync", help="按交易日增量同步全市场日频数据")
-    warehouse_sync.add_argument("--start", dest="start_date", required=True, help="开始日期，例如2022-01-01")
-    warehouse_sync.add_argument("--end", dest="end_date", help="结束日期；默认今天")
-    warehouse_sync.add_argument(
-        "--max-sessions",
-        type=int,
-        default=20,
-        help="本次最多处理多少个待同步交易日；默认20，0表示全部",
-    )
-    warehouse_sync.add_argument(
-        "--oldest-first",
-        action="store_true",
-        help="从最早缺口开始；默认优先补最近交易日",
-    )
-    warehouse_sync.add_argument("--force", action="store_true", help="重新拉取已经完成的交易日")
-    warehouse_sync.add_argument("--pause-seconds", type=float, default=0.08, help="交易日之间的请求间隔")
-    warehouse_sync.add_argument(
-        "--price-only",
-        action="store_true",
-        help="低额度模式：只同步全市场日线，并从pre_close重建相对复权链",
-    )
-    warehouse_sync.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="低额度模式的日线下载并发数，范围1到8",
-    )
-    warehouse_sync.add_argument("--json", action="store_true")
-
-    performance = sub.add_parser(
-        "performance",
-        help="揭晓已冻结预测并报告近20/60/120个交易日的真实表现",
-    )
-    performance.add_argument(
-        "--window",
-        type=int,
-        choices=[20, 60, 120],
-        help="只查看一个交易日窗口；默认同时返回20、60、120日",
-    )
-    performance.add_argument(
-        "--kind",
-        dest="source_kind",
-        choices=["all", "single", "board"],
-        default="all",
-        help="查看全部、单股或板块预测；默认全部",
-    )
-    performance.add_argument("--json", action="store_true")
 
     sub.add_parser("settings", help="查看当前运行配置")
     openai_login = sub.add_parser("openai-login", help="使用 ChatGPT OAuth 登录 OpenAI Provider")
@@ -818,8 +516,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.gupiao,
             args.source,
             args.history_calendar_days,
-            args.holding_days,
-            args.budget_yuan,
             args.config_path,
             args.json,
         )
@@ -830,46 +526,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.history_calendar_days,
             args.config_path,
             args.json,
-        )
-    if args.command == "bankuai":
-        return cmd_bankuai(
-            args.bankuai,
-            args.bankuai_leixing,
-            args.top_n,
-            args.offset,
-            args.selection_id,
-            args.source,
-            args.config_path,
-            args.json,
-        )
-    if args.command == "warehouse":
-        if args.warehouse_command == "status":
-            return cmd_warehouse_status(json_mode=args.json)
-        if args.warehouse_command == "update":
-            return cmd_warehouse_update(
-                max_sessions=args.max_sessions,
-                pause_seconds=args.pause_seconds,
-                workers=args.workers,
-                json_mode=args.json,
-            )
-        if args.warehouse_command == "enrich":
-            return cmd_warehouse_enrich(json_mode=args.json)
-        return cmd_warehouse_sync(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            max_sessions=args.max_sessions,
-            newest_first=not args.oldest_first,
-            force=args.force,
-            pause_seconds=args.pause_seconds,
-            json_mode=args.json,
-            price_only=args.price_only,
-            workers=args.workers,
-        )
-    if args.command == "performance":
-        return cmd_performance(
-            window=args.window,
-            source_kind=args.source_kind,
-            json_mode=args.json,
         )
     if args.command == "settings":
         return cmd_settings()

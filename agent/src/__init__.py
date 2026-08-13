@@ -1,1 +1,1 @@
-"""A股 T+3 量化研究员核心包。"""
+"""Personal A-share daily-K analysis and three-trading-day forecast core."""

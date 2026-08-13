@@ -1,4 +1,4 @@
-"""Offline tests for the two A-share T+3 business workflows."""
+"""Daily-K contract tests for the two supported A-share workflows."""
 
 from __future__ import annotations
 
@@ -11,11 +11,7 @@ import pandas as pd
 import pytest
 
 from src.ashare import gupiao_yanjiu
-from src.ashare.bankuai_yuce import (
-    _filter_constituents,
-    goujian_moxing_shuju,
-    xunlian_yuce_moxing,
-)
+from src.ashare.bankuai_yuce import goujian_moxing_shuju, xunlian_yuce_moxing
 from src.ashare.dangu_yuce import _future_schedule_unavailable_reason
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
@@ -118,30 +114,7 @@ def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
 
 
 def test_agent_exposes_research_tools_only() -> None:
-    assert build_registry().tool_names == ["gupiao_fenxi", "gupiao_yuce", "bankuai_xuangu"]
-
-
-def test_filter_removes_st_illiquid_and_limit_up_rows() -> None:
-    config, _ = jiazai_lianghua_peizhi()
-    frame = pd.DataFrame(
-        [
-            {"ts_code": "600001.SH", "name": "正常股份", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
-            {"ts_code": "600002.SH", "name": "ST测试", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
-            {"ts_code": "600003.SH", "name": "低流动", "latest_price": 10, "amount_yuan": 1_000_000, "pct_chg": 1},
-            {"ts_code": "600004.SH", "name": "涨停股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 10},
-            {"ts_code": "600005.SH", "name": "N新股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
-            {"ts_code": "600006.SH", "name": "C新股", "latest_price": 10, "amount_yuan": 90_000_000, "pct_chg": 1},
-            {"ts_code": "600007.SH", "name": "缺价格", "latest_price": None, "amount_yuan": 90_000_000, "pct_chg": 1},
-            {"ts_code": "600008.SH", "name": "缺成交额", "latest_price": 10, "amount_yuan": None, "pct_chg": 1},
-        ]
-    )
-    accepted, rejected = _filter_constituents(frame, config)
-    assert accepted["ts_code"].tolist() == ["600001.SH"]
-    assert len(rejected) == 7
-    assert {item["reason"] for item in rejected} >= {
-        "缺少最新价格，无法应用价格过滤",
-        "缺少最新成交额，无法应用流动性过滤",
-    }
+    assert build_registry().tool_names == ["gupiao_fenxi", "gupiao_yuce"]
 
 
 def test_stock_basic_cache_reads_existing_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -156,7 +129,7 @@ def test_stock_basic_cache_reads_existing_csv(tmp_path: Path, monkeypatch: pytes
 
 def test_single_stock_rules_describe_supported_t3_forecast() -> None:
     rules = _a_share_rules("600519.SH", "贵州茅台")
-    assert "单股工具支持 T+1/T+2/T+3" in rules["prediction_horizon"]
+    assert "公开三日预测" in rules["prediction_horizon"]
     assert "不伪造" in rules["prediction_horizon"]
 
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gupiaoyanjiu"
 dynamic = ["version"]
-description = "A股 T+3 量化研究员：单股与指定板块短线量化研究"
+description = "个人使用的 A 股日 K 方向分析与未来三交易日预测工具"
 requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [

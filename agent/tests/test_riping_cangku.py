@@ -1,4 +1,4 @@
-"""Offline tests for the full-market daily warehouse."""
+"""Internal cache tests for the network-backed daily-K workflow."""
 
 from __future__ import annotations
 

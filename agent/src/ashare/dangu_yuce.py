@@ -1,9 +1,9 @@
-"""Horizon-aware quantitative research for one mainland China A-share.
+"""Daily-K quantitative research for one mainland China A-share.
 
 The single-stock workflow deliberately trains on a liquid peer panel instead
-of fitting a tiny model to one stock's own history.  Signals are created after
-the latest completed daily close; entry is the next market-session open and
-T+1/T+2/T+3 are the first, second and third sellable closes after entry.
+of fitting a tiny model to one stock's own history. Signals are created after
+the latest completed daily close and publish the next three market-session
+close estimates together.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from src.ashare.jiaoyi_zhixing import (
 from src.ashare.moxing_pinggu import regression_baseline_metrics, signal_evidence_gate
 from src.ashare.shuju_yuan import _load_or_fetch_stock_basic, _price_limit_rule, _tushare_pro
 from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
+from src.ashare.yinzi_gongcheng import FACTOR_ENGINEERING_VERSION, engineered_factor_columns
 
 
 SINGLE_STOCK_EXTRA_FEATURES = [
@@ -83,7 +84,14 @@ SINGLE_STOCK_EXTRA_FEATURES = [
     "rank_volatility_20",
     "rank_log_amount",
 ]
-SINGLE_STOCK_FEATURE_COLUMNS = FEATURE_COLUMNS + SINGLE_STOCK_EXTRA_FEATURES + DAILY_FACTOR_FEATURE_COLUMNS
+SINGLE_STOCK_FEATURE_COLUMNS = list(
+    dict.fromkeys(
+        FEATURE_COLUMNS
+        + SINGLE_STOCK_EXTRA_FEATURES
+        + DAILY_FACTOR_FEATURE_COLUMNS
+        + engineered_factor_columns()
+    )
+)
 
 
 def shichang_shizhong(reference: datetime | None = None) -> dict[str, Any]:
@@ -833,7 +841,8 @@ def _fit_single_stock_models(
         "features": feature_columns,
         "feature_coverage": {column: round(float(coverage[column]), 4) for column in feature_columns},
         "latest_missing_features": [column for column in feature_columns if latest[column].isna().any()],
-        "feature_preprocessing": "每个滚动训练窗口独立做因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放",
+        "feature_preprocessing": "共享因子工程；每个滚动训练窗口独立做逐日Rank IC筛选、同组去重和分位数去极值；Ridge与方向Logistic另做稳健缩放",
+        "factor_engineering_version": FACTOR_ENGINEERING_VERSION,
         "horizons": {},
     }
     horizons = [int(value) for value in model_config["horizons"]]
@@ -1393,7 +1402,8 @@ def _fit_future_session_models(
         "forecast_basis": "最近完整收盘价到未来第1/2/3个市场交易日收盘的累计收益",
         "feature_count": int(len(feature_columns)),
         "features": feature_columns,
-        "feature_preprocessing": "每个滚动训练窗口独立做因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放",
+        "feature_preprocessing": "共享因子工程；每个滚动训练窗口独立做逐日Rank IC筛选、同组去重和分位数去极值；Ridge与方向Logistic另做稳健缩放",
+        "factor_engineering_version": FACTOR_ENGINEERING_VERSION,
         "horizons": {},
     }
     horizons = [int(value) for value in model_config["horizons"]]
@@ -2121,14 +2131,14 @@ def yanjiu_dangu_yuce(
     target_adjustment: str,
     source: str,
     signal_date: str,
-    holding_days: int,
-    budget_yuan: float | None,
     config: dict[str, Any],
     technical: dict[str, Any],
     fundamentals: dict[str, Any],
     tradability: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run peer selection, walk-forward modeling, cost adjustment and evidence assessment."""
+    """Run the single-stock model, evidence summary, and fixed three-day forecast."""
+    holding_days = 2
+    budget_yuan = None
     configured_budget, cost_scenario, cost_path, cost_errors = _load_cost_assumption(
         str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
     )

@@ -12,6 +12,7 @@ import pandas as pd
 
 from src.ashare.gupiao_yanjiu import akshare_zhilian
 from src.ashare.shuju_yuan import CACHE_DIR, _tushare_pro
+from src.ashare.yinzi_gongcheng import add_factor_composites
 
 
 BENCHMARKS = {
@@ -552,6 +553,7 @@ def enrich_daily_factor_panel(
             data[output_column] = np.nan
 
     data = data.replace([np.inf, -np.inf], np.nan)
+    data, factor_engineering_meta = add_factor_composites(data)
     feature_coverage = {
         column: round(float(data[column].notna().mean()), 4)
         for column in DAILY_FACTOR_FEATURE_COLUMNS
@@ -568,6 +570,7 @@ def enrich_daily_factor_panel(
         "size_neutralization": "逐交易日用历史流通市值对指定因子做线性残差化；不足5只有效股票时留空",
         "market_regime_method": "仅使用当日可见的沪深300近20日收益、市场宽度和20日波动率，按固定阈值生成弱市/震荡市/强市状态",
         "feature_coverage": feature_coverage,
+        "factor_engineering": factor_engineering_meta,
         "warnings": warnings,
     }
 

@@ -1,4 +1,4 @@
-"""Second-stage, request-specific forecast and position-return tool."""
+"""Second-stage forecast for the next three trading days."""
 
 from __future__ import annotations
 
@@ -7,350 +7,97 @@ import math
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.ashare.chengben_huadian import CostScenario
 from src.tools.gupiao_analysis_cache import get_analysis
 
 
-def _finite_positive(value: Any) -> float | None:
+def _bounded_probability(value: Any) -> float | None:
+    """Normalize a model probability without manufacturing one."""
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if math.isfinite(parsed) and parsed > 0 else None
-
-
-def _cost_components(notional: float, *, side: str, scenario: CostScenario) -> dict[str, float]:
-    commission_rate = scenario.buy_commission_rate if side == "buy" else scenario.sell_commission_rate
-    transfer_rate = scenario.transfer_fee_buy_rate if side == "buy" else scenario.transfer_fee_sell_rate
-    slippage_bps = scenario.buy_slippage_bps if side == "buy" else scenario.sell_slippage_bps
-    commission = max(notional * commission_rate, scenario.min_commission_yuan)
-    transfer = notional * transfer_rate
-    stamp_tax = notional * scenario.stamp_tax_sell_rate if side == "sell" else 0.0
-    slippage = notional * slippage_bps / 10000.0
-    total = commission + transfer + stamp_tax + slippage
-    return {
-        "commission_yuan": round(commission, 2),
-        "transfer_fee_yuan": round(transfer, 2),
-        "stamp_tax_yuan": round(stamp_tax, 2),
-        "slippage_assumption_yuan": round(slippage, 2),
-        "total_yuan": round(total, 2),
-    }
-
-
-def _position_return(
-    *,
-    ts_code: str,
-    buy_price: Any,
-    shares: Any,
-    position_value_yuan: Any,
-    current_price: Any,
-    projected_price: Any,
-    scenario: CostScenario,
-) -> dict[str, Any] | None:
-    parsed_buy = _finite_positive(buy_price)
-    parsed_current = _finite_positive(current_price)
-    if parsed_buy is None:
+    if not math.isfinite(parsed):
         return None
-    parsed_shares: int | None = None
-    if shares is not None:
-        try:
-            candidate = int(shares)
-        except (TypeError, ValueError):
-            candidate = 0
-        if candidate > 0:
-            parsed_shares = candidate
-    if parsed_shares is None:
-        budget = _finite_positive(position_value_yuan)
-        if budget is not None:
-            from src.ashare.bankuai_yuce import _position_for_budget
-
-            sizing = _position_for_budget(ts_code, parsed_buy, budget)
-            if sizing.get("execution_feasible"):
-                parsed_shares = int(sizing["estimated_buy_shares"])
-    if parsed_shares is None:
-        return {
-            "status": "need_position_size",
-            "message": "已有买入价；还需要持仓股数或持仓金额，才能计入最低佣金并计算实际收益",
-        }
-
-    buy_notional = parsed_buy * parsed_shares
-    buy_cost = _cost_components(buy_notional, side="buy", scenario=scenario)
-
-    def calculate(exit_price: float) -> dict[str, Any]:
-        sell_notional = exit_price * parsed_shares
-        sell_cost = _cost_components(sell_notional, side="sell", scenario=scenario)
-        invested = buy_notional + float(buy_cost["total_yuan"])
-        proceeds = sell_notional - float(sell_cost["total_yuan"])
-        pnl = proceeds - invested
-        return {
-            "exit_price": round(exit_price, 3),
-            "sell_notional_yuan": round(sell_notional, 2),
-            "sell_cost": sell_cost,
-            "net_profit_yuan": round(pnl, 2),
-            "net_return": round(pnl / invested, 6) if invested > 0 else None,
-            "net_return_pct": round(pnl / invested * 100.0, 3) if invested > 0 else None,
-        }
-
-    result: dict[str, Any] = {
-        "status": "ok",
-        "buy_price": round(parsed_buy, 3),
-        "shares": parsed_shares,
-        "buy_notional_yuan": round(buy_notional, 2),
-        "buy_cost": buy_cost,
-        "cost_scenario": scenario.name,
-        "cost_scope": "佣金（含最低佣金）、过户费、卖出印花税和双边滑点假设",
-    }
-    if parsed_current is not None:
-        result["current_exit_estimate"] = calculate(parsed_current)
-    parsed_projected = _finite_positive(projected_price)
-    if parsed_projected is not None:
-        result["projected_exit_estimate"] = calculate(parsed_projected)
-    return result
+    return round(min(max(parsed, 0.0), 1.0), 6)
 
 
-def build_requested_forecast(
+def build_three_day_forecast(
     full_result: dict[str, Any],
     *,
     analysis_id: str,
-    horizon: int,
-    mode: str,
-    intent: str,
-    buy_price: Any = None,
-    shares: Any = None,
-    position_value_yuan: Any = None,
 ) -> dict[str, Any]:
-    label = f"T+{horizon}"
-    stock = full_result.get("stock") or {}
-    quantitative = full_result.get("quantitative_analysis") or {}
-    diagnostics: dict[str, Any]
-    raw_forecast: dict[str, Any]
-    timing_valid = True
-    unavailable_reason = ""
+    """Publish the three forecasts calculated from one completed diagnosis.
 
-    if mode == "future_close":
-        future = full_result.get("future_3_trading_days") or {}
-        diagnostics = (future.get("validation") or {}).get("horizons", {}).get(label, {})
-        raw_forecast = (future.get("forecast") or {}).get(label, {})
-        if future.get("status") != "ok":
-            unavailable_reason = str(future.get("error") or "未来交易日预测当前不可用")
-    else:
-        diagnostics = (quantitative.get("validation") or {}).get("horizons", {}).get(label, {})
-        raw_forecast = (quantitative.get("forecast") or {}).get(label, {})
-        scenario_timing = (quantitative.get("analysis_assessment") or {}).get("scenario_timing") or {}
-        timing_valid = bool(scenario_timing.get("valid", True))
-        if not timing_valid:
-            unavailable_reason = str(scenario_timing.get("reason") or "持有期测算入口已经失效")
-
-    validation_passed = bool(diagnostics.get("validation_passed"))
-    forecast_notice = ""
-    if unavailable_reason:
-        forecast_status = "obsolete_or_unavailable"
-    elif not raw_forecast:
-        forecast_status = "unavailable"
-        unavailable_reason = "指定周期没有可用预测"
-    elif not validation_passed:
-        forecast_status = "model_estimate"
-        forecast_notice = "指定周期未通过样本外验证；仍发布当前模型估计，可信度按验证结果标注"
-    else:
-        forecast_status = "validated"
-
-    published_forecast: dict[str, Any] | None = None
-    projected_price = None
-    if forecast_status in {"validated", "model_estimate"}:
-        if mode == "future_close":
-            gross = raw_forecast.get("cumulative_return_from_signal_close")
-            cost_rate = (quantitative.get("cost_assumption") or {}).get("estimated_roundtrip_cost_rate")
-            net = (
-                (1.0 + float(gross)) * (1.0 - float(cost_rate)) - 1.0
-                if gross is not None and cost_rate is not None
-                else None
-            )
-            projected_price = raw_forecast.get("predicted_close_reference")
-            published_forecast = {
-                "target_trade_date": raw_forecast.get("target_trade_date"),
-                "cumulative_return_from_signal_close": gross,
-                "cumulative_return_from_signal_close_pct": raw_forecast.get(
-                    "cumulative_return_from_signal_close_pct"
-                ),
-                "estimated_return_after_roundtrip_cost": round(net, 6) if net is not None else None,
-                "estimated_return_after_roundtrip_cost_pct": round(net * 100.0, 3) if net is not None else None,
-                "predicted_close_reference": projected_price,
-                "predicted_close_interval_80": raw_forecast.get("predicted_close_interval_80"),
-                "predicted_close_interval_method": raw_forecast.get("predicted_close_interval_method"),
-                "calibrated_direction_positive_probability": raw_forecast.get(
-                    "direction_model_positive_probability"
-                ),
-                "direction_probability_method": raw_forecast.get("direction_probability_method"),
-                "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
-                "empirical_return_interval_80": raw_forecast.get("empirical_return_interval_80"),
-                "conformal_return_interval_80": raw_forecast.get("conformal_return_interval_80"),
-                "quantile_return_interval_80": raw_forecast.get("quantile_return_interval_80"),
-                "quantile_median_return": raw_forecast.get("quantile_median_return"),
-                "conformalized_quantile_return_interval_80": raw_forecast.get(
-                    "conformalized_quantile_return_interval_80"
-                ),
-                "preferred_return_interval_80": raw_forecast.get("preferred_return_interval_80"),
-                "preferred_return_interval_method": raw_forecast.get(
-                    "predicted_close_interval_method"
-                ),
-            }
-        else:
-            published_forecast = {
-                "assumed_entry_date": raw_forecast.get("assumed_entry_date"),
-                "scenario_exit_date": raw_forecast.get("scenario_exit_date"),
-                "entry_to_exit_gross_return": raw_forecast.get("entry_to_exit_gross_return"),
-                "entry_to_exit_gross_return_pct": raw_forecast.get("entry_to_exit_gross_return_pct"),
-                "estimated_net_return_after_cost": raw_forecast.get("estimated_net_return_after_cost"),
-                "estimated_net_return_after_cost_pct": raw_forecast.get("estimated_net_return_after_cost_pct"),
-                "calibrated_direction_positive_probability": raw_forecast.get(
-                    "direction_model_positive_probability"
-                ),
-                "direction_probability_method": raw_forecast.get("direction_probability_method"),
-                "historical_similar_sample_positive_rate": raw_forecast.get("empirical_positive_probability"),
-                "empirical_net_return_interval_80": raw_forecast.get("empirical_net_return_interval_80"),
-                "conformal_net_return_interval_80": raw_forecast.get("conformal_net_return_interval_80"),
-                "quantile_return_interval_80": raw_forecast.get("quantile_return_interval_80"),
-                "quantile_median_return": raw_forecast.get("quantile_median_return"),
-                "conformalized_quantile_return_interval_80": raw_forecast.get(
-                    "conformalized_quantile_return_interval_80"
-                ),
-                "preferred_return_interval_80": raw_forecast.get("preferred_return_interval_80"),
-                "preferred_net_return_interval_80": raw_forecast.get(
-                    "preferred_net_return_interval_80"
-                ),
-                "preferred_return_interval_method": raw_forecast.get(
-                    "preferred_return_interval_method"
-                ),
-                "position_and_cost": raw_forecast.get("position_and_cost"),
-            }
-        published_forecast.update(
-            {
-                "prediction_type": "validated_forecast" if validation_passed else "unvalidated_model_estimate",
-                "validation_passed": validation_passed,
-                "model_quality": diagnostics.get("quality_label", "low"),
-            }
-        )
-
-    model_recommendation: dict[str, Any] | None = None
-    if published_forecast is not None:
-        net_return_key = (
-            "estimated_return_after_roundtrip_cost"
-            if mode == "future_close"
-            else "estimated_net_return_after_cost"
-        )
-        estimated_net_return = published_forecast.get(net_return_key)
-        if estimated_net_return is None:
-            recommendation_decision = "watch"
-            recommendation_reason = "模型已给出方向预测，但当前缺少完整成本后收益"
-        elif float(estimated_net_return) > 0:
-            recommendation_decision = "recommend"
-            recommendation_reason = "当前模型预测扣除往返交易成本后的收益为正"
-        else:
-            recommendation_decision = "avoid"
-            recommendation_reason = "当前模型预测扣除往返交易成本后的收益不为正"
-        model_recommendation = {
-            "decision": recommendation_decision,
-            "reason": recommendation_reason,
-            "confidence": diagnostics.get("quality_label", "low"),
-            "validation_passed": validation_passed,
+    The analysis stage trains/calculates all three horizons together.  This
+    wrapper deliberately accepts no horizon or portfolio arguments:
+    one call returns the complete personal-use forecast for T+1/T+2/T+3.
+    """
+    future = full_result.get("future_3_trading_days") or {}
+    raw_forecasts = future.get("forecast") or {}
+    required_labels = {"T+1", "T+2", "T+3"}
+    if future.get("status") != "ok" or not raw_forecasts or not required_labels.issubset(raw_forecasts):
+        return {
+            "status": "unavailable",
+            "tool_contract_version": 4,
+            "analysis_id": analysis_id,
+            "stock": full_result.get("stock") or {},
+            "analysis_as_of": full_result.get("as_of"),
+            "signal_close": future.get("signal_close"),
+            "forecast": {},
+            "error": future.get("error") or "未来三个交易日预测当前不可用",
         }
 
-    scenario_name = str((quantitative.get("cost_assumption") or {}).get("scenario") or "normal_cost")
-    from src.ashare.bankuai_yuce import _load_cost_assumption
-
-    _, scenario, cost_path, cost_errors = _load_cost_assumption(scenario_name)
-    quote = full_result.get("current_quote") or {}
-    technical = full_result.get("technical_analysis") or {}
-    current_price = quote.get("last_price") if quote.get("status") == "ok" else technical.get("close")
-    position = _position_return(
-        ts_code=str(stock.get("ts_code") or ""),
-        buy_price=buy_price,
-        shares=shares,
-        position_value_yuan=position_value_yuan,
-        current_price=current_price,
-        projected_price=projected_price,
-        scenario=scenario,
-    )
-    raw_ensemble = diagnostics.get("production_model_ensemble") or diagnostics.get("model_ensemble")
-    public_ensemble = (
-        {
-            key: value
-            for key, value in raw_ensemble.items()
-            if key != "latest_component_predictions"
+    forecasts: dict[str, dict[str, Any]] = {}
+    for horizon in (1, 2, 3):
+        label = f"T+{horizon}"
+        raw = raw_forecasts.get(label) or {}
+        probability = _bounded_probability(
+            raw.get("direction_model_positive_probability")
+            if raw.get("direction_model_positive_probability") is not None
+            else raw.get("empirical_positive_probability")
+        )
+        forecasts[label] = {
+            "target_trade_date": raw.get("target_trade_date"),
+            "direction": raw.get("direction", "flat_or_unavailable"),
+            "positive_probability": probability,
+            "negative_probability": round(1.0 - probability, 6) if probability is not None else None,
+            "predicted_return": raw.get("cumulative_return_from_signal_close"),
+            "predicted_return_pct": raw.get("cumulative_return_from_signal_close_pct"),
+            "predicted_close": raw.get("predicted_close_reference"),
+            "interval_80": raw.get("predicted_close_interval_80"),
+            "validation_passed": bool(raw.get("validation_passed")),
+            "confidence": raw.get("model_quality", "low"),
         }
-        if isinstance(raw_ensemble, dict)
-        else None
-    )
 
     return {
-        "status": "ok" if published_forecast is not None else "unavailable",
-        "tool_contract_version": 3,
+        "status": "ok",
+        "tool_contract_version": 4,
         "analysis_id": analysis_id,
-        "analysis_stage_required": "gupiao_fenxi completed",
-        "stock": stock,
+        "stock": full_result.get("stock") or {},
         "analysis_as_of": full_result.get("as_of"),
-        "generated_at": full_result.get("generated_at"),
-        "request": {"mode": mode, "intent": intent, "horizon": label},
-        "forecast_status": forecast_status,
-        "forecast": published_forecast,
-        "model_recommendation": model_recommendation,
-        "forecast_notice": forecast_notice or None,
-        "unavailable_reason": unavailable_reason or None,
-        "validation_diagnostics": {
-            key: diagnostics.get(key)
-            for key in [
-                "validation_passed",
-                "quality_score",
-                "quality_label",
-                "direction_accuracy",
-                "mean_daily_rank_ic",
-                "skill_vs_median_baseline",
-                "walk_forward_folds_passed",
-                "final_holdout_passed",
-                "oos_samples",
-                "experiment_fingerprint",
-                "fold_stability",
-                "market_regime_stability",
-                "conformal_diagnostics",
-                "direction_probability_calibration",
-            ]
-        },
-        "model_ensemble": public_ensemble,
-        "position_return_analysis": position,
-        "cost_assumption": {
-            "scenario": scenario.name,
-            "config_path": cost_path,
-            "config_errors": cost_errors,
-        },
-        "interpretation": (
-            "买入问题解释为扣除广义交易成本后的上涨空间；卖出问题先分析后续空间，"
-            "提供买入价和持仓股数或金额后再计算持仓净收益。样本外验证用于标注可信度，"
-            "不再隐藏已经生成的模型收益预测。"
-        ),
+        "signal_date": future.get("signal_date"),
+        "signal_close": future.get("signal_close"),
+        "forecast": forecasts,
+        "definition": "以最近完整收盘日为T，预测未来第1、2、3个交易日收盘相对T收盘的方向和累计收益",
+        "note": "这是模型参考值，不是目标价或交易指令；confidence表示模型可信度，不是收益保证。",
     }
 
 
 class GupiaoYuceTool(BaseTool):
     name = "gupiao_yuce"
     description = (
-        "Second-stage request-specific T+1/T+2/T+3 forecast. It requires an analysis_id returned by gupiao_fenxi. "
-        "Use future_close for '未来几天/几天后走势' and holding_return for '买入后持有几天'. Interpret buy questions "
-        "as after-cost upside. Interpret sell questions as remaining upside; include buy_price and shares or position_value_yuan "
-        "when known to calculate net position return. Available model estimates are returned even when validation fails; "
-        "validation status and model quality must be reported as confidence information."
+        "Second-stage forecast. It requires the analysis_id returned by gupiao_fenxi and returns one result containing "
+        "the direction, positive probability, reference close, and confidence for T+1, T+2, and T+3."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "analysis_id": {"type": "string", "description": "Identifier returned by the preceding gupiao_fenxi call."},
-            "horizon": {"type": "integer", "enum": [1, 2, 3], "default": 2},
-            "mode": {"type": "string", "enum": ["future_close", "holding_return"]},
-            "intent": {"type": "string", "enum": ["forecast", "buy_upside", "sell_upside"], "default": "forecast"},
-            "buy_price": {"type": "number", "exclusiveMinimum": 0},
-            "shares": {"type": "integer", "minimum": 1},
-            "position_value_yuan": {"type": "number", "exclusiveMinimum": 0},
+            "analysis_id": {
+                "type": "string",
+                "description": "Identifier returned by the preceding gupiao_fenxi call.",
+            },
         },
-        "required": ["analysis_id", "horizon", "mode"],
+        "required": ["analysis_id"],
     }
     repeatable = True
     is_readonly = True
@@ -367,36 +114,10 @@ class GupiaoYuceTool(BaseTool):
                 },
                 ensure_ascii=False,
             )
-        horizon = int(kwargs.get("horizon", 2))
-        if horizon not in {1, 2, 3}:
-            return json.dumps({"status": "error", "error": "horizon必须是1、2或3"}, ensure_ascii=False)
-        mode = str(kwargs.get("mode") or "future_close")
-        if mode not in {"future_close", "holding_return"}:
-            return json.dumps({"status": "error", "error": "mode无效"}, ensure_ascii=False)
-        result = build_requested_forecast(
-            full_result,
-            analysis_id=analysis_id,
-            horizon=horizon,
-            mode=mode,
-            intent=str(kwargs.get("intent") or "forecast"),
-            buy_price=kwargs.get("buy_price"),
-            shares=kwargs.get("shares"),
-            position_value_yuan=kwargs.get("position_value_yuan"),
+        return json.dumps(
+            build_three_day_forecast(full_result, analysis_id=analysis_id),
+            ensure_ascii=False,
         )
-        try:
-            from src.ashare.yuce_liushui import record_single_prediction, settle_predictions
-
-            ledger_record = record_single_prediction(result)
-            result["prediction_ledger"] = {
-                **ledger_record,
-                "settlement": settle_predictions(),
-            }
-        except Exception as exc:
-            result["prediction_ledger"] = {
-                "status": "error",
-                "error": f"预测流水账写入失败：{exc}",
-            }
-        return json.dumps(result, ensure_ascii=False)
 
 
-__all__ = ["GupiaoYuceTool", "build_requested_forecast"]
+__all__ = ["GupiaoYuceTool", "build_three_day_forecast"]

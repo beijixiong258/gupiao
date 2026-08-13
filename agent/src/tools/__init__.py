@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from src.agent.tools import ToolRegistry
-from src.tools.bankuai_xuangu_tool import BankuaiXuanguTool
 from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
 from src.tools.gupiao_yuce_tool import GupiaoYuceTool
-from src.tools.yuce_biaoxian_tool import YuceBiaoxianTool
 
-_BUSINESS_TOOLS = (GupiaoFenxiTool, GupiaoYuceTool, BankuaiXuanguTool, YuceBiaoxianTool)
+_BUSINESS_TOOLS = (GupiaoFenxiTool, GupiaoYuceTool)
 
 
 def build_registry(

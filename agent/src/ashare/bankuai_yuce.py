@@ -56,11 +56,17 @@ from src.ashare.shuju_zhiliang import (
 )
 from src.ashare.shuju_yuan import _latest_tushare_daily, _limit_rate, _load_or_fetch_stock_basic, _tushare_pro
 from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
+from src.ashare.yinzi_gongcheng import (
+    COMPOSITE_FACTOR_COLUMNS,
+    FACTOR_ENGINEERING_VERSION,
+    engineered_factor_columns,
+    select_fold_factor_features,
+)
 from src.providers.llm import _ensure_dotenv
 from src.tools.path_utils import safe_run_dir
 
 
-BOARD_FEATURE_COLUMNS = FEATURE_COLUMNS + DAILY_FACTOR_FEATURE_COLUMNS
+BOARD_FEATURE_COLUMNS = list(dict.fromkeys(FEATURE_COLUMNS + DAILY_FACTOR_FEATURE_COLUMNS + engineered_factor_columns()))
 MARKET_BASELINE_FEATURE_COLUMNS = [
     column
     for column in DAILY_FACTOR_FEATURE_COLUMNS
@@ -1150,7 +1156,17 @@ def _select_stable_features(
     target_column: str,
     model_config: dict[str, Any],
 ) -> tuple[list[str], dict[str, Any]]:
-    """Select factors using only the supplied training window."""
+    """Select compact factors using the shared daily factor engine."""
+    return select_fold_factor_features(frame, candidate_features, target_column, model_config)
+
+
+def _select_stable_features_legacy(
+    frame: pd.DataFrame,
+    candidate_features: list[str],
+    target_column: str,
+    model_config: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Legacy implementation retained for artifact compatibility only."""
     enabled = bool(model_config.get("factor_stability_enabled", True))
     slices = max(2, int(model_config.get("factor_stability_slices", 3)))
     minimum_valid_slices = max(1, int(model_config.get("factor_min_valid_slices", 2)))
@@ -1860,7 +1876,9 @@ def xunlian_yuce_moxing(
         "feature_count": len(feature_columns),
         "features": list(feature_columns),
         "feature_coverage": {column: round(float(coverage[column]), 4) for column in feature_columns},
-        "feature_preprocessing": "训练窗口内完成因子稳定筛选和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放，验证和最新数据不参与拟合",
+        "factor_engineering_version": FACTOR_ENGINEERING_VERSION,
+        "composite_factor_columns": [column for column in COMPOSITE_FACTOR_COLUMNS if column in feature_columns],
+        "feature_preprocessing": "共享因子工程；训练窗口内完成逐日Rank IC筛选、同组Spearman去重和逐特征分位数去极值；Ridge与方向Logistic另做稳健缩放，验证和最新数据不参与拟合",
         "horizons": {},
     }
 
@@ -3567,19 +3585,6 @@ def bankuai_xuangu(
             )
     if validation["overall_quality_label"] == "low":
         result["risk_notice"] = "当前样本外验证质量为 low；即使存在正预测，也只能视为低强度分析证据。"
-    try:
-        from src.ashare.yuce_liushui import record_board_predictions, settle_predictions
-
-        ledger_record = record_board_predictions(result)
-        result["prediction_ledger"] = {
-            **ledger_record,
-            "settlement": settle_predictions(),
-        }
-    except Exception as exc:
-        result["prediction_ledger"] = {
-            "status": "error",
-            "error": f"预测流水账写入失败：{exc}",
-        }
     if run_dir:
         try:
             result["artifacts"] = _save_artifacts(run_dir, result)

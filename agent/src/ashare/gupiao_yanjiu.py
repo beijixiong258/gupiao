@@ -24,6 +24,10 @@ from src.ashare.shuju_yuan import (
     _tushare_pro,
 )
 from src.ashare.shuju_zhiliang import build_data_health, classify_failure
+from src.ashare.yinzi_gongcheng import (
+    RAW_PRICE_VOLUME_FEATURE_COLUMNS as ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS,
+    add_price_volume_factors,
+)
 from src.providers.llm import _ensure_dotenv
 from src.tools.path_utils import safe_run_dir
 
@@ -60,6 +64,10 @@ FEATURE_COLUMNS = [
     "volume_ratio_5_20",
     "amplitude_1",
 ]
+# ``FEATURE_COLUMNS`` remains the compact, backwards-compatible technical
+# contract used by the analysis layer.  The model layer additionally consumes
+# the registered continuous price/volume factors below.
+RAW_PRICE_VOLUME_FEATURE_COLUMNS = list(ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS)
 FINANCIAL_CRITICAL_FIELDS = ("roe_pct", "net_profit_yoy_pct", "debt_to_assets_pct")
 
 # Kept for compatibility with callers that imported the old module global.  A
@@ -161,9 +169,11 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
             "ensemble_min_calibration_dates": 20,
             "time_decay_min_calibration_samples": 80,
             "time_decay_min_calibration_dates": 20,
-            "factor_stability_slices": 3,
-            "factor_min_valid_slices": 2,
-            "factor_min_features": 12,
+            "factor_stability_slices": 6,
+            "factor_min_valid_slices": 4,
+            "factor_min_features": 15,
+            "factor_max_features": 20,
+            "factor_max_per_group": 3,
             "direction_logistic_max_iter": 500,
             "probability_calibration_min_samples": 120,
             "conformal_min_samples": 80,
@@ -201,6 +211,7 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         model_feature_coverage = float(model.get("min_feature_coverage", 0.20))
         factor_min_sign_agreement = float(model.get("factor_min_sign_agreement", 0.67))
         factor_min_abs_ic = float(model.get("factor_min_abs_mean_rank_ic", 0.005))
+        factor_dedup_abs_spearman = float(model.get("factor_dedup_abs_spearman", 0.80))
         direction_logistic_c = float(model.get("direction_logistic_c", 0.5))
         calibration_evaluation_ratio = float(model.get("probability_calibration_evaluation_ratio", 0.30))
         calibration_min_improvement = float(model.get("probability_calibration_min_brier_improvement", 0.0005))
@@ -234,6 +245,10 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.min_passed_subwindows 不能大于 validation_subwindows")
     if positive_integer_fields["factor_min_valid_slices"] > positive_integer_fields["factor_stability_slices"]:
         raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
+    if positive_integer_fields["factor_max_features"] < positive_integer_fields["factor_min_features"]:
+        raise ValueError("moxing.factor_max_features 不能小于 factor_min_features")
+    if positive_integer_fields["factor_max_per_group"] > positive_integer_fields["factor_max_features"]:
+        raise ValueError("moxing.factor_max_per_group 不能大于 factor_max_features")
     if not 0.5 <= min_direction <= 1:
         raise ValueError("moxing.min_direction_accuracy 必须在 0.5 到 1 之间")
     if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1 or not -1 <= min_best_naive_skill <= 1:
@@ -260,6 +275,8 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.factor_min_sign_agreement 必须在 0.5 到 1 之间")
     if not 0 <= factor_min_abs_ic <= 1:
         raise ValueError("moxing.factor_min_abs_mean_rank_ic 必须在 0 到 1 之间")
+    if not 0 < factor_dedup_abs_spearman <= 1:
+        raise ValueError("moxing.factor_dedup_abs_spearman 必须在 0 到 1 之间")
     if not math.isfinite(direction_logistic_c) or direction_logistic_c <= 0:
         raise ValueError("moxing.direction_logistic_c 必须是正有限数")
     if not 0.1 <= calibration_evaluation_ratio <= 0.5:
@@ -1058,6 +1075,10 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     volume_20 = volume.rolling(20, min_periods=20).mean()
     data["volume_ratio_5_20"] = volume_5 / volume_20.replace(0, np.nan)
     data["amplitude_1"] = (high - low) / previous_close.replace(0, np.nan)
+    # Keep all newly introduced factors in the same leak-free daily pipeline.
+    # The helper is independent of model labels and works for both standalone
+    # technical analysis and the stock/board training panels.
+    data = add_price_volume_factors(data)
     return data.replace([np.inf, -np.inf], np.nan)
 
 
@@ -1572,9 +1593,8 @@ def _a_share_rules(
         ),
         "buy_lot": buy_lot,
         "prediction_horizon": (
-            "单股工具支持 T+1/T+2/T+3：T日收盘后生成信号，下一交易日开盘计划入场；"
-            "T+1/T+2/T+3分别表示入场后第1/2/3个可卖出交易日收盘。"
-            "模型输出入场到退出收益，不伪造尚未知开盘价对应的精确目标价"
+            "公开三日预测以最近完整收盘日T为基准；T+1/T+2/T+3分别表示之后第1/2/3个实际交易日收盘。"
+            "参考收盘价由模型从T收盘推导，不伪造尚未知开盘价对应的精确目标价"
         ),
     }
 
@@ -1584,19 +1604,17 @@ def fenxi_gupiao(
     gupiao: str,
     source: str = "auto",
     history_calendar_days: int | None = None,
-    holding_days: int = 2,
-    budget_yuan: float | None = None,
     config_path: str | None = None,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Run deterministic single-stock research with horizon-aware ML gates."""
+    """Run the first stage of the personal single-stock analysis workflow."""
     _ensure_dotenv()
     config, resolved_config = jiazai_lianghua_peizhi(config_path)
-    holding_days = int(holding_days)
-    if holding_days not in {1, 2, 3}:
-        raise ValueError("holding_days 必须是 1、2 或 3 个交易日")
-    if budget_yuan is not None and (not math.isfinite(float(budget_yuan)) or float(budget_yuan) <= 0):
-        raise ValueError("budget_yuan 必须是大于0的有限数值")
+    # The public product has one fixed direction reference and one fixed
+    # three-day forecast.  The model layer still uses T+2 internally when it
+    # needs a single representative horizon for the evidence summary.
+    holding_days = 2
+    budget_yuan = None
     configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1440))
     history_calendar_days = configured_history_days if history_calendar_days is None else int(history_calendar_days)
     history_calendar_days = max(540, min(history_calendar_days, 1800))
@@ -1696,8 +1714,6 @@ def fenxi_gupiao(
             target_adjustment=market.adjustment,
             source=source,
             signal_date=str(technical["trade_date"]),
-            holding_days=holding_days,
-            budget_yuan=budget_yuan,
             config=config,
             technical=technical,
             fundamentals=fundamentals,
@@ -1760,7 +1776,7 @@ def fenxi_gupiao(
     risks.extend(str(value) for value in tradability.get("hard_blocks", []))
     risks.extend(str(value) for value in tradability.get("cautions", []))
     if quantitative.get("status") != "ok":
-        risks.append("指定持有期量化模型本次不可用或同行样本不足，相关证据不足")
+        risks.append("三交易日量化模型本次不可用或同行样本不足，方向证据不足")
 
     peer_universe = quantitative.get("peer_universe", {})
     history_fetch = peer_universe.get("history_fetch", {})
@@ -1789,10 +1805,8 @@ def fenxi_gupiao(
         "tool_contract_version": SINGLE_STOCK_TOOL_CONTRACT_VERSION,
         "analysis_type": "single_stock",
         "analysis_request": {
-            "requested_holding_trading_days": holding_days,
-            "requested_horizon": f"T+{holding_days}",
-            "budget_yuan": budget_yuan,
             "history_calendar_days": history_calendar_days,
+            "prediction_horizons": ["T+1", "T+2", "T+3"],
         },
         "stock": {"ts_code": code, "name": name, **{key: value for key, value in profile.items() if key not in {"ts_code", "name"}}},
         "as_of": technical["trade_date"],
@@ -1827,8 +1841,8 @@ def fenxi_gupiao(
         "risks": risks,
         "configuration": {
             "quant_config_path": resolved_config,
-            "cost_scenario": config.get("jiaoyi", {}).get("cost_scenario"),
-            "dynamic_slippage_enabled": config.get("jiaoyi", {}).get("dynamic_slippage_enabled", True),
+            "data_frequency": "daily",
+            "forecast_horizons": ["T+1", "T+2", "T+3"],
         },
         "scope_note": (
             "这是基于公开数据、同行面板和滚动样本外验证的A股研究结果，不是收益保证；"
