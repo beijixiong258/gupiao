@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -80,27 +79,19 @@ def test_technical_features_use_only_current_and_past_rows() -> None:
     assert summary["trade_date"] == original["trade_date"].iloc[-1].strftime("%Y-%m-%d")
 
 
-def test_external_config_hard_caps_horizons_at_t3() -> None:
+def test_internal_config_hard_caps_horizons_at_t3() -> None:
     config, path = jiazai_lianghua_peizhi()
     assert path.endswith("lianghua_peizhi.json")
     assert config["moxing"]["horizons"] == [1, 2, 3]
-    assert config["jiaoyi"]["max_holding_days"] == 3
     assert config["shuju"]["akshare_bypass_proxy"] is True
-    assert config["jiaoyi"]["execution_mode"] == "research_only"
-    assert config["jiaoyi"]["allow_live_trading"] is False
-    assert config["jiaoyi"]["allow_order_submission"] is False
+    assert "jiaoyi" not in config
     assert "source" not in config["shuju"]
     assert "min_list_days" not in config["guolv"]
 
 
-def test_config_cannot_enable_order_submission(tmp_path: Path) -> None:
+def test_trading_configuration_is_not_loaded() -> None:
     config, _ = jiazai_lianghua_peizhi()
-    config["jiaoyi"]["allow_order_submission"] = True
-    config_path = tmp_path / "unsafe.json"
-    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="禁止实盘交易和订单提交"):
-        jiazai_lianghua_peizhi(str(config_path))
+    assert "jiaoyi" not in config
 
 
 def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
@@ -176,6 +167,10 @@ def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:
     histories = {code: _history(index + 10) for index, code in enumerate(codes)}
     names = {code: f"样本{index}" for index, code in enumerate(codes)}
     config, _ = jiazai_lianghua_peizhi()
+    # This contract test covers the purged split and fixed T+1/T+2/T+3
+    # outputs.  Five random synthetic stocks are not a meaningful universe
+    # for the production Rank-IC stability gate, which has dedicated tests.
+    config["moxing"]["factor_stability_enabled"] = False
     panel = goujian_moxing_shuju(histories, names, [1, 2, 3])
     latest = (
         panel.sort_values("trade_date")

@@ -86,9 +86,9 @@ class XingqingJieguo:
     errors: tuple[str, ...]
 
 
-def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, Any], str]:
-    """Load and validate the external quant configuration."""
-    path = Path(config_path).expanduser().resolve() if config_path else DEFAULT_CONFIG_PATH
+def jiazai_lianghua_peizhi() -> tuple[dict[str, Any], str]:
+    """Load and validate the fixed internal daily-model configuration."""
+    path = DEFAULT_CONFIG_PATH
     if not path.is_file():
         raise FileNotFoundError(f"量化配置文件不存在：{path}")
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -346,27 +346,6 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("moxing.l2_regularization 不能小于 0")
     if any(item <= 0 for item in model_integer_fields.values()):
         raise ValueError("moxing 的迭代次数、树规模、深度和叶节点样本数必须为正整数")
-    max_holding_days = int(value.get("jiaoyi", {}).get("max_holding_days", 0))
-    if max_holding_days != 3:
-        raise ValueError("jiaoyi.max_holding_days 必须为 3")
-    trading = value.get("jiaoyi", {})
-    if (
-        trading.get("execution_mode") != "research_only"
-        or trading.get("allow_live_trading") is not False
-        or trading.get("allow_order_submission") is not False
-    ):
-        raise ValueError("本程序被硬限制为 research_only，禁止实盘交易和订单提交")
-    if not isinstance(trading.get("dynamic_slippage_enabled", True), bool):
-        raise ValueError("jiaoyi.dynamic_slippage_enabled 必须是 true 或 false")
-    try:
-        maximum_dynamic_slippage = float(trading.get("max_dynamic_slippage_bps_roundtrip", 40.0))
-        maximum_participation = float(trading.get("max_participation_rate", 0.005))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"jiaoyi 动态成交成本配置无效：{exc}") from exc
-    if not 0 <= maximum_dynamic_slippage <= 500:
-        raise ValueError("jiaoyi.max_dynamic_slippage_bps_roundtrip 必须在 0 到 500 之间")
-    if not 0 < maximum_participation <= 0.1:
-        raise ValueError("jiaoyi.max_participation_rate 必须在 0 到 0.1 之间")
     single = value.get("dangu", {})
     if not isinstance(single, dict):
         raise ValueError("dangu 必须是 JSON 对象")
@@ -422,8 +401,6 @@ def jiazai_lianghua_peizhi(config_path: str | None = None) -> tuple[dict[str, An
         raise ValueError("dangu 的验证窗口至少为 20 日，训练日期至少为 80 日")
     if minimum_fold_training <= 0 or minimum_fold_validation <= 0:
         raise ValueError("dangu 的每折训练和验证样本数必须为正整数")
-    if not str(trading.get("cost_scenario", "")).strip():
-        raise ValueError("jiaoyi.cost_scenario 不能为空")
     return value, str(path)
 
 
@@ -1604,17 +1581,13 @@ def fenxi_gupiao(
     gupiao: str,
     source: str = "auto",
     history_calendar_days: int | None = None,
-    config_path: str | None = None,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
     """Run the first stage of the personal single-stock analysis workflow."""
     _ensure_dotenv()
-    config, resolved_config = jiazai_lianghua_peizhi(config_path)
-    # The public product has one fixed direction reference and one fixed
-    # three-day forecast.  The model layer still uses T+2 internally when it
-    # needs a single representative horizon for the evidence summary.
-    holding_days = 2
-    budget_yuan = None
+    config, _ = jiazai_lianghua_peizhi()
+    # The public product has one fixed direction-evidence stage and one fixed
+    # three-trading-day forecast stage.  No prediction model is fitted here.
     configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1440))
     history_calendar_days = configured_history_days if history_calendar_days is None else int(history_calendar_days)
     history_calendar_days = max(540, min(history_calendar_days, 1800))
@@ -1686,9 +1659,9 @@ def fenxi_gupiao(
     name = str(profile.get("name") or resolved.get("name") or "")
     fundamental_score, fundamental_evidence = _fundamental_score(fundamentals)
     from src.ashare.dangu_yuce import (
+        fenxi_dangu_yinzi,
         huoqu_dangqian_kuaizhao,
         pinggu_kejiaoyixing,
-        yanjiu_dangu_yuce,
     )
 
     execution_reference = datetime.now()
@@ -1705,7 +1678,12 @@ def fenxi_gupiao(
     )
     industry = str(profile.get("industry") or profile.get("所属行业") or resolved.get("industry") or "")
     try:
-        quantitative = yanjiu_dangu_yuce(
+        fundamentals_for_analysis = {
+            **fundamentals,
+            "score_0_100": fundamental_score,
+            "evidence": fundamental_evidence,
+        }
+        quantitative = fenxi_dangu_yinzi(
             code=code,
             name=name,
             industry=industry,
@@ -1716,16 +1694,16 @@ def fenxi_gupiao(
             signal_date=str(technical["trade_date"]),
             config=config,
             technical=technical,
-            fundamentals=fundamentals,
+            fundamentals=fundamentals_for_analysis,
             tradability=tradability,
         )
     except Exception as exc:
         fallback_label = "证据偏负面" if not tradability.get("basic_execution_feasible") else "证据不足"
         fallback_reasons = list(tradability.get("hard_blocks", []))
-        fallback_reasons.append(f"单股量化模型本次不可用：{exc}")
+        fallback_reasons.append(f"量化因子分析本次不可用：{exc}")
         quantitative = {
             "status": "unavailable",
-            "requested_horizon": f"T+{holding_days}",
+            "model_status": "not_run",
             "forecast": {},
             "future_3_trading_days": {
                 "status": "unavailable",
@@ -1736,7 +1714,7 @@ def fenxi_gupiao(
             "validation": {"horizons": {}, "passed_horizons": 0},
             "analysis_assessment": {
                 "evidence_label": fallback_label,
-                "requested_horizon": f"T+{holding_days}",
+                "requested_horizon": "当前因子状态",
                 "summary": f"{fallback_label}：{fallback_reasons[0]}",
                 "reasons": fallback_reasons,
                 "signal_gate": {
@@ -1748,9 +1726,21 @@ def fenxi_gupiao(
             },
             "error": str(exc),
             "failure_category": classify_failure(exc),
-            "failure_stage": "single_stock_model",
-            "limitations": ["模型失败时不使用启发式技术分替代收益预测"],
+            "failure_stage": "factor_analysis",
+            "factor_analysis": {
+                "status": "unavailable",
+                "model_status": "not_run",
+                "direction": "中性/不确定",
+                "evidence_label": fallback_label,
+                "error": str(exc),
+            },
+            "limitations": ["分析阶段不训练收益预测模型；模型预测请调用第二阶段"],
+            "_prediction_context": None,
         }
+    prediction_context = quantitative.pop("_prediction_context", None)
+    quantitative_public = {
+        key: value for key, value in quantitative.items() if not str(key).startswith("_")
+    }
     risks: list[str] = []
     if market.adjustment == "raw_unadjusted":
         risks.append("行情未复权，历史分红送转可能影响长周期技术指标")
@@ -1776,7 +1766,7 @@ def fenxi_gupiao(
     risks.extend(str(value) for value in tradability.get("hard_blocks", []))
     risks.extend(str(value) for value in tradability.get("cautions", []))
     if quantitative.get("status") != "ok":
-        risks.append("三交易日量化模型本次不可用或同行样本不足，方向证据不足")
+        risks.append("量化因子分析本次不可用或同行样本不足，方向证据不足")
 
     peer_universe = quantitative.get("peer_universe", {})
     history_fetch = peer_universe.get("history_fetch", {})
@@ -1807,6 +1797,7 @@ def fenxi_gupiao(
         "analysis_request": {
             "history_calendar_days": history_calendar_days,
             "prediction_horizons": ["T+1", "T+2", "T+3"],
+            "prediction_training": "deferred_until_explicit_forecast_request",
         },
         "stock": {"ts_code": code, "name": name, **{key: value for key, value in profile.items() if key not in {"ts_code", "name"}}},
         "as_of": technical["trade_date"],
@@ -1824,9 +1815,9 @@ def fenxi_gupiao(
         "data_health": data_health,
         "current_quote": current_quote,
         "tradability": tradability,
-        "quantitative_analysis": quantitative,
-        "future_3_trading_days": quantitative.get("future_3_trading_days", {}),
-        "analysis_assessment": quantitative.get("analysis_assessment", {}),
+        "quantitative_analysis": quantitative_public,
+        "future_3_trading_days": quantitative_public.get("future_3_trading_days", {}),
+        "analysis_assessment": quantitative_public.get("analysis_assessment", {}),
         "technical_analysis": technical,
         "fundamental_analysis": {
             **fundamentals,
@@ -1839,16 +1830,17 @@ def fenxi_gupiao(
         },
         "a_share_rules": _a_share_rules(code, name),
         "risks": risks,
-        "configuration": {
-            "quant_config_path": resolved_config,
+        "research_scope": {
             "data_frequency": "daily",
             "forecast_horizons": ["T+1", "T+2", "T+3"],
+            "note": "程序固定使用日K；预测只覆盖未来三个实际交易日",
         },
         "scope_note": (
-            "这是基于公开数据、同行面板和滚动样本外验证的A股研究结果，不是收益保证；"
-            "数值、模型门槛和证据标签由程序生成，LLM只负责解释，不得改写"
+            "这是基于公开数据、量化因子和同行横截面证据的A股研究结果，不是收益保证；"
+            "分析阶段不训练预测模型，LLM只负责把程序生成的证据翻译成通俗说明，不得改写数值"
         ),
         "execution_policy": "research_only：程序只做分析和预测，不连接券商、不读取交易账户、不提交委托，也不替用户作买卖决定。",
+        "_prediction_context": prediction_context,
     }
 
     if run_dir:
@@ -1857,7 +1849,8 @@ def fenxi_gupiao(
             artifact_dir = run_path / "artifacts"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             output = artifact_dir / f"gupiao_fenxi_{code.replace('.', '_')}.json"
-            output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            artifact_result = {key: value for key, value in result.items() if not str(key).startswith("_")}
+            output.write_text(json.dumps(artifact_result, ensure_ascii=False, indent=2), encoding="utf-8")
             result["artifact"] = str(output)
         except Exception as exc:
             result["artifact_error"] = str(exc)

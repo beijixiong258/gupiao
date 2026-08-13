@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.tools.gupiao_analysis_cache import get_analysis
+from src.tools.gupiao_analysis_cache import get_analysis, get_prediction_context
 
 
 def _bounded_probability(value: Any) -> float | None:
@@ -28,7 +28,7 @@ def build_three_day_forecast(
 ) -> dict[str, Any]:
     """Publish the three forecasts calculated from one completed diagnosis.
 
-    The analysis stage trains/calculates all three horizons together.  This
+    The prediction stage trains/calculates all three horizons together.  This
     wrapper deliberately accepts no horizon or portfolio arguments:
     one call returns the complete personal-use forecast for T+1/T+2/T+3.
     """
@@ -100,7 +100,9 @@ class GupiaoYuceTool(BaseTool):
         "required": ["analysis_id"],
     }
     repeatable = True
-    is_readonly = True
+    # This stage intentionally performs the deferred model fit against shared
+    # in-process context, so it must be serialized with the first-stage tool.
+    is_readonly = False
 
     def execute(self, **kwargs: Any) -> str:
         analysis_id = str(kwargs.get("analysis_id") or "").strip()
@@ -114,6 +116,31 @@ class GupiaoYuceTool(BaseTool):
                 },
                 ensure_ascii=False,
             )
+        prediction_context = get_prediction_context(analysis_id)
+        if prediction_context is not None:
+            # The first stage deliberately stores only deterministic factor
+            # evidence.  Fit the expensive return models here, after the user
+            # has explicitly requested a forecast.
+            try:
+                from src.ashare.dangu_yuce import yanjiu_dangu_yuce
+
+                quantitative = yanjiu_dangu_yuce(**prediction_context)
+                full_result = dict(full_result)
+                full_result["quantitative_analysis"] = quantitative
+                full_result["future_3_trading_days"] = quantitative.get("future_3_trading_days", {})
+                full_result["analysis_assessment"] = quantitative.get("analysis_assessment", {})
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "unavailable",
+                        "tool_contract_version": 4,
+                        "analysis_id": analysis_id,
+                        "stock": full_result.get("stock") or {},
+                        "forecast": {},
+                        "error": f"按需训练三交易日预测模型失败：{exc}",
+                    },
+                    ensure_ascii=False,
+                )
         return json.dumps(
             build_three_day_forecast(full_result, analysis_id=analysis_id),
             ensure_ascii=False,

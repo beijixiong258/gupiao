@@ -47,6 +47,7 @@ from src.ashare.gupiao_yanjiu import (
     _stock_basic_cache,
     akshare_zhilian,
     biaozhunhua_daima,
+    jisuan_tezheng_biao,
     huoqu_rili_xingqing,
     shi_a_gu,
 )
@@ -60,7 +61,12 @@ from src.ashare.jiaoyi_zhixing import (
 from src.ashare.moxing_pinggu import regression_baseline_metrics, signal_evidence_gate
 from src.ashare.shuju_yuan import _load_or_fetch_stock_basic, _price_limit_rule, _tushare_pro
 from src.ashare.riping_yinzi import DAILY_FACTOR_FEATURE_COLUMNS, enrich_daily_factor_panel
-from src.ashare.yinzi_gongcheng import FACTOR_ENGINEERING_VERSION, engineered_factor_columns
+from src.ashare.yinzi_gongcheng import (
+    FACTOR_ENGINEERING_VERSION,
+    FACTOR_GROUPS,
+    engineered_factor_columns,
+    factor_role,
+)
 
 
 SINGLE_STOCK_EXTRA_FEATURES = [
@@ -853,8 +859,7 @@ def _fit_single_stock_models(
     expected_folds = max(2, int(single_config.get("walk_forward_folds", 6)))
     min_passed_folds = max(1, int(single_config.get("min_passed_folds", 4)))
     validation_top_n = max(1, int(model_config.get("validation_top_n", 3)))
-    cost_scenario_name = str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
-    _, cost_scenario, _, _ = _load_cost_assumption(cost_scenario_name)
+    _, cost_scenario, _, _ = _load_cost_assumption("research_reference")
 
     for horizon in horizons:
         target_column = f"target_t{horizon}"
@@ -981,7 +986,7 @@ def _fit_single_stock_models(
                 budget_yuan=budget_yuan,
                 scenario=cost_scenario,
                 top_n=validation_top_n,
-                trading_settings=config.get("jiaoyi", {}),
+                trading_settings=None,
             )
             fold_passed = bool(
                 direction >= 0.50
@@ -1206,7 +1211,7 @@ def _fit_single_stock_models(
                 budget_yuan=budget_yuan,
                 scenario=cost_scenario,
                 top_n=validation_top_n,
-                trading_settings=config.get("jiaoyi", {}),
+                trading_settings=None,
             )
             residual = actual - predicted
             residual_low, residual_high = np.nanquantile(residual, [0.10, 0.90])
@@ -2121,6 +2126,366 @@ def _build_analysis_assessment(
     }
 
 
+def _factor_number(value: Any, digits: int = 6) -> float | None:
+    """Convert a factor value to a finite JSON-safe number."""
+    return _round_optional(value, digits)
+
+
+def _factor_percentile(
+    value: Any,
+    comparable: pd.Series,
+) -> float | None:
+    """Return the signal row's same-date cross-sectional percentile."""
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    values = pd.to_numeric(comparable, errors="coerce").dropna()
+    if pd.isna(parsed) or len(values) < 5:
+        return None
+    return round(float((values <= float(parsed)).mean()), 4)
+
+
+_FACTOR_GROUP_MEANINGS: dict[str, tuple[str, str]] = {
+    "trend_structure": ("趋势结构", "均线结构、趋势斜率和趋势拟合质量，判断趋势是否连贯"),
+    "momentum_reversal": ("动量与反转", "不同周期收益、RSI、MACD，观察动量延续或反转"),
+    "candle_pressure": ("K线压力", "跳空、日内收益、收盘位置和影线，观察买卖压力"),
+    "price_volume_confirmation": ("价量确认", "量比、成交额异常、价量相关和量价残差，判断走势是否有成交量确认"),
+    "breakout_pullback_quality": ("突破与回撤质量", "突破距离、放量确认、回撤质量和停滞压力，判断突破是否健康"),
+    "relative_strength": ("相对强弱", "相对同行、行业和市场基准的超额收益与排名，判断是否跑赢参照物"),
+    "risk_liquidity": ("风险与流动性", "ATR、波动率、振幅、回撤、成交额、换手和市值流动性，识别波动与交易风险"),
+    "market_context": ("市场背景", "全市场和行业广度、平均收益、离散度与市场状态，判断个股信号所处环境"),
+}
+
+
+def _build_factor_analysis(
+    *,
+    target_rows: pd.DataFrame,
+    panel: pd.DataFrame | None,
+    signal_date: str,
+    technical: dict[str, Any],
+    fundamentals: dict[str, Any],
+    tradability: dict[str, Any],
+    peer_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a deterministic, human-readable factor diagnosis.
+
+    This function intentionally contains no sklearn model fitting, target
+    labels, or future prices.  It reports current/past factor values and,
+    when a peer panel is available, same-date relative percentiles.
+    """
+    if target_rows is None or target_rows.empty:
+        return {
+            "status": "unavailable",
+            "error": "当前没有可用的信号日因子",
+            "model_status": "not_run",
+        }
+    target = target_rows.tail(1).iloc[0]
+    signal = pd.Timestamp(signal_date).normalize()
+    same_day = pd.DataFrame()
+    if panel is not None and not panel.empty and "trade_date" in panel.columns:
+        dates = pd.to_datetime(panel["trade_date"], errors="coerce").dt.normalize()
+        same_day = panel.loc[dates.eq(signal)].copy()
+    peer_count = int(len(same_day))
+    groups: dict[str, dict[str, Any]] = {}
+    alpha_scores: list[float] = []
+    risk_scores: list[float] = []
+    evidence: list[str] = []
+    factor_evidence: list[str] = []
+    available_factor_count = 0
+    total_factor_count = 0
+
+    # ``FACTOR_GROUPS`` is the single source of truth for names and economic
+    # grouping.  Values are exposed verbatim enough for an LLM to explain,
+    # while percentiles are explicitly labeled as descriptive, not
+    # probabilities.
+    for group, members in FACTOR_GROUPS.items():
+        group_label, economic_meaning = _FACTOR_GROUP_MEANINGS.get(
+            group, (group, "该因子组的当前量化证据")
+        )
+        total_factor_count += len(members)
+        available: list[str] = []
+        values: dict[str, float | None] = {}
+        percentiles: dict[str, float | None] = {}
+        for feature in members:
+            if feature not in target.index:
+                continue
+            number = _factor_number(target.get(feature))
+            if number is None:
+                continue
+            available.append(feature)
+            available_factor_count += 1
+            values[feature] = number
+            percentiles[feature] = _factor_percentile(
+                number,
+                same_day[feature] if feature in same_day.columns else pd.Series(dtype=float),
+            )
+        role = factor_role(f"factor_{group}_composite")
+        usable_percentiles = [value for value in percentiles.values() if value is not None]
+        score = (
+            round(float(np.mean(usable_percentiles)) * 100.0, 2)
+            if usable_percentiles
+            else None
+        )
+        if role == "risk":
+            label = "风险/流动性因子位置偏高" if score is not None and score >= 65 else "风险/流动性因子位置偏低" if score is not None and score <= 35 else "风险/流动性因子位置中等或信息有限"
+            if score is not None:
+                risk_scores.append(score)
+        elif role == "context":
+            label = "市场背景信息"
+        else:
+            label = "因子相对位置偏高" if score is not None and score >= 65 else "因子相对位置偏低" if score is not None and score <= 35 else "因子相对位置中等或信息有限"
+            if score is not None:
+                alpha_scores.append(score)
+        groups[group] = {
+            "label": group_label,
+            "role": role,
+            "status": "ok" if available else "unavailable",
+            "factor_count": len(members),
+            "available_factor_count": len(available),
+            "factors": available,
+            "values": values,
+            "same_date_peer_percentiles": percentiles,
+            "score_0_100": score,
+            "interpretation": label,
+            "economic_meaning": economic_meaning,
+        }
+        if score is not None:
+            position = f"同日同行分位均值 {score:.1f}/100"
+        else:
+            position = "同行同日分位不可用"
+        factor_evidence.append(
+            f"{group_label}：{economic_meaning}；使用 {len(available)}/{len(members)} 个因子；"
+            f"{label}；{position}。"
+        )
+
+    technical_score = _factor_number(technical.get("score_0_100"), 2)
+    fundamental_score = _factor_number((fundamentals or {}).get("score_0_100"), 2)
+    score_parts: list[tuple[float, float]] = []
+    if technical_score is not None:
+        score_parts.append((technical_score, 0.65))
+    if fundamental_score is not None:
+        score_parts.append((fundamental_score, 0.35))
+    # Relative factor ranks are only meaningful with a real cross-section.
+    relative_alpha_score = round(float(np.mean(alpha_scores)), 2) if alpha_scores and peer_count >= 5 else None
+    # The raw registry contains factors with different economic polarity.
+    # Cross-sectional averages are therefore descriptive positions only and
+    # must not be treated as an oriented bullish/bearish score.
+    risk_percentile_score = round(float(np.mean(risk_scores)), 2) if risk_scores and peer_count >= 5 else None
+    # Risk/liquidity contains mixed-polarity inputs (for example volatility
+    # and liquidity), so expose its percentile for explanation but do not
+    # fold an un-oriented average into the directional score.
+    total_weight = sum(weight for _, weight in score_parts)
+    overall_score = round(sum(score * weight for score, weight in score_parts) / total_weight, 2) if total_weight else None
+    if overall_score is None:
+        direction = "中性/不确定"
+        evidence_label = "证据不足"
+    elif overall_score >= 60:
+        direction = "偏上涨"
+        evidence_label = "证据偏正面"
+    elif overall_score <= 40:
+        direction = "偏下跌"
+        evidence_label = "证据偏负面"
+    else:
+        direction = "中性/不确定"
+        evidence_label = "证据中性"
+    technical_evidence = [str(value) for value in (technical.get("evidence") or [])]
+    fundamental_evidence = [str(value) for value in (fundamentals or {}).get("evidence", [])]
+    # Keep every factor group visible.  The LLM and the terminal renderer use
+    # ``factor_evidence`` for a complete eight-group explanation, while this
+    # combined list remains backward-compatible for callers that consume
+    # ``evidence``.
+    evidence = (technical_evidence + fundamental_evidence + factor_evidence)[:24]
+    if not evidence:
+        evidence = ["当前可用因子不足，无法形成明确方向证据"]
+    return {
+        "status": "ok",
+        "model_status": "not_run",
+        "basis": "最近完整收盘日及其之前的日K、成交量、基本面和可取得的同行同日横截面",
+        "signal_date": signal.strftime("%Y-%m-%d"),
+        "peer_count_on_signal_date": peer_count,
+        "factor_group_count": len(groups),
+        "factor_count": total_factor_count,
+        "available_factor_count": available_factor_count,
+        "technical_score_0_100": technical_score,
+        "fundamental_score_0_100": fundamental_score,
+        "relative_alpha_score_0_100": relative_alpha_score,
+        "risk_percentile_score_0_100": risk_percentile_score,
+        "overall_evidence_score_0_100": overall_score,
+        "direction": direction,
+        "evidence_label": evidence_label,
+        "groups": groups,
+        "factor_evidence": factor_evidence,
+        "evidence": evidence,
+        "interpretation_note": "分数和同日分位数是当前证据的描述性量化汇总，不是上涨概率、收益预测或目标价。",
+        "peer_universe": peer_meta,
+        "limitations": [
+            "分析阶段不拟合收益预测模型；如需 T+1/T+2/T+3 数值，请调用第二阶段预测",
+            "同行分位数受当前可取得的同行池和数据完整度影响",
+        ],
+    }
+
+
+def _build_factor_panel(
+    histories: dict[str, pd.DataFrame],
+    names: dict[str, str],
+    *,
+    source: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build a daily factor panel without creating future labels."""
+    frames: list[pd.DataFrame] = []
+    for code, history in histories.items():
+        if history is None or history.empty:
+            continue
+        features = jisuan_tezheng_biao(history)
+        features["trade_date"] = pd.to_datetime(features["trade_date"], errors="coerce").dt.normalize()
+        features["ts_code"] = str(code)
+        features["name"] = str(names.get(code) or "")
+        if "peer_role" in history.columns:
+            features["peer_role"] = history.get("peer_role", "").astype(str).to_numpy()
+        frames.append(features)
+    if not frames:
+        return pd.DataFrame(), {"status": "unavailable", "warnings": ["没有可构造因子面板的历史行情"]}
+    panel = pd.concat(frames, ignore_index=True, sort=False)
+    panel = _add_single_stock_features(panel)
+    panel, factor_meta = enrich_daily_factor_panel(
+        panel,
+        source=source,
+        include_historical_valuation=True,
+    )
+    return panel, factor_meta
+
+
+def fenxi_dangu_yinzi(
+    *,
+    code: str,
+    name: str,
+    industry: str,
+    target_history: pd.DataFrame,
+    target_source: str,
+    target_adjustment: str,
+    source: str,
+    signal_date: str,
+    config: dict[str, Any],
+    technical: dict[str, Any],
+    fundamentals: dict[str, Any],
+    tradability: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the analysis-stage factor calculation only.
+
+    No regression, classifier, probability calibration, or future-return
+    label is fitted here.  The returned private context is consumed by the
+    second-stage prediction tool when the user explicitly asks for a forecast.
+    """
+    peer_table, peer_meta = xuanze_tonghang_yangben(
+        code=code,
+        name=name,
+        industry=industry,
+        signal_date=signal_date,
+        config=config,
+    )
+    peer_snapshot = _peer_snapshot(peer_table, code)
+    histories, names, history_meta = _fetch_peer_histories(
+        peer_table=peer_table,
+        target_code=code,
+        target_history=target_history,
+        target_source=target_source,
+        target_adjustment=target_adjustment,
+        signal_date=signal_date,
+        source=source,
+        config=config,
+    )
+    minimum_peers = int(config.get("dangu", {}).get("minimum_peer_stocks", 8))
+    peer_universe = {
+        **peer_meta,
+        "history_fetch": history_meta,
+        "relative_snapshot": peer_snapshot,
+    }
+    peer_warning: str | None = None
+    if code not in histories:
+        # The target's own complete history is sufficient for technical and
+        # price/volume factors.  Relative factors simply remain unavailable.
+        if target_history is not None and not target_history.empty:
+            histories = {code: target_history.copy()}
+            names = {code: name}
+            peer_warning = "同行未取得，当前仅使用目标股票自身因子；相对强弱分位数为空"
+        else:
+            raise RuntimeError("目标股票没有可用于因子分析的前复权历史")
+    elif len(histories) < minimum_peers:
+        peer_warning = f"可用同行历史只有 {len(histories)} 只，少于相对比较建议值 {minimum_peers} 只"
+    if peer_warning:
+        peer_universe.setdefault("history_fetch", {}).setdefault("warnings", []).append(peer_warning)
+
+    panel, factor_meta = _build_factor_panel(histories, names, source=source)
+    if panel.empty or "trade_date" not in panel.columns:
+        raise RuntimeError("因子面板中没有有效交易日期")
+    target_dates = pd.to_datetime(panel["trade_date"], errors="coerce").dt.normalize()
+    target_rows = panel[(panel["ts_code"] == code) & target_dates.eq(pd.Timestamp(signal_date).normalize())].copy()
+    if target_rows.empty:
+        target_rows = panel[panel["ts_code"] == code].sort_values("trade_date").tail(1).copy()
+    if target_rows.empty:
+        raise RuntimeError("因子面板中没有目标股票的最新特征")
+    factor_analysis = _build_factor_analysis(
+        target_rows=target_rows,
+        panel=panel,
+        signal_date=signal_date,
+        technical=technical,
+        fundamentals=fundamentals,
+        tradability=tradability,
+        peer_meta=peer_universe,
+    )
+    factor_label = str(factor_analysis.get("evidence_label") or "证据不足")
+    assessment = {
+        "evidence_label": factor_label,
+        "requested_horizon": "当前因子状态",
+        "summary": f"{factor_label}：基于当前量化因子和基本面证据的方向性汇总",
+        "confidence": "descriptive_factor_evidence",
+        "reasons": list(factor_analysis.get("evidence") or []),
+        "signal_gate": {
+            "actionable_signal": False,
+            "decision": "research_only",
+            "reasons": ["分析阶段只提供因子证据，不生成收益预测或交易信号"],
+        },
+        "responsibility_note": "这是因子证据解读，不是买入、卖出或持有指令；最终决定由用户自行作出。",
+    }
+    return {
+        "status": "ok",
+        "model_status": "not_run",
+        "peer_universe": peer_universe,
+        "daily_factor_data": factor_meta,
+        "factor_analysis": factor_analysis,
+        "forecast": {},
+        "future_3_trading_days": {
+            "status": "not_requested",
+            "signal_date": signal_date,
+            "forecast": {},
+            "error": "分析阶段未训练预测模型；请明确调用预测功能",
+        },
+        "analysis_assessment": assessment,
+        "methodology": {
+            "model": "deterministic_daily_factor_diagnosis",
+            "fitted": False,
+            "factors": "技术、价量、相对强弱、市场背景、风险流动性和基本面",
+            "llm_boundary": "LLM只把确定性因子结果翻译成通俗说明，不得改写数值或制造概率",
+        },
+        "limitations": [
+            "分析阶段不拟合 HistGradientBoosting、Ridge 或 Logistic 预测模型",
+            "同日分位数是描述性横截面位置，不等于上涨概率",
+        ] + ([peer_warning] if peer_warning else []),
+        "_prediction_context": {
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "target_history": target_history,
+            "target_source": target_source,
+            "target_adjustment": target_adjustment,
+            "source": source,
+            "signal_date": signal_date,
+            "config": config,
+            "technical": technical,
+            "fundamentals": fundamentals,
+            "tradability": tradability,
+        },
+    }
+
+
 def yanjiu_dangu_yuce(
     *,
     code: str,
@@ -2139,9 +2504,7 @@ def yanjiu_dangu_yuce(
     """Run the single-stock model, evidence summary, and fixed three-day forecast."""
     holding_days = 2
     budget_yuan = None
-    configured_budget, cost_scenario, cost_path, cost_errors = _load_cost_assumption(
-        str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
-    )
+    configured_budget, cost_scenario, cost_source, cost_errors = _load_cost_assumption("research_reference")
     actual_budget = float(budget_yuan) if budget_yuan is not None else float(configured_budget)
     schedule = _next_market_sessions(signal_date)
     peer_table, peer_meta = xuanze_tonghang_yangben(
@@ -2257,7 +2620,7 @@ def yanjiu_dangu_yuce(
         cost_scenario,
         daily_amount_yuan=_round_optional(latest_model_row.get("amount_yuan")),
         atr_pct=_round_optional(latest_model_row.get("atr_14_pct")),
-        trading_settings=config.get("jiaoyi", {}),
+        trading_settings=None,
     )
     forecast: dict[str, Any] = {}
     for horizon in [1, 2, 3]:
@@ -2414,10 +2777,11 @@ def yanjiu_dangu_yuce(
         "analysis_assessment": analysis_assessment,
         "cost_assumption": {
             "scenario": cost_scenario.name,
-            "config_path": cost_path,
+            "source": cost_source,
             "budget_yuan": round(actual_budget, 2),
             "estimated_roundtrip_cost_rate": round(float(stock_cost_rate), 6) if stock_cost_rate is not None else None,
-            "config_errors": cost_errors,
+            "assumption": "程序内固定研究成本假设，不提供外部交易成本配置",
+            "assumption_errors": cost_errors,
         },
         "methodology": {
             "model": "HistGradientBoostingRegressor + 稳健缩放Ridge的小型集成",
@@ -2439,6 +2803,7 @@ def yanjiu_dangu_yuce(
 
 __all__ = [
     "SINGLE_STOCK_FEATURE_COLUMNS",
+    "fenxi_dangu_yinzi",
     "huoqu_dangqian_kuaizhao",
     "pinggu_kejiaoyixing",
     "shichang_shizhong",

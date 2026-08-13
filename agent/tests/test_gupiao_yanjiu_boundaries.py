@@ -31,14 +31,17 @@ def _flat_history(rows: int = 30) -> pd.DataFrame:
     )
 
 
-def test_quant_config_hard_rejects_minute_bars(tmp_path: Path) -> None:
+def test_quant_config_hard_rejects_minute_bars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = json.loads(gupiao_yanjiu.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
     config["shuju"]["minute_bars_enabled"] = True
     path = tmp_path / "minute_config.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
+    monkeypatch.setattr(gupiao_yanjiu, "DEFAULT_CONFIG_PATH", path)
     with pytest.raises(ValueError, match="分钟K不属于产品范围"):
-        gupiao_yanjiu.jiazai_lianghua_peizhi(str(path))
+        gupiao_yanjiu.jiazai_lianghua_peizhi()
 
 
 def test_short_history_keeps_unformed_ma60_and_macd_neutral() -> None:
@@ -360,11 +363,14 @@ def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company(
     assert "资产负债率偏高，需结合行业解释" not in evidence
 
 
-def test_quant_config_rejects_out_of_range_validation_settings(tmp_path: Path) -> None:
+def test_quant_config_rejects_out_of_range_validation_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = json.loads(gupiao_yanjiu.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
     config["moxing"]["validation_ratio"] = 0.9
     path = tmp_path / "invalid_quant.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
+    monkeypatch.setattr(gupiao_yanjiu, "DEFAULT_CONFIG_PATH", path)
     with pytest.raises(ValueError, match="validation_ratio"):
-        gupiao_yanjiu.jiazai_lianghua_peizhi(str(path))
+        gupiao_yanjiu.jiazai_lianghua_peizhi()

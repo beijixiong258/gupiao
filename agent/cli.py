@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import sys
 import time
@@ -22,6 +23,39 @@ RUNS_DIR = AGENT_DIR / "runs"
 EXIT_SUCCESS = 0
 EXIT_RUN_FAILED = 1
 EXIT_USAGE_ERROR = 2
+
+
+def _restore_rich_io() -> None:
+    """Stop any live Rich render and restore the real terminal streams.
+
+    Rich's ``Status`` temporarily replaces ``sys.stdout``/``sys.stderr`` with
+    ``FileProxy`` objects.  On Windows, an interpreter that exits while a
+    refresh thread is winding down can otherwise flush that proxy after
+    ``sys.meta_path`` has already been cleared, producing a noisy
+    ``Exception ignored in ... FileProxy.flush`` traceback.  This cleanup is
+    intentionally best-effort and is safe to call more than once.
+    """
+    try:
+        live_stack = list(getattr(console, "_live_stack", ()) or ())
+        for live in reversed(live_stack):
+            try:
+                live.stop()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    for stream_name in ("stdout", "stderr"):
+        try:
+            stream = getattr(sys, stream_name, None)
+            original = getattr(stream, "rich_proxied_file", None)
+            if original is not None:
+                setattr(sys, stream_name, original)
+        except Exception:
+            pass
+
+
+atexit.register(_restore_rich_io)
 
 
 def _console_safe(value: object) -> str:
@@ -149,8 +183,8 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
-        "gupiao_fenxi": "正在核对股票时点、整理方向证据并训练模型...",
-        "gupiao_yuce": "正在生成未来三个交易日预测...",
+        "gupiao_fenxi": "正在核对股票时点、计算量化因子并整理方向证据...",
+        "gupiao_yuce": "正在按需训练模型并生成未来三个交易日预测...",
     }
 
     def callback(event_type: str, data: dict[str, Any]) -> None:
@@ -216,6 +250,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
         try:
             prompt = console.input("[bold cyan]你 > [/bold cyan]").strip()
         except (KeyboardInterrupt, EOFError):
+            _restore_rich_io()
             console.print("\n[dim]已退出[/dim]")
             return EXIT_SUCCESS
 
@@ -227,6 +262,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
                 console.print(f"[dim]会话已保存：{huihua.huihua_id}[/dim]")
             else:
                 console.print("[dim]已退出；空会话未保存[/dim]")
+            _restore_rich_io()
             return EXIT_SUCCESS
         if command in {"/help", "帮助"}:
             _dayin_duihua_bangzhu()
@@ -389,11 +425,152 @@ def cmd_openai_logout() -> int:
     return EXIT_SUCCESS
 
 
+def _build_analysis_explanation(result: dict[str, Any]) -> str:
+    """Ask the configured LLM for one plain-language explanation of factors.
+
+    The CLI's ``--json`` mode remains machine-readable and skips this call.
+    For the normal human-facing command, the model receives only the
+    deterministic analysis payload; it is explicitly forbidden to invent a
+    probability or a forecast.
+    """
+    factor = result.get("factor_analysis") or {}
+    direction = result.get("direction_analysis") or {}
+    groups = factor.get("groups") or {}
+    compact_groups = []
+    if isinstance(groups, dict):
+        for group, value in groups.items():
+            if not isinstance(value, dict):
+                continue
+            compact_groups.append(
+                {
+                    "group": group,
+                    "label": value.get("label") or group,
+                    "economic_meaning": value.get("economic_meaning"),
+                    "role": value.get("role"),
+                    "status": value.get("status"),
+                    "available_factor_count": value.get("available_factor_count"),
+                    "factor_count": value.get("factor_count"),
+                    "interpretation": value.get("interpretation"),
+                    "score_0_100": value.get("score_0_100"),
+                    "factors": list(value.get("factors") or [])[:6],
+                }
+            )
+    payload = {
+        "stock": result.get("stock"),
+        "as_of": result.get("as_of"),
+        "direction_analysis": {
+            "direction": direction.get("direction"),
+            "evidence_label": direction.get("evidence_label"),
+            "reasons": list(direction.get("reasons") or [])[:8],
+        },
+        "factor_analysis": {
+            "direction": factor.get("direction"),
+            "evidence_label": factor.get("evidence_label"),
+            "overall_evidence_score_0_100": factor.get("overall_evidence_score_0_100"),
+            "technical_score_0_100": factor.get("technical_score_0_100"),
+            "fundamental_score_0_100": factor.get("fundamental_score_0_100"),
+            "groups": compact_groups,
+            "factor_evidence": list(factor.get("factor_evidence") or [])[:8],
+            "evidence": list(factor.get("evidence") or [])[:24],
+            "limitations": list(factor.get("limitations") or [])[:5],
+        },
+        "risks": list(result.get("risks") or [])[:8],
+        "data_health": result.get("data_health"),
+        "analysis_stage": result.get("analysis_stage"),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    prompt = (
+        "你是面向普通投资者的A股研究解读员。请严格只根据下面的程序输出写一段中文解读，不能补充外部事实。"
+        "先给一句结论，再按因子组逐组解释量化结果，最后说明数据日期和局限。"
+        "必须覆盖这 8 组：趋势结构、动量与反转、K线压力、价量确认、突破与回撤质量、相对强弱、风险与流动性、市场背景。"
+        "每组都要说明使用的因子类别、当前结果以及它对普通投资者意味着什么；即使数据不足，也要明确写‘信息有限’，不能只讲均线、RSI或MACD。"
+        "把 0-100 分和同日分位数称为‘证据强弱/相对位置’，绝不能说成上涨概率、收益率或目标价。"
+        "本次是分析阶段，明确写出‘尚未训练三交易日预测模型’，不要输出 T+1/T+2/T+3 数字，也不要给买卖指令。"
+        "如果证据不足，要直说证据不足。控制在 650 字以内，可使用 8 个短项目符号。\n\n程序输出 JSON：\n"
+        + serialized[:30000]
+    )
+    try:
+        from src.providers.chat import ChatLLM
+
+        response = ChatLLM().chat(
+            [
+                {
+                    "role": "system",
+                    "content": "你只负责把已计算的量化证据翻译成易懂中文，不得改写或臆测数值。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            timeout=45,
+        )
+        content = str(response.content or "").strip()
+        if content:
+            return content
+    except Exception:
+        # The deterministic result is still useful when the optional LLM
+        # explanation provider is unavailable or rate-limited.
+        pass
+
+    stock = result.get("stock") or {}
+    stock_name = stock.get("name") or stock.get("ts_code") or "该股票"
+    label = factor.get("evidence_label") or direction.get("evidence_label") or "证据不足"
+    tilt = factor.get("direction") or direction.get("direction") or "中性/不确定"
+    score = factor.get("overall_evidence_score_0_100")
+    score_text = f"，综合证据强弱 {score}/100" if score is not None else ""
+    factor_evidence = [str(item) for item in (factor.get("factor_evidence") or [])[:8]]
+    reasons = [str(item) for item in (factor.get("evidence") or direction.get("reasons") or [])[:4]]
+    reason_text = "；".join(reasons) if reasons else "当前没有足够的可解释因子"
+    group_text = "；".join(factor_evidence)
+    risks = [str(item) for item in (result.get("risks") or [])[:2]]
+    risk_text = f"需要留意：{'；'.join(risks)}。" if risks else "暂未发现额外数据风险。"
+    return (
+        f"{stock_name}截至 {result.get('as_of') or '最近完整收盘日'} 的当前因子倾向为“{tilt}”（{label}{score_text}）。"
+        f"主要依据是：{reason_text}。各量化因子组：{group_text or '信息有限'}。{risk_text}"
+        "这只是对当前量化证据的通俗解释，分析阶段尚未训练三交易日预测模型，也不构成买卖建议。"
+    )
+
+
+def _print_human_analysis(result: dict[str, Any]) -> None:
+    """Render a concise human view instead of dumping the raw JSON payload."""
+    console.print(Panel(Markdown(_console_safe(_build_analysis_explanation(result))), title="A股分析解读"))
+    factor = result.get("factor_analysis") or {}
+    direction = result.get("direction_analysis") or {}
+    table = Table(title="量化依据（描述性，不是概率）")
+    table.add_column("项目")
+    table.add_column("结果")
+    table.add_row("当前方向", _console_safe(factor.get("direction") or direction.get("direction") or "中性/不确定"))
+    table.add_row("证据标签", _console_safe(factor.get("evidence_label") or direction.get("evidence_label") or "证据不足"))
+    table.add_row("综合证据强弱", _console_safe(factor.get("overall_evidence_score_0_100", "—")))
+    table.add_row("技术因子", _console_safe(factor.get("technical_score_0_100", "—")))
+    table.add_row("基本面因子", _console_safe(factor.get("fundamental_score_0_100", "—")))
+    table.add_row("模型状态", "未训练（明确调用 yuce 后才训练）")
+    console.print(table)
+
+    groups = factor.get("groups") or {}
+    if isinstance(groups, dict) and groups:
+        group_table = Table(title="因子分组结果（已使用全部量化因子；描述性，不是概率）")
+        group_table.add_column("因子组")
+        group_table.add_column("使用内容")
+        group_table.add_column("结果")
+        group_table.add_column("相对位置")
+        for group, value in groups.items():
+            if not isinstance(value, dict):
+                continue
+            score = value.get("score_0_100")
+            position = f"{score}/100" if score is not None else "信息有限"
+            used = f"{value.get('available_factor_count', 0)}/{value.get('factor_count', 0)} 个因子"
+            group_table.add_row(
+                _console_safe(value.get("label") or group),
+                _console_safe(value.get("economic_meaning") or used),
+                _console_safe(value.get("interpretation") or "信息有限"),
+                _console_safe(position),
+            )
+        console.print(group_table)
+
+
 def cmd_gupiao(
     gupiao: str,
     source: str,
     history_calendar_days: int,
-    config_path: str | None,
     json_mode: bool,
 ) -> int:
     from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
@@ -402,12 +579,14 @@ def cmd_gupiao(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
-        config_path=config_path,
     ))
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
     else:
-        console.print_json(json.dumps(result, ensure_ascii=False))
+        if result.get("status") == "ok":
+            _print_human_analysis(result)
+        else:
+            console.print_json(json.dumps(result, ensure_ascii=False))
     return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
 
 
@@ -415,7 +594,6 @@ def cmd_yuce(
     gupiao: str,
     source: str,
     history_calendar_days: int,
-    config_path: str | None,
     json_mode: bool,
 ) -> int:
     """Run diagnosis once, then print model forecasts for the next three market sessions."""
@@ -426,7 +604,6 @@ def cmd_yuce(
         gupiao=gupiao,
         source=source,
         history_calendar_days=history_calendar_days,
-        config_path=config_path,
     ))
     prediction: dict[str, Any] = {}
     analysis_id = diagnosis.get("analysis_id")
@@ -479,7 +656,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
     )
     gupiao.add_argument("--history-calendar-days", type=int, default=1440)
-    gupiao.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     gupiao.add_argument("--json", action="store_true")
 
     yuce = sub.add_parser("yuce", help="预测一只 A 股未来第 1、2、3 个交易日收盘")
@@ -491,7 +667,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="股票名称解析和日线行情来源",
     )
     yuce.add_argument("--history-calendar-days", type=int, default=1440)
-    yuce.add_argument("--config", dest="config_path", help="量化配置文件路径；默认使用项目根目录配置")
     yuce.add_argument("--json", action="store_true")
 
     sub.add_parser("settings", help="查看当前运行配置")
@@ -516,7 +691,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.gupiao,
             args.source,
             args.history_calendar_days,
-            args.config_path,
             args.json,
         )
     if args.command == "yuce":
@@ -524,7 +698,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.gupiao,
             args.source,
             args.history_calendar_days,
-            args.config_path,
             args.json,
         )
     if args.command == "settings":

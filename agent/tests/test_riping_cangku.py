@@ -393,7 +393,12 @@ def test_complete_warehouse_expands_daily_peer_panel(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         dangu_yuce,
         "_latest_tushare_cross_section",
-        lambda _signal: (universe, "2024-12-31", []),
+        lambda _signal: (
+            universe,
+            "2024-12-31",
+            [],
+            {"status": "warehouse_snapshot", "snapshot_date": "2024-12-31"},
+        ),
     )
 
     selected, metadata = dangu_yuce.xuanze_tonghang_yangben(

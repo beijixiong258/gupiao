@@ -1886,8 +1886,7 @@ def xunlian_yuce_moxing(
     minimum_validation = int(model_config.get("min_validation_samples", 100))
     quantiles = model_config.get("prediction_clip_quantiles", [0.01, 0.99])
     lower_q, upper_q = float(quantiles[0]), float(quantiles[1])
-    cost_scenario_name = str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
-    budget_yuan, cost_scenario, _, _ = _load_cost_assumption(cost_scenario_name)
+    budget_yuan, cost_scenario, _, _ = _load_cost_assumption("research_reference")
     validation_top_n = max(1, int(model_config.get("validation_top_n", 3)))
 
     for horizon in horizons:
@@ -2026,7 +2025,7 @@ def xunlian_yuce_moxing(
             horizon=horizon,
             budget_yuan=budget_yuan,
             scenario=cost_scenario,
-            trading_settings=config.get("jiaoyi", {}),
+            trading_settings=None,
         )
         validation_net_actual = _historical_net_returns(
             validation_frame,
@@ -2034,7 +2033,7 @@ def xunlian_yuce_moxing(
             horizon=horizon,
             budget_yuan=budget_yuan,
             scenario=cost_scenario,
-            trading_settings=config.get("jiaoyi", {}),
+            trading_settings=None,
         )
         if model_config.get("ranking_enabled", True):
             validation_ranking_score, validation_ranking_model = _fit_ranking_model(
@@ -2080,7 +2079,7 @@ def xunlian_yuce_moxing(
             budget_yuan=budget_yuan,
             scenario=cost_scenario,
             top_n=validation_top_n,
-            trading_settings=config.get("jiaoyi", {}),
+            trading_settings=None,
         )
         minimum_rank_ic = float(model_config.get("min_mean_daily_rank_ic", 0.01))
         minimum_best_naive_skill = float(model_config.get("min_skill_vs_best_naive_baseline", 0.01))
@@ -2215,7 +2214,7 @@ def xunlian_yuce_moxing(
             horizon=horizon,
             budget_yuan=budget_yuan,
             scenario=cost_scenario,
-            trading_settings=config.get("jiaoyi", {}),
+            trading_settings=None,
         )
         if model_config.get("ranking_enabled", True):
             latest_ranking_score, production_ranking_model = _fit_ranking_model(
@@ -2419,7 +2418,7 @@ def xunlian_yuce_moxing(
                 budget_yuan=budget_yuan,
                 scenario=cost_scenario,
                 top_n=validation_top_n,
-                trading_settings=config.get("jiaoyi", {}),
+                trading_settings=None,
             )
             fold_direction_labels = (fold_actual > 0).astype(int)
             fold_raw_probability = np.asarray(validation_direction_probability, dtype=float)[mask]
@@ -2732,9 +2731,7 @@ def _prediction_rows(
         for label, metrics in validation["horizons"].items()
         if metrics.get("validation_passed")
     }
-    budget_yuan, cost_scenario, _, _ = _load_cost_assumption(
-        str(config.get("jiaoyi", {}).get("cost_scenario", "normal_cost"))
-    )
+    budget_yuan, cost_scenario, _, _ = _load_cost_assumption("research_reference")
     constituent_map = constituents.set_index("ts_code").to_dict("index")
     rows: list[dict[str, Any]] = []
     for _, row in predictions.iterrows():
@@ -2755,7 +2752,7 @@ def _prediction_rows(
                 constituent_map.get(code, {}).get("amount_yuan", row.get("amount_yuan"))
             ),
             atr_pct=_round_optional(row.get("atr_14_pct")),
-            trading_settings=config.get("jiaoyi", {}),
+            trading_settings=None,
         )
         forecasts: dict[str, Any] = {}
         configured_horizons = [
@@ -3082,7 +3079,6 @@ def _selection_sequence_id(
     board_meta: dict[str, Any],
     as_of: pd.Timestamp,
     source: str,
-    config_path: str,
     eligible: list[dict[str, Any]],
 ) -> str:
     payload = {
@@ -3090,7 +3086,6 @@ def _selection_sequence_id(
         "board_type": board_meta.get("board_type"),
         "as_of": as_of.strftime("%Y-%m-%d"),
         "source": source,
-        "config_path": config_path,
         "ordered_codes": [str(item.get("ts_code") or "") for item in eligible],
     }
     return "sel_" + hashlib.sha256(
@@ -3121,7 +3116,6 @@ def bankuai_xuangu(
     offset: int = 0,
     selection_id: str | None = None,
     source: str = "auto",
-    config_path: str | None = None,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
     """Select stocks from a specified A-share board and predict only T+1 to T+3."""
@@ -3140,7 +3134,7 @@ def bankuai_xuangu(
     if source not in {"auto", "tushare", "akshare"}:
         return {"status": "error", "error": "source 必须是 auto、tushare 或 akshare"}
     try:
-        config, resolved_config = jiazai_lianghua_peizhi(config_path)
+        config, _ = jiazai_lianghua_peizhi()
     except Exception as exc:
         return {
             "status": "error",
@@ -3327,7 +3321,7 @@ def bankuai_xuangu(
 
     try:
         predictions, validation = xunlian_yuce_moxing(panel, latest, config)
-        cost_rate, cost_meta = _roundtrip_cost(str(config["jiaoyi"].get("cost_scenario", "normal_cost")))
+        cost_rate, cost_meta = _roundtrip_cost("research_reference")
     except Exception as exc:
         return {
             "status": "error",
@@ -3386,7 +3380,6 @@ def bankuai_xuangu(
         board_meta=board_meta,
         as_of=global_as_of,
         source=source,
-        config_path=resolved_config,
         eligible=recommendation_pool,
     )
     if selection_id is not None and selection_id != current_selection_id:
@@ -3534,7 +3527,6 @@ def bankuai_xuangu(
                 ),
             },
             "source_policy": f"行业成分优先 Tushare，免费降级依次为新浪和东方财富；{daily_source_policy}",
-            "config_path": resolved_config,
         },
         "filter_summary": {
             "rejected_count": int(len(rejected)),

@@ -106,8 +106,7 @@ def test_system_prompt_defines_semantic_two_path_routing_and_short_redirect(tmp_
     assert "Path B: direct conversation" in system_prompt
     assert "Never use isolated keywords or regular-expression matching" in system_prompt
     assert "call `gupiao_fenxi` first" in system_prompt
-    assert "call `gupiao_yuce` after `gupiao_fenxi`" in system_prompt
-    assert "hard-limited to at most 8" in system_prompt
+    assert "call `gupiao_yuce` once with that exact `analysis_id`" in system_prompt
     assert "本程序专注 A 股分析与预测，请尽量围绕相关内容提问。" in system_prompt
     assert result["content"] == "本程序专注 A 股分析与预测，请尽量围绕相关内容提问。"
 

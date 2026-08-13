@@ -58,8 +58,15 @@ def _full_result() -> dict:
             "limitations": ["同行样本存在当前成分偏差"],
             "analysis_assessment": {
                 "evidence_label": "证据偏正面",
-                "confidence": "medium",
-                "reasons": ["三交易日模型通过验证"],
+                "confidence": "descriptive_factor_evidence",
+                "reasons": ["当前因子证据偏正面"],
+            },
+            "factor_analysis": {
+                "status": "ok",
+                "model_status": "not_run",
+                "direction": "偏上涨",
+                "evidence_label": "证据偏正面",
+                "evidence": ["当前因子证据偏正面"],
             },
         },
         "future_3_trading_days": {
@@ -88,8 +95,10 @@ def test_first_stage_hides_forecasts_and_returns_analysis_id(monkeypatch: pytest
     assert result["tool_contract_version"] == 4
     assert result["analysis_id"].startswith("fx_")
     assert result["analysis_stage"]["status"] == "completed"
-    assert result["direction_analysis"]["horizon"] == "T+2"
-    assert result["direction_analysis"]["positive_probability"] == pytest.approx(0.60)
+    assert result["direction_analysis"]["horizon"] == "当前因子状态"
+    assert result["direction_analysis"]["positive_probability"] is None
+    assert result["direction_analysis"]["negative_probability"] is None
+    assert result["direction_analysis"]["probability_method"] is None
     assert "quantitative_analysis" not in result
     assert "future_3_trading_days" not in result
     assert "analysis_assessment" not in result

@@ -6,17 +6,19 @@ import math
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-from src.ashare.chengben_huadian import CostScenario
-from src.ashare.chengben_huadian import DEFAULT_CONFIG_PATH as COST_CONFIG_PATH
-from src.ashare.chengben_huadian import _commission_rate, _load_cost_config
+from src.ashare.chengben_huadian import (
+    CostScenario,
+    DEFAULT_COST_SOURCE,
+    DEFAULT_NOTIONAL_YUAN,
+    DEFAULT_SCENARIO,
+    _commission_rate,
+)
 
 
 def _load_cost_assumption(scenario_name: str) -> tuple[float, CostScenario, str, list[str]]:
-    budget, scenarios, path, errors = _load_cost_config(str(COST_CONFIG_PATH))
-    scenario = next((item for item in scenarios if item.name == scenario_name), None)
-    if scenario is None:
-        raise ValueError(f"交易成本配置中不存在场景：{scenario_name}")
-    return float(budget), scenario, path, errors
+    if scenario_name != "research_reference":
+        raise ValueError(f"仅支持程序内固定研究成本假设：{scenario_name}")
+    return DEFAULT_NOTIONAL_YUAN, DEFAULT_SCENARIO, DEFAULT_COST_SOURCE, []
 
 
 def _buy_order_rule(ts_code: str) -> tuple[int, int, str]:
@@ -176,7 +178,7 @@ def _stock_roundtrip_cost(
 
 
 def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
-    notional, scenario, path, errors = _load_cost_assumption(scenario_name)
+    notional, scenario, source, errors = _load_cost_assumption(scenario_name)
     buy_commission = _commission_rate(scenario.buy_commission_rate, scenario.min_commission_yuan, notional)
     sell_commission = _commission_rate(scenario.sell_commission_rate, scenario.min_commission_yuan, notional)
     buy_cost = buy_commission + scenario.transfer_fee_buy_rate + scenario.buy_slippage_bps / 10000.0
@@ -189,14 +191,14 @@ def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
     roundtrip = 1.0 - (1.0 - buy_cost) * (1.0 - sell_cost)
     return float(roundtrip), {
         "scenario": scenario.name,
-        "config_path": path,
+        "source": source,
         "notional_yuan": float(notional),
         "reference_roundtrip_cost_rate": round(float(roundtrip), 6),
         "estimated_roundtrip_cost_rate": round(float(roundtrip), 6),
         "estimated_roundtrip_cost_rate_is_reference_only": True,
         "stamp_tax_sell_rate": scenario.stamp_tax_sell_rate,
         "capital_assumption": "个股成本会按整手、成交额参与率和ATR动态滑点重新计算，参考成本仅用于展示",
-        "config_errors": errors,
+        "assumption_errors": errors,
     }
 
 
