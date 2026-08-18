@@ -48,6 +48,70 @@ def zhengli_xiaoxi(messages: Iterable[Any]) -> list[dict[str, Any]]:
     return cleaned
 
 
+def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
+    """把完整量化工具结果缩为跨进程不可复用的会话指代标记。"""
+    copied = _zhuan_json_anquan(message)
+    content = copied.get("content")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        copied["content"] = json.dumps(
+            {
+                "status": "reanalysis_required",
+                "message": "历史量化工具结果未持久化；需要时必须重新获取远端数据。",
+                "market_data_persistence": "none",
+            },
+            ensure_ascii=False,
+        )
+        return copied
+    scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+    requested_name = str(
+        scope.get("requested_name") or scope.get("canonical_name") or ""
+    ).strip()
+    stock = payload.get("selected_stock") or payload.get("primary")
+    minimal_stock = (
+        {
+            key: stock.get(key)
+            for key in ("ts_code", "name")
+            if stock.get(key) is not None
+        }
+        if isinstance(stock, dict)
+        else None
+    )
+    copied["content"] = json.dumps(
+        {
+            "status": "reanalysis_required",
+            "outcome": "reanalysis_required",
+            "previous_business_outcome": payload.get("outcome"),
+            "stock_reference": minimal_stock,
+            "scope_request": {
+                "fanwei": "named_scope" if requested_name else "all_market",
+                "mingcheng": requested_name or None,
+            },
+            "message": (
+                "会话只保留范围和股票指代，不保存行情、板块成分、因子或预测输入；"
+                "恢复会话后必须重新获取远端数据并分析。"
+            ),
+            "market_data_persistence": "none",
+        },
+        ensure_ascii=False,
+    )
+    return copied
+
+
+def zhengli_chijiuhua_xiaoxi(messages: Iterable[Any]) -> list[dict[str, Any]]:
+    """保存会话时移除可被误作本地行情缓存的完整量化工具结果。"""
+    persistent: list[dict[str, Any]] = []
+    for message in zhengli_xiaoxi(messages):
+        if message.get("role") == "tool" and message.get("name") == "gupiao_fenxi":
+            persistent.append(_chijiuhua_fenxi_biaoji(message))
+        else:
+            persistent.append(message)
+    return persistent
+
+
 @dataclass
 class DuihuaHuihua:
     """One resumable terminal conversation."""
@@ -79,7 +143,7 @@ class DuihuaHuihua:
             "chuangjian_shijian": self.chuangjian_shijian,
             "gengxin_shijian": self.gengxin_shijian,
             "lunshu": self.lunshu,
-            "xiaoxi": zhengli_xiaoxi(self.xiaoxi),
+            "xiaoxi": zhengli_chijiuhua_xiaoxi(self.xiaoxi),
         }
 
 
@@ -165,3 +229,13 @@ class DuihuaCunchu:
     def zuijin(self) -> DuihuaHuihua | None:
         sessions = self.liechu(1)
         return sessions[0] if sessions else None
+
+
+__all__ = [
+    "DUIHUA_MULU",
+    "DuihuaCunchu",
+    "DuihuaHuihua",
+    "HuihuaCuoWu",
+    "zhengli_chijiuhua_xiaoxi",
+    "zhengli_xiaoxi",
+]

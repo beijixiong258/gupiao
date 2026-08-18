@@ -1,20 +1,30 @@
 {
   "shuju": {
     "frequency": "daily_only",
-    "minute_bars_enabled": false,
-    "history_calendar_days": 1080,
-    "max_board_stocks": 24,
-    "warehouse_max_board_stocks": 80,
-    "minimum_history_rows": 180,
-    "request_pause_seconds": 0.15,
-    "akshare_bypass_proxy": true
+    "minute_bars_enabled": true,
+    "request_pause_seconds": 0.15
+  },
+  "wangluo": {
+    "domestic_connection_mode": "direct",
+    "connect_timeout_seconds": 6,
+    "read_timeout_seconds": 20,
+    "max_attempts_per_endpoint": 2,
+    "tushare_max_attempts": 2,
+    "history_max_workers": 8,
+    "history_fallback_max_stocks": 16,
+    "retry_backoff_seconds": 0.35
+  },
+  "run_logs": {
+    "enabled": true,
+    "content_mode": "metadata_only",
+    "retention_days": 14,
+    "maximum_runs": 100,
+    "maximum_total_mb": 100
   },
   "dangu": {
     "history_calendar_days": 1440,
     "max_peer_stocks": 20,
     "same_industry_stocks": 16,
-    "warehouse_max_peer_stocks": 60,
-    "warehouse_same_industry_stocks": 45,
     "minimum_peer_stocks": 8,
     "minimum_history_rows": 180,
     "min_listing_calendar_days": 180,
@@ -30,18 +40,69 @@
     "assessment_min_net_return": 0.003,
     "assessment_min_positive_probability": 0.55
   },
-  "guolv": {
-    "min_price": 2.0,
-    "max_price": 300.0,
+  "fenxi": {
+    "history_calendar_days": 420,
+    "prefilter_limit": 240,
+    "factor_candidate_limit": 120,
+    "deep_analysis_limit": 5,
+    "backup_limit": 4,
+    "minimum_history_rows": 80,
+    "minimum_history_session_coverage": 0.9,
+    "minimum_listing_calendar_days": 180,
     "min_amount_yuan": 50000000,
-    "exclude_name_keywords": [
-      "ST",
-      "*ST",
-      "退",
-      "N",
-      "C"
-    ],
-    "exclude_latest_limit_up": true
+    "minimum_recommendation_score": 60,
+    "minimum_confidence": 0.6,
+    "risk_penalty_max": 30,
+    "near_limit_up_penalty": 8,
+    "high_volatility_threshold": 0.55,
+    "high_volatility_penalty": 6,
+    "fundamental_deep_weight": 0.65,
+    "component_weights": {
+      "daily_factors": 0.65,
+      "fundamental": 0.15,
+      "pattern": 0.1,
+      "late_session": 0.1
+    },
+    "factor_group_weights": {
+      "trend_structure": 0.2,
+      "momentum_reversal": 0.12,
+      "candle_pressure": 0.1,
+      "price_volume_confirmation": 0.14,
+      "breakout_pullback_quality": 0.12,
+      "relative_strength": 0.16,
+      "risk_liquidity": 0.1,
+      "market_context": 0.06
+    }
+  },
+  "xingtai": {
+    "limit_up_tolerance_yuan": 0.005,
+    "shrink_window_sessions": 7,
+    "breakout_deadline_sessions": 14,
+    "shrink_volume_ratio_max": 0.5,
+    "breakout_volume_median_ratio_min": 1.2,
+    "state_scores": {
+      "adjusting": 40,
+      "extreme_shrink": 55,
+      "waiting_breakout": 65,
+      "intraday_confirmed": 90,
+      "close_confirmed": 100,
+      "invalidated": 0,
+      "expired": 10
+    }
+  },
+  "weipan": {
+    "enabled": true,
+    "initial_screen_start": "14:30",
+    "minute_validation_start": "14:45",
+    "market_close": "15:00",
+    "close_confirmation_time": "15:05",
+    "high_time_after": "14:40",
+    "pct_change_high_score_range": [3.0, 5.0],
+    "volume_ratio_target_min": 1.0,
+    "turnover_high_score_range": [5.0, 10.0],
+    "circulating_market_value_high_score_range_yuan": [5000000000, 20000000000],
+    "max_pullback_from_high_pct": 1.5,
+    "minute_candidate_limit": 8
   },
   "moxing": {
     "horizons": [

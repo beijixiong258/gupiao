@@ -21,7 +21,7 @@ def classify_failure(value: Any) -> str:
     if any(token in text for token in ["empty", "no rows", "没有", "为空", "无数据"]):
         return "empty_data"
     if any(token in text for token in ["cache", "缓存", "sqlite", "database"]):
-        return "cache_or_warehouse"
+        return "unexpected_local_persistence"
     if any(token in text for token in ["field", "column", "字段", "格式", "schema"]):
         return "schema_or_format"
     return "unexpected"
@@ -46,15 +46,16 @@ def build_data_health(
     expected_as_of: str | None,
     freshness: dict[str, Any] | None,
     sources: dict[str, Any],
-    warehouse: dict[str, Any] | None,
+    persistence: dict[str, Any] | None,
     warnings: Iterable[Any],
     errors: Iterable[Any],
     constituent_history: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    warning_summary = summarize_failures(warnings)
-    error_summary = summarize_failures(errors)
+    warning_values = list(warnings)
+    error_values = list(errors)
+    warning_summary = summarize_failures(warning_values)
+    error_summary = summarize_failures(error_values)
     freshness_status = str((freshness or {}).get("status") or "unknown")
-    warehouse_ready = bool((warehouse or {}).get("ready"))
     degraded = bool(error_summary["count"] or freshness_status in {"possibly_stale", "too_stale"})
     return {
         "status": "degraded" if degraded else "ready",
@@ -62,11 +63,16 @@ def build_data_health(
         "expected_latest_completed_date": expected_as_of,
         "freshness": freshness or {},
         "sources": sources,
-        "warehouse": {
-            "ready": warehouse_ready,
-            **(warehouse or {}),
+        "persistence": {
+            "mode": "none",
+            **(persistence or {}),
         },
-        "cache_usage_detected": any("cache" in str(value).lower() or "缓存" in str(value) for value in warnings),
+        "local_market_data_usage_detected": any(
+            "cache" in str(value).lower()
+            or "缓存" in str(value)
+            or "仓库" in str(value)
+            for value in warning_values
+        ),
         "constituent_history": constituent_history or {"status": "not_applicable"},
         "warnings": warning_summary,
         "errors": error_summary,

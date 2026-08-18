@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from src.core.run_policy import RunLogPolicy, trace_entry_for_policy
 
 
 class TraceWriter:
@@ -18,14 +20,19 @@ class TraceWriter:
         path: Path to the trace.jsonl file.
     """
 
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, policy: RunLogPolicy | None = None) -> None:
         """Initialize TraceWriter.
 
         Args:
             run_dir: Run directory; trace.jsonl is written here.
         """
+        self.policy = policy or RunLogPolicy.load()
         self.path = run_dir / "trace.jsonl"
-        self._file = open(self.path, "a", encoding="utf-8")
+        self._file = (
+            open(self.path, "a", encoding="utf-8")
+            if self.policy.enabled
+            else None
+        )
 
     def write(self, entry: Dict[str, Any]) -> None:
         """Write a trace record.
@@ -33,14 +40,19 @@ class TraceWriter:
         Args:
             entry: Trace entry; a ts field is added automatically.
         """
-        if "ts" not in entry:
-            entry["ts"] = time.time()
-        self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if self._file is None:
+            return
+        payload = dict(entry)
+        if "ts" not in payload:
+            payload["ts"] = time.time()
+        payload = trace_entry_for_policy(payload, self.policy)
+        self._file.write(json.dumps(payload, ensure_ascii=False) + "\n")
         self._file.flush()
 
     def close(self) -> None:
         """Close the file handle."""
-        self._file.close()
+        if self._file is not None:
+            self._file.close()
 
     @staticmethod
     def read(run_dir: Path) -> List[Dict[str, Any]]:

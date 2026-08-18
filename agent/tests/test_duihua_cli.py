@@ -34,7 +34,11 @@ def test_chat_reuses_history_and_saves_session(tmp_path, monkeypatch) -> None:
     prompts = iter(["分析贵州茅台", "那它未来三天呢？", "/exit"])
     monkeypatch.setattr(huihua_module, "DUIHUA_MULU", tmp_path)
     monkeypatch.setattr(preflight_module, "run_preflight", lambda console: [])
-    monkeypatch.setattr(cli, "_build_agent", lambda max_iter, event_callback=None: fake_agent)
+    monkeypatch.setattr(
+        cli,
+        "_build_agent",
+        lambda max_iter, event_callback=None, clarification_handler=None: fake_agent,
+    )
     monkeypatch.setattr(cli.console, "input", lambda *_args, **_kwargs: next(prompts))
 
     assert cli.cmd_chat(5, new_session=True) == cli.EXIT_SUCCESS
@@ -76,7 +80,11 @@ def test_clear_history_command_requires_confirmation_and_removes_saved_sessions(
     prompts = iter(["/clear-history", "确认清除", "/exit"])
     monkeypatch.setattr(huihua_module, "DUIHUA_MULU", tmp_path)
     monkeypatch.setattr(preflight_module, "run_preflight", lambda console: [])
-    monkeypatch.setattr(cli, "_build_agent", lambda max_iter, event_callback=None: fake_agent)
+    monkeypatch.setattr(
+        cli,
+        "_build_agent",
+        lambda max_iter, event_callback=None, clarification_handler=None: fake_agent,
+    )
     monkeypatch.setattr(cli.console, "input", lambda *_args, **_kwargs: next(prompts))
 
     assert cli.cmd_chat(5) == cli.EXIT_SUCCESS

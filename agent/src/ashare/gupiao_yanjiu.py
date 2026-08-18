@@ -1,47 +1,28 @@
-"""Shared A-share data, technical indicators, and single-stock research."""
+"""A-share history, technical indicators, and fundamental data capabilities."""
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 
 from src.ashare.shuju_yuan import (
-    STOCK_BASIC_CACHE,
-    STOCK_BASIC_CACHE_TTL,
-    _load_or_fetch_stock_basic,
-    _price_limit_rule,
     _tushare_pro,
+    biaozhunhua_gupiao_daima,
+    huoqu_gupiao_jichu_ziliao,
+    huoqu_zhangdieting_guize,
 )
-from src.ashare.shuju_zhiliang import build_data_health, classify_failure
+from src.ashare.shichang_shuju import akshare_zhilian
 from src.ashare.yinzi_gongcheng import (
     RAW_PRICE_VOLUME_FEATURE_COLUMNS as ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS,
     add_price_volume_factors,
 )
 from src.providers.llm import _ensure_dotenv
-from src.tools.path_utils import safe_run_dir
-
-ROOT_DIR = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG_PATH = ROOT_DIR / "lianghua_peizhi.json"
-AK_STOCK_NAMES_CACHE = STOCK_BASIC_CACHE.parent / "akshare_stock_names.csv"
-AK_STOCK_NAMES_CACHE_TTL_SECONDS = 24 * 60 * 60
-DAILY_BAR_CACHE_DIR = STOCK_BASIC_CACHE.parent / "daily_bar_cache"
-DAILY_BAR_CACHE_TTL_SECONDS = 12 * 60 * 60
-MARKET_DATA_STALE_WARNING_BUSINESS_DAYS = 2
-MARKET_DATA_STALE_ERROR_BUSINESS_DAYS = 7
-MARKET_CLOSE_HOUR = 15
-MARKET_CLOSE_MINUTE = 5
-SINGLE_STOCK_TOOL_CONTRACT_VERSION = 4
 
 FEATURE_COLUMNS = [
     "ret_1",
@@ -74,7 +55,6 @@ FINANCIAL_CRITICAL_FIELDS = ("roe_pct", "net_profit_yoy_pct", "debt_to_assets_pc
 # failed adj_factor request is now isolated to that request and never disables
 # adjustment for later stocks.
 _ADJ_FACTOR_DISABLED_REASON = ""
-_PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
 @dataclass(frozen=True)
@@ -84,352 +64,6 @@ class XingqingJieguo:
     adjustment: str
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
-
-
-def jiazai_lianghua_peizhi() -> tuple[dict[str, Any], str]:
-    """Load and validate the fixed internal daily-model configuration."""
-    path = DEFAULT_CONFIG_PATH
-    if not path.is_file():
-        raise FileNotFoundError(f"量化配置文件不存在：{path}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("量化配置必须是 JSON 对象")
-
-    def finite_number(section: dict[str, Any], key: str, default: float, label: str) -> float:
-        try:
-            number = float(section.get(key, default))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{label}.{key} 必须是数值") from exc
-        if not math.isfinite(number):
-            raise ValueError(f"{label}.{key} 必须是有限数值")
-        return number
-
-    data_settings = value.get("shuju", {})
-    if not isinstance(data_settings, dict):
-        raise ValueError("shuju 必须是 JSON 对象")
-    data_history_days = int(finite_number(data_settings, "history_calendar_days", 540, "shuju"))
-    max_board_stocks = int(finite_number(data_settings, "max_board_stocks", 20, "shuju"))
-    warehouse_max_board_stocks = int(
-        finite_number(data_settings, "warehouse_max_board_stocks", 80, "shuju")
-    )
-    minimum_history_rows = int(finite_number(data_settings, "minimum_history_rows", 120, "shuju"))
-    data_pause = finite_number(data_settings, "request_pause_seconds", 0.15, "shuju")
-    if not 180 <= data_history_days <= 3650:
-        raise ValueError("shuju.history_calendar_days 必须在 180 到 3650 之间")
-    if not 1 <= max_board_stocks <= 100:
-        raise ValueError("shuju.max_board_stocks 必须在 1 到 100 之间")
-    if not max_board_stocks <= warehouse_max_board_stocks <= 200:
-        raise ValueError("shuju.warehouse_max_board_stocks 必须不小于普通上限且不大于200")
-    if not 60 <= minimum_history_rows <= 2000:
-        raise ValueError("shuju.minimum_history_rows 必须在 60 到 2000 之间")
-    if not 0 <= data_pause <= 10:
-        raise ValueError("shuju.request_pause_seconds 必须在 0 到 10 之间")
-    if not isinstance(data_settings.get("akshare_bypass_proxy", True), bool):
-        raise ValueError("shuju.akshare_bypass_proxy 必须是 true 或 false")
-    if data_settings.get("frequency", "daily_only") != "daily_only":
-        raise ValueError("shuju.frequency 必须为 daily_only；本产品永久只做日K")
-    if data_settings.get("minute_bars_enabled", False) is not False:
-        raise ValueError("shuju.minute_bars_enabled 必须为 false；分钟K不属于产品范围")
-
-    filters = value.get("guolv", {})
-    if not isinstance(filters, dict):
-        raise ValueError("guolv 必须是 JSON 对象")
-    minimum_price = finite_number(filters, "min_price", 2.0, "guolv")
-    maximum_price = finite_number(filters, "max_price", 300.0, "guolv")
-    minimum_amount = finite_number(filters, "min_amount_yuan", 50_000_000, "guolv")
-    if minimum_price <= 0 or maximum_price <= minimum_price:
-        raise ValueError("guolv 价格范围必须满足 0 < min_price < max_price")
-    if minimum_amount < 0:
-        raise ValueError("guolv.min_amount_yuan 不能小于 0")
-    keywords = filters.get("exclude_name_keywords", [])
-    if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
-        raise ValueError("guolv.exclude_name_keywords 必须是字符串数组")
-    if not isinstance(filters.get("exclude_latest_limit_up", True), bool):
-        raise ValueError("guolv.exclude_latest_limit_up 必须是 true 或 false")
-
-    model = value.get("moxing", {})
-    if not isinstance(model, dict):
-        raise ValueError("moxing 必须是 JSON 对象")
-    horizons = model.get("horizons")
-    if horizons != [1, 2, 3]:
-        raise ValueError("moxing.horizons 必须严格为 [1, 2, 3]")
-    try:
-        validation_ratio = float(model.get("validation_ratio"))
-        clip_quantiles = [float(item) for item in model.get("prediction_clip_quantiles", [])]
-        weights = {int(key): float(item) for key, item in model.get("horizon_weights", {}).items()}
-        integer_defaults = {
-            "min_training_samples": 500,
-            "min_validation_samples": 100,
-            "min_rank_ic_days": 10,
-            "validation_top_n": 3,
-            "min_top_n_days": 10,
-            "validation_subwindows": 6,
-            "min_passed_subwindows": 4,
-            "ensemble_min_calibration_samples": 80,
-            "ensemble_min_calibration_dates": 20,
-            "time_decay_min_calibration_samples": 80,
-            "time_decay_min_calibration_dates": 20,
-            "factor_stability_slices": 6,
-            "factor_min_valid_slices": 4,
-            "factor_min_features": 15,
-            "factor_max_features": 20,
-            "factor_max_per_group": 3,
-            "direction_logistic_max_iter": 500,
-            "probability_calibration_min_samples": 120,
-            "conformal_min_samples": 80,
-            "ranking_relevance_grades": 5,
-            "ranking_pair_top_k": 8,
-            "ranking_n_estimators": 180,
-        }
-        positive_integer_fields = {
-            key: int(model.get(key, default)) for key, default in integer_defaults.items()
-        }
-        min_direction = float(model.get("min_direction_accuracy", 0.52))
-        min_rank_ic = float(model.get("min_mean_daily_rank_ic", 0.01))
-        min_skill = float(model.get("min_skill_vs_baseline", 0.01))
-        min_best_naive_skill = float(model.get("min_skill_vs_best_naive_baseline", 0.0))
-        abstain_min_net_return = float(model.get("abstain_min_net_return", 0.003))
-        abstain_min_probability = float(model.get("abstain_min_positive_probability", 0.55))
-        abstain_min_quality = float(model.get("abstain_min_quality_score", 0.40))
-        ridge_alpha = float(model.get("ridge_alpha", 10.0))
-        ensemble_default_tree_weight = float(model.get("ensemble_default_tree_weight", 0.75))
-        ensemble_calibration_ratio = float(model.get("ensemble_calibration_ratio", 0.15))
-        ensemble_weight_grid = [
-            float(item)
-            for item in model.get("ensemble_tree_weight_grid", [0.0, 0.25, 0.5, 0.75, 1.0])
-        ]
-        time_decay_candidates = [
-            float(item)
-            for item in model.get("time_decay_half_life_candidates", [0, 252, 504])
-        ]
-        time_decay_calibration_ratio = float(model.get("time_decay_calibration_ratio", 0.15))
-        time_decay_min_improvement = float(model.get("time_decay_min_relative_improvement", 0.002))
-        time_decay_min_weight = float(model.get("time_decay_min_weight", 0.10))
-        feature_winsor_quantiles = [
-            float(item) for item in model.get("feature_winsor_quantiles", [0.01, 0.99])
-        ]
-        model_feature_coverage = float(model.get("min_feature_coverage", 0.20))
-        factor_min_sign_agreement = float(model.get("factor_min_sign_agreement", 0.67))
-        factor_min_abs_ic = float(model.get("factor_min_abs_mean_rank_ic", 0.005))
-        factor_dedup_abs_spearman = float(model.get("factor_dedup_abs_spearman", 0.80))
-        direction_logistic_c = float(model.get("direction_logistic_c", 0.5))
-        calibration_evaluation_ratio = float(model.get("probability_calibration_evaluation_ratio", 0.30))
-        calibration_min_improvement = float(model.get("probability_calibration_min_brier_improvement", 0.0005))
-        conformal_coverage = float(model.get("conformal_coverage", 0.80))
-        ranking_min_ndcg_improvement = float(model.get("ranking_min_ndcg_improvement", 0.0))
-        return_interval_coverage_range = [
-            float(item) for item in model.get("return_interval_coverage_range", [0.75, 0.85])
-        ]
-        quantile_levels = [
-            float(item) for item in model.get("quantile_levels", [0.10, 0.50, 0.90])
-        ]
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"moxing 数值配置无效：{exc}") from exc
-    if not 0.05 <= validation_ratio <= 0.4:
-        raise ValueError("moxing.validation_ratio 必须在 0.05 到 0.4 之间")
-    if len(clip_quantiles) != 2 or not 0 <= clip_quantiles[0] < clip_quantiles[1] <= 1:
-        raise ValueError("moxing.prediction_clip_quantiles 必须是两个递增的 0~1 数值")
-    if (
-        set(weights) != {1, 2, 3}
-        or any(not math.isfinite(item) or item < 0 for item in weights.values())
-        or sum(weights.values()) <= 0
-    ):
-        raise ValueError("moxing.horizon_weights 必须为 T+1/T+2/T+3 提供非负权重且总和大于0")
-    if any(item <= 0 for item in positive_integer_fields.values()):
-        raise ValueError("moxing 的样本数、验证天数和 Top-N 配置必须为正整数")
-    if not 2 <= positive_integer_fields["ranking_relevance_grades"] <= 31:
-        raise ValueError("moxing.ranking_relevance_grades 必须在 2 到 31 之间")
-    if positive_integer_fields["ranking_pair_top_k"] > 100:
-        raise ValueError("moxing.ranking_pair_top_k 不能大于 100")
-    if positive_integer_fields["min_passed_subwindows"] > positive_integer_fields["validation_subwindows"]:
-        raise ValueError("moxing.min_passed_subwindows 不能大于 validation_subwindows")
-    if positive_integer_fields["factor_min_valid_slices"] > positive_integer_fields["factor_stability_slices"]:
-        raise ValueError("moxing.factor_min_valid_slices 不能大于 factor_stability_slices")
-    if positive_integer_fields["factor_max_features"] < positive_integer_fields["factor_min_features"]:
-        raise ValueError("moxing.factor_max_features 不能小于 factor_min_features")
-    if positive_integer_fields["factor_max_per_group"] > positive_integer_fields["factor_max_features"]:
-        raise ValueError("moxing.factor_max_per_group 不能大于 factor_max_features")
-    if not 0.5 <= min_direction <= 1:
-        raise ValueError("moxing.min_direction_accuracy 必须在 0.5 到 1 之间")
-    if not -1 <= min_rank_ic <= 1 or not -1 <= min_skill <= 1 or not -1 <= min_best_naive_skill <= 1:
-        raise ValueError("moxing 的 Rank IC 和基线提升门槛必须在 -1 到 1 之间")
-    if not 0 <= abstain_min_net_return <= 0.2:
-        raise ValueError("moxing.abstain_min_net_return 必须在 0 到 0.2 之间")
-    if not 0.5 <= abstain_min_probability <= 1:
-        raise ValueError("moxing.abstain_min_positive_probability 必须在 0.5 到 1 之间")
-    if not 0 <= abstain_min_quality <= 1:
-        raise ValueError("moxing.abstain_min_quality_score 必须在 0 到 1 之间")
-    if not isinstance(model.get("ensemble_enabled", True), bool):
-        raise ValueError("moxing.ensemble_enabled 必须是 true 或 false")
-    if not isinstance(model.get("time_decay_enabled", True), bool):
-        raise ValueError("moxing.time_decay_enabled 必须是 true 或 false")
-    if not isinstance(model.get("factor_stability_enabled", True), bool):
-        raise ValueError("moxing.factor_stability_enabled 必须是 true 或 false")
-    if not isinstance(model.get("ranking_enabled", True), bool):
-        raise ValueError("moxing.ranking_enabled 必须是 true 或 false")
-    if not isinstance(model.get("quantile_interval_enabled", True), bool):
-        raise ValueError("moxing.quantile_interval_enabled 必须是 true 或 false")
-    if not 0 < model_feature_coverage <= 1:
-        raise ValueError("moxing.min_feature_coverage 必须在 0 到 1 之间")
-    if not 0.5 <= factor_min_sign_agreement <= 1:
-        raise ValueError("moxing.factor_min_sign_agreement 必须在 0.5 到 1 之间")
-    if not 0 <= factor_min_abs_ic <= 1:
-        raise ValueError("moxing.factor_min_abs_mean_rank_ic 必须在 0 到 1 之间")
-    if not 0 < factor_dedup_abs_spearman <= 1:
-        raise ValueError("moxing.factor_dedup_abs_spearman 必须在 0 到 1 之间")
-    if not math.isfinite(direction_logistic_c) or direction_logistic_c <= 0:
-        raise ValueError("moxing.direction_logistic_c 必须是正有限数")
-    if not 0.1 <= calibration_evaluation_ratio <= 0.5:
-        raise ValueError("moxing.probability_calibration_evaluation_ratio 必须在 0.1 到 0.5 之间")
-    if not 0 <= calibration_min_improvement <= 0.2:
-        raise ValueError("moxing.probability_calibration_min_brier_improvement 必须在 0 到 0.2 之间")
-    if not 0.5 < conformal_coverage < 1:
-        raise ValueError("moxing.conformal_coverage 必须在 0.5 到 1 之间")
-    if not -1 <= ranking_min_ndcg_improvement <= 1:
-        raise ValueError("moxing.ranking_min_ndcg_improvement 必须在 -1 到 1 之间")
-    if (
-        len(return_interval_coverage_range) != 2
-        or not 0 < return_interval_coverage_range[0] < return_interval_coverage_range[1] < 1
-    ):
-        raise ValueError("moxing.return_interval_coverage_range 必须是两个递增的 0~1 数值")
-    if (
-        len(quantile_levels) != 3
-        or quantile_levels != sorted(quantile_levels)
-        or not 0 < quantile_levels[0] < quantile_levels[1] < quantile_levels[2] < 1
-    ):
-        raise ValueError("moxing.quantile_levels 必须是三个递增的 0~1 数值")
-    if not math.isfinite(ridge_alpha) or ridge_alpha <= 0:
-        raise ValueError("moxing.ridge_alpha 必须是正有限数")
-    if not 0 <= ensemble_default_tree_weight <= 1:
-        raise ValueError("moxing.ensemble_default_tree_weight 必须在 0 到 1 之间")
-    if not 0.05 <= ensemble_calibration_ratio <= 0.4:
-        raise ValueError("moxing.ensemble_calibration_ratio 必须在 0.05 到 0.4 之间")
-    if (
-        not time_decay_candidates
-        or 0.0 not in time_decay_candidates
-        or len(time_decay_candidates) != len(set(time_decay_candidates))
-        or time_decay_candidates != sorted(time_decay_candidates)
-        or any(not math.isfinite(item) or item < 0 for item in time_decay_candidates)
-    ):
-        raise ValueError("moxing.time_decay_half_life_candidates 必须是包含0的非负递增无重复数值数组")
-    if not 0.05 <= time_decay_calibration_ratio <= 0.4:
-        raise ValueError("moxing.time_decay_calibration_ratio 必须在 0.05 到 0.4 之间")
-    if not 0 <= time_decay_min_improvement <= 0.2:
-        raise ValueError("moxing.time_decay_min_relative_improvement 必须在 0 到 0.2 之间")
-    if not 0 < time_decay_min_weight <= 1:
-        raise ValueError("moxing.time_decay_min_weight 必须在 0 到 1 之间")
-    if (
-        not ensemble_weight_grid
-        or any(not math.isfinite(item) or not 0 <= item <= 1 for item in ensemble_weight_grid)
-    ):
-        raise ValueError("moxing.ensemble_tree_weight_grid 必须是非空的 0 到 1 数值数组")
-    if (
-        len(feature_winsor_quantiles) != 2
-        or not 0 <= feature_winsor_quantiles[0] < feature_winsor_quantiles[1] <= 1
-    ):
-        raise ValueError("moxing.feature_winsor_quantiles 必须是两个递增的 0 到 1 数值")
-    learning_rate = finite_number(model, "learning_rate", 0.05, "moxing")
-    l2_regularization = finite_number(model, "l2_regularization", 1.0, "moxing")
-    model_integer_fields = {
-        "max_iter": int(finite_number(model, "max_iter", 180, "moxing")),
-        "max_leaf_nodes": int(finite_number(model, "max_leaf_nodes", 15, "moxing")),
-        "max_depth": int(finite_number(model, "max_depth", 4, "moxing")),
-        "min_samples_leaf": int(finite_number(model, "min_samples_leaf", 30, "moxing")),
-    }
-    try:
-        int(model.get("random_state", 42))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("moxing.random_state 必须是整数") from exc
-    if not 0 < learning_rate <= 1:
-        raise ValueError("moxing.learning_rate 必须在 0 到 1 之间")
-    if l2_regularization < 0:
-        raise ValueError("moxing.l2_regularization 不能小于 0")
-    if any(item <= 0 for item in model_integer_fields.values()):
-        raise ValueError("moxing 的迭代次数、树规模、深度和叶节点样本数必须为正整数")
-    single = value.get("dangu", {})
-    if not isinstance(single, dict):
-        raise ValueError("dangu 必须是 JSON 对象")
-    try:
-        single_history_days = int(single.get("history_calendar_days", 1440))
-        maximum_peers = int(single.get("max_peer_stocks", 20))
-        same_industry_peers = int(single.get("same_industry_stocks", 16))
-        warehouse_maximum_peers = int(single.get("warehouse_max_peer_stocks", 60))
-        warehouse_same_industry_peers = int(single.get("warehouse_same_industry_stocks", 45))
-        minimum_peers = int(single.get("minimum_peer_stocks", 8))
-        walk_forward_folds = int(single.get("walk_forward_folds", 6))
-        minimum_passed_folds = int(single.get("min_passed_folds", 4))
-        minimum_feature_coverage = float(single.get("min_feature_coverage", 0.2))
-        minimum_net_return = float(single.get("assessment_min_net_return", 0.003))
-        minimum_probability = float(single.get("assessment_min_positive_probability", 0.55))
-        single_minimum_history_rows = int(single.get("minimum_history_rows", 180))
-        minimum_listing_days = int(single.get("min_listing_calendar_days", 180))
-        single_minimum_amount = float(single.get("min_amount_yuan", 30_000_000))
-        single_pause = float(single.get("request_pause_seconds", 0.08))
-        validation_window_days = int(single.get("validation_window_days", 45))
-        minimum_training_dates = int(single.get("minimum_training_dates", 120))
-        minimum_fold_training = int(single.get("min_fold_training_samples", 500))
-        minimum_fold_validation = int(single.get("min_fold_validation_samples", 80))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"dangu 数值配置无效：{exc}") from exc
-    if not 540 <= single_history_days <= 1800:
-        raise ValueError("dangu.history_calendar_days 必须在 540 到 1800 之间")
-    if not 8 <= maximum_peers <= 40:
-        raise ValueError("dangu.max_peer_stocks 必须在 8 到 40 之间")
-    if not 4 <= same_industry_peers < maximum_peers:
-        raise ValueError("dangu.same_industry_stocks 必须至少为4且小于 max_peer_stocks")
-    if not maximum_peers <= warehouse_maximum_peers <= 200:
-        raise ValueError("dangu.warehouse_max_peer_stocks 必须不小于普通上限且不大于200")
-    if not same_industry_peers <= warehouse_same_industry_peers < warehouse_maximum_peers:
-        raise ValueError(
-            "dangu.warehouse_same_industry_stocks 必须不小于普通同行数且小于仓库同行上限"
-        )
-    if not 5 <= minimum_peers <= maximum_peers:
-        raise ValueError("dangu.minimum_peer_stocks 必须在5到 max_peer_stocks 之间")
-    if walk_forward_folds < 2 or not 1 <= minimum_passed_folds <= walk_forward_folds:
-        raise ValueError("dangu 的滚动验证折数或最少通过折数无效")
-    if not 0 < minimum_feature_coverage <= 1:
-        raise ValueError("dangu.min_feature_coverage 必须在0到1之间")
-    if not 0 <= minimum_net_return <= 0.2 or not 0.5 <= minimum_probability <= 1:
-        raise ValueError("dangu 的证据评估收益或上涨比例门槛无效")
-    if single_minimum_history_rows < 60:
-        raise ValueError("dangu.minimum_history_rows 必须至少为 60")
-    if minimum_listing_days < 0 or single_minimum_amount < 0:
-        raise ValueError("dangu 的最少上市天数和最低成交额不能小于 0")
-    if not 0 <= single_pause <= 10:
-        raise ValueError("dangu.request_pause_seconds 必须在 0 到 10 之间")
-    if validation_window_days < 20 or minimum_training_dates < 80:
-        raise ValueError("dangu 的验证窗口至少为 20 日，训练日期至少为 80 日")
-    if minimum_fold_training <= 0 or minimum_fold_validation <= 0:
-        raise ValueError("dangu 的每折训练和验证样本数必须为正整数")
-    return value, str(path)
-
-
-def _akshare_bypass_proxy_enabled() -> bool:
-    override = os.getenv("GPYJ_AKSHARE_BYPASS_PROXY", "").strip().lower()
-    if override:
-        return override not in {"0", "false", "no", "off"}
-    try:
-        config, _ = jiazai_lianghua_peizhi()
-        return bool(config.get("shuju", {}).get("akshare_bypass_proxy", True))
-    except Exception:
-        return True
-
-
-@contextmanager
-def akshare_zhilian():
-    """Temporarily bypass proxy variables for mainland AKShare endpoints."""
-    if not _akshare_bypass_proxy_enabled():
-        yield
-        return
-    saved = {name: os.environ[name] for name in _PROXY_ENV_NAMES if name in os.environ}
-    try:
-        for name in _PROXY_ENV_NAMES:
-            os.environ.pop(name, None)
-        yield
-    finally:
-        for name in _PROXY_ENV_NAMES:
-            os.environ.pop(name, None)
-        os.environ.update(saved)
 
 
 def _digits_from_symbol(value: str) -> str:
@@ -442,29 +76,9 @@ def _digits_from_symbol(value: str) -> str:
 def biaozhunhua_daima(value: str) -> str:
     """Normalize a mainland A-share stock code to Tushare format."""
     raw = str(value).strip().upper()
-    digits = _digits_from_symbol(raw)
-    if len(digits) != 6 or not digits.isdigit():
-        raise ValueError(f"不是有效的 6 位 A 股代码：{value}")
-
-    suffix = ""
-    match = re.search(r"\.(SH|SZ|BJ)$", raw)
-    if match:
-        suffix = match.group(1)
-    elif raw.startswith(("SH", "SZ", "BJ")):
-        suffix = raw[:2]
-
-    expected = ""
-    if digits.startswith(("600", "601", "603", "605", "688", "689")):
-        expected = "SH"
-    elif digits.startswith(("000", "001", "002", "003", "300", "301")):
-        expected = "SZ"
-    elif digits.startswith(("43", "83", "87", "88", "920")):
-        expected = "BJ"
-    if not expected:
-        raise ValueError(f"代码不属于本系统支持的 A 股普通股票范围：{value}")
-    if suffix and suffix != expected:
-        raise ValueError(f"代码与交易所后缀不一致：{value}，应为 .{expected}")
-    return f"{digits}.{expected}"
+    if raw.startswith(("SH", "SZ", "BJ")) and "." not in raw:
+        raw = f"{raw[2:]}.{raw[:2]}"
+    return biaozhunhua_gupiao_daima(raw)
 
 
 def shi_a_gu(value: str) -> bool:
@@ -475,45 +89,16 @@ def shi_a_gu(value: str) -> bool:
         return False
 
 
-def _stock_basic_cache() -> pd.DataFrame:
-    if not STOCK_BASIC_CACHE.is_file():
-        return pd.DataFrame()
-    try:
-        cache_age = max(0.0, time.time() - STOCK_BASIC_CACHE.stat().st_mtime)
-        if cache_age > STOCK_BASIC_CACHE_TTL.total_seconds():
-            return pd.DataFrame()
-        return pd.read_csv(STOCK_BASIC_CACHE, dtype=str)
-    except Exception:
-        return pd.DataFrame()
-
-
 def _akshare_name_table() -> pd.DataFrame:
-    stale_cache = pd.DataFrame()
-    if AK_STOCK_NAMES_CACHE.is_file():
-        try:
-            cached = pd.read_csv(AK_STOCK_NAMES_CACHE, dtype=str)
-            if not cached.empty and {"ts_code", "name"}.issubset(cached.columns):
-                stale_cache = cached
-                cache_age = max(0.0, time.time() - AK_STOCK_NAMES_CACHE.stat().st_mtime)
-                if cache_age <= AK_STOCK_NAMES_CACHE_TTL_SECONDS:
-                    return cached
-        except Exception:
-            pass
-    try:
-        import akshare as ak
+    """从 AKShare 实时读取代码名称表，不在本地持久化。"""
+    import akshare as ak
 
-        with akshare_zhilian():
-            table = ak.stock_info_a_code_name().rename(columns={"code": "ts_code", "name": "name"})
-    except Exception:
-        if not stale_cache.empty:
-            return stale_cache
-        raise
+    with akshare_zhilian():
+        table = ak.stock_info_a_code_name().rename(columns={"code": "ts_code", "name": "name"})
     table = table[["ts_code", "name"]].copy()
     table["ts_code"] = table["ts_code"].astype(str).str.zfill(6)
     table = table[table["ts_code"].map(shi_a_gu)].copy()
     table["ts_code"] = table["ts_code"].map(biaozhunhua_daima)
-    AK_STOCK_NAMES_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    table.to_csv(AK_STOCK_NAMES_CACHE, index=False, encoding="utf-8-sig")
     return table
 
 
@@ -565,31 +150,27 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
         code = biaozhunhua_daima(raw)
         resolved: dict[str, Any] = {}
         if source in {"auto", "tushare"}:
-            resolved = _match_stock_basic(_stock_basic_cache(), code) or {}
-        if not resolved.get("name") and source in {"auto", "tushare"}:
             try:
-                resolved = _match_stock_basic(_load_or_fetch_stock_basic(_tushare_pro(), {}), code) or resolved
+                resolved = _match_stock_basic(
+                    huoqu_gupiao_jichu_ziliao(_tushare_pro(), {}),
+                    code,
+                ) or resolved
             except Exception as exc:
                 warnings.append(f"Tushare 股票名称暂不可用：{exc}")
         if not resolved.get("name") and source in {"auto", "akshare"}:
             try:
                 resolved = _match_stock_basic(_akshare_name_table(), code) or resolved
                 if resolved.get("name"):
-                    warnings.append("股票名称来自 AKShare 本地代码表缓存")
+                    warnings.append("股票名称来自 AKShare 实时接口")
             except Exception as exc:
                 warnings.append(f"股票名称表暂不可用：{exc}")
         return code, resolved, warnings
-
-    if source in {"auto", "tushare"}:
-        cached = _match_stock_basic(_stock_basic_cache(), raw)
-        if cached and cached.get("ts_code"):
-            return biaozhunhua_daima(str(cached["ts_code"])), cached, warnings
 
     errors: list[str] = []
     if source in {"auto", "tushare"}:
         try:
             pro = _tushare_pro()
-            table = _load_or_fetch_stock_basic(pro, {})
+            table = huoqu_gupiao_jichu_ziliao(pro, {})
             match = _match_stock_basic(table, raw)
             if match and match.get("ts_code"):
                 return biaozhunhua_daima(str(match["ts_code"])), match, warnings
@@ -661,32 +242,18 @@ def _normalize_history(frame: pd.DataFrame, *, tushare: bool) -> pd.DataFrame:
     )
 
 
-def _latest_expected_market_date(reference: datetime | None = None) -> pd.Timestamp:
-    """Return the latest weekday whose closing bar should be complete.
-
-    This deliberately uses only a conservative weekday calendar.  Exchange
-    holidays can make the returned date later than the real last trading day,
-    so stale data is warned early but rejected only after a wider tolerance.
-    """
-    current = reference or datetime.now()
-    expected = pd.Timestamp(current.date())
-    before_close = (current.hour, current.minute) < (MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE)
-    if expected.weekday() < 5 and before_close:
-        expected -= timedelta(days=1)
-    while expected.weekday() >= 5:
-        expected -= timedelta(days=1)
-    return expected.normalize()
-
-
 def _completed_market_history(
     history: pd.DataFrame,
     *,
-    reference: datetime | None = None,
+    latest_completed_date: str | pd.Timestamp,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Exclude bars that are not guaranteed to represent a completed session."""
+    """按已由交易日历确认的日期排除未完成日线。"""
     if history is None or history.empty:
         return pd.DataFrame(), []
-    expected = _latest_expected_market_date(reference)
+    expected = pd.to_datetime(latest_completed_date, errors="coerce")
+    if pd.isna(expected):
+        raise ValueError("latest_completed_date 必须是有效交易日")
+    expected = pd.Timestamp(expected).normalize()
     dates = pd.to_datetime(history["trade_date"], errors="coerce").dt.normalize()
     keep = dates <= expected
     dropped = int((~keep).sum())
@@ -694,50 +261,6 @@ def _completed_market_history(
     if dropped:
         warnings.append(f"已忽略 {dropped} 根尚未确认收盘的日线，技术分析只使用完整交易日")
     return history.loc[keep].copy().reset_index(drop=True), warnings
-
-
-def _market_data_freshness(as_of: Any, *, reference: datetime | None = None) -> dict[str, Any]:
-    """Describe whether the latest completed bar is recent enough for current analysis."""
-    latest = pd.to_datetime(as_of, errors="coerce")
-    if pd.isna(latest):
-        return {
-            "expected_latest_date": _latest_expected_market_date(reference).strftime("%Y-%m-%d"),
-            "business_days_old": None,
-            "status": "invalid_date",
-        }
-    latest = pd.Timestamp(latest).normalize()
-    expected = _latest_expected_market_date(reference)
-    if latest >= expected:
-        business_days_old = 0
-    else:
-        business_days_old = int(np.busday_count(latest.date(), expected.date()))
-    if business_days_old > MARKET_DATA_STALE_ERROR_BUSINESS_DAYS:
-        status = "too_stale"
-    elif business_days_old > MARKET_DATA_STALE_WARNING_BUSINESS_DAYS:
-        status = "possibly_stale"
-    else:
-        status = "fresh"
-    return {
-        "expected_latest_date": expected.strftime("%Y-%m-%d"),
-        "business_days_old": business_days_old,
-        "status": status,
-    }
-
-
-def _can_use_current_akshare_snapshot(
-    as_of: Any,
-    *,
-    reference: datetime | None = None,
-) -> bool:
-    """Allow an undated realtime snapshot only when it cannot contain intraday data."""
-    as_of_date = pd.to_datetime(as_of, errors="coerce")
-    if pd.isna(as_of_date):
-        return False
-    current = reference or datetime.now()
-    before_close = (current.hour, current.minute) < (MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE)
-    if current.weekday() < 5 and before_close:
-        return False
-    return pd.Timestamp(as_of_date).normalize() == _latest_expected_market_date(current)
 
 
 def _apply_qfq(pro: Any, code: str, start_date: str, end_date: str, data: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
@@ -763,155 +286,20 @@ def _apply_qfq(pro: Any, code: str, start_date: str, end_date: str, data: pd.Dat
         return data, "raw_unadjusted", reason
 
 
-def _daily_bar_cache_path(code: str, source: str) -> Path:
-    return DAILY_BAR_CACHE_DIR / f"{code.replace('.', '_')}_{source}.csv"
-
-
-def _load_daily_bar_cache(
-    *,
-    code: str,
-    source: str,
-    start: str,
-    end: str,
-) -> XingqingJieguo | None:
-    path = _daily_bar_cache_path(code, source)
-    meta_path = path.with_suffix(".json")
-    if not path.is_file() or not meta_path.is_file():
-        return None
-    try:
-        age_seconds = max(0.0, time.time() - path.stat().st_mtime)
-        if age_seconds > DAILY_BAR_CACHE_TTL_SECONDS:
-            return None
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        requested_start = pd.to_datetime(meta.get("requested_start"), errors="coerce")
-        requested_end = pd.to_datetime(meta.get("requested_end"), errors="coerce")
-        wanted_start = pd.to_datetime(start, errors="coerce")
-        wanted_end = pd.to_datetime(end, errors="coerce")
-        if (
-            pd.isna(requested_start)
-            or pd.isna(requested_end)
-            or pd.isna(wanted_start)
-            or pd.isna(wanted_end)
-            or pd.Timestamp(requested_start) > pd.Timestamp(wanted_start)
-            or pd.Timestamp(requested_end) < pd.Timestamp(wanted_end)
-        ):
-            return None
-        data = _normalize_history(pd.read_csv(path), tushare=False)
-        data = data[
-            (data["trade_date"] >= pd.Timestamp(wanted_start))
-            & (data["trade_date"] <= pd.Timestamp(wanted_end))
-        ].reset_index(drop=True)
-        if data.empty:
-            return None
-        expected_latest = _latest_expected_market_date()
-        if (
-            pd.Timestamp(wanted_end).normalize() >= expected_latest
-            and pd.Timestamp(data["trade_date"].max()).normalize() < expected_latest
-        ):
-            return None
-        provider = str(meta.get("provider") or source)
-        adjustment = str(meta.get("adjustment") or "unknown")
-        return XingqingJieguo(
-            data=data,
-            source=provider,
-            adjustment=adjustment,
-            warnings=(f"日K使用12小时内的本地缓存（{provider}）",),
-            errors=(),
-        )
-    except Exception:
-        return None
-
-
-def _save_daily_bar_cache(
-    *,
-    code: str,
-    source_policy: str,
-    start: str,
-    end: str,
-    result: XingqingJieguo,
-) -> None:
-    if result.data.empty or result.adjustment in {"unknown", "raw_unadjusted"}:
-        return
-    path = _daily_bar_cache_path(code, source_policy)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    result.data.to_csv(path, index=False, encoding="utf-8-sig")
-    path.with_suffix(".json").write_text(
-        json.dumps(
-            {
-                "provider": result.source,
-                "adjustment": result.adjustment,
-                "requested_start": pd.Timestamp(start).strftime("%Y-%m-%d"),
-                "requested_end": pd.Timestamp(end).strftime("%Y-%m-%d"),
-                "rows": int(len(result.data)),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
 def huoqu_rili_xingqing(
     code: str,
     *,
     start_date: str,
     end_date: str,
     source: str = "auto",
-    use_cache: bool = False,
 ) -> XingqingJieguo:
-    """Fetch one stock's daily bars with Tushare-first fallback semantics."""
+    """实时获取单股日线；Tushare 优先，失败时降级 AKShare，全程不落盘。"""
     normalized = biaozhunhua_daima(code)
     source = source.strip().lower()
     if source not in {"auto", "tushare", "akshare"}:
         raise ValueError("source 必须是 auto、tushare 或 akshare")
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
-    if use_cache:
-        cached = _load_daily_bar_cache(
-            code=normalized,
-            source=source,
-            start=start,
-            end=end,
-        )
-        if cached is not None:
-            return cached
-        if source in {"auto", "tushare"}:
-            try:
-                from src.ashare.riping_cangku import load_qfq_history_from_warehouse
-
-                warehouse_data, warehouse_meta = load_qfq_history_from_warehouse(
-                    normalized,
-                    start_date=start,
-                    end_date=end,
-                )
-                if not warehouse_data.empty and warehouse_meta.get("status") == "ok":
-                    return XingqingJieguo(
-                        data=_normalize_history(warehouse_data, tushare=False),
-                        source=str(warehouse_meta.get("source") or "tushare_daily_warehouse"),
-                        adjustment=str(
-                            warehouse_meta.get("adjustment") or "qfq_by_warehouse_adj_factor"
-                        ),
-                        warnings=(
-                            f"日K来自全市场本地仓库，区间同步覆盖率{warehouse_meta.get('sync_coverage')}",
-                        ),
-                        errors=(),
-                    )
-            except Exception:
-                pass
-
-    def finish(result: XingqingJieguo) -> XingqingJieguo:
-        if use_cache:
-            try:
-                _save_daily_bar_cache(
-                    code=normalized,
-                    source_policy=source,
-                    start=start,
-                    end=end,
-                    result=result,
-                )
-            except Exception:
-                pass
-        return result
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -932,11 +320,11 @@ def huoqu_rili_xingqing(
                 raw_tushare_fallback = tushare_result
                 warnings.append("自动模式要求复权口径，继续尝试 AKShare 前复权行情")
             else:
-                return finish(tushare_result)
+                return tushare_result
         except Exception as exc:
             errors.append(f"Tushare 日线失败：{exc}")
             if source == "tushare":
-                return finish(XingqingJieguo(pd.DataFrame(), "tushare", "unknown", tuple(warnings), tuple(errors)))
+                return XingqingJieguo(pd.DataFrame(), "tushare", "unknown", tuple(warnings), tuple(errors))
 
     try:
         import akshare as ak
@@ -977,20 +365,20 @@ def huoqu_rili_xingqing(
             if source == "auto"
             else "行情使用 AKShare 免费聚合接口"
         )
-        return finish(XingqingJieguo(data, "akshare", "qfq", tuple(warnings), tuple(errors)))
+        return XingqingJieguo(data, "akshare", "qfq", tuple(warnings), tuple(errors))
     except Exception as exc:
         errors.append(f"AKShare 日线失败：{exc}")
         if raw_tushare_fallback is not None:
             fallback_warnings = list(raw_tushare_fallback.warnings)
             fallback_warnings.append("AKShare 前复权降级失败，只能使用 Tushare 未复权行情")
-            return finish(XingqingJieguo(
+            return XingqingJieguo(
                 raw_tushare_fallback.data,
                 raw_tushare_fallback.source,
                 raw_tushare_fallback.adjustment,
                 tuple(fallback_warnings),
                 tuple(errors),
-            ))
-        return finish(XingqingJieguo(pd.DataFrame(), "akshare", "unknown", tuple(warnings), tuple(errors)))
+            )
+        return XingqingJieguo(pd.DataFrame(), "akshare", "unknown", tuple(warnings), tuple(errors))
 
 
 def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
@@ -1279,7 +667,12 @@ def _akshare_financials(code: str, *, as_of: str | None = None) -> tuple[dict[st
         return {}, errors
 
 
-def huoqu_jibenmian(code: str, *, trade_date: str) -> dict[str, Any]:
+def huoqu_jibenmian(
+    code: str,
+    *,
+    trade_date: str,
+    allow_current_snapshot: bool = False,
+) -> dict[str, Any]:
     """Fetch profile, valuation, and financial indicators with explicit provenance."""
     as_of_date = pd.to_datetime(trade_date, errors="coerce")
     if pd.isna(as_of_date):
@@ -1297,15 +690,14 @@ def huoqu_jibenmian(code: str, *, trade_date: str) -> dict[str, Any]:
     try:
         pro = _tushare_pro()
         basic_quality: dict[str, Any] = {}
-        basic_all = _load_or_fetch_stock_basic(pro, basic_quality)
+        basic_all = huoqu_gupiao_jichu_ziliao(pro, basic_quality)
         data_quality["stock_basic"] = basic_quality.get("stock_basic", {})
         warnings.extend(str(item) for item in basic_quality.get("warnings", []))
         basic = basic_all[basic_all["ts_code"].astype(str) == code]
         if basic is not None and not basic.empty:
             profile = {str(key): _json_value(value) for key, value in basic.iloc[0].items()}
-            basic_source = str(data_quality["stock_basic"].get("source") or "tushare")
-            sources["profile"] = (
-                "tushare" if basic_source == "tushare" else f"tushare_{basic_source}"
+            sources["profile"] = str(
+                data_quality["stock_basic"].get("source") or "tushare_live"
             )
     except Exception as exc:
         errors.append(f"Tushare 基本资料失败：{exc}")
@@ -1426,8 +818,7 @@ def huoqu_jibenmian(code: str, *, trade_date: str) -> dict[str, Any]:
                     "circulating_share": ak_info.get("流通股"),
                 }
                 sources["profile"] = "akshare"
-            can_use_current_snapshot = _can_use_current_akshare_snapshot(as_of_date)
-            if not valuation and ak_info and can_use_current_snapshot:
+            if not valuation and ak_info and allow_current_snapshot:
                 valuation = {
                     "as_of": as_of_text,
                     "as_of_note": "AKShare 快照未提供原始交易日期，仅在最近完成交易日使用",
@@ -1446,7 +837,7 @@ def huoqu_jibenmian(code: str, *, trade_date: str) -> dict[str, Any]:
             errors.append(f"AKShare 基本面降级失败：{exc}")
 
     if not financials:
-        if _can_use_current_akshare_snapshot(as_of_date):
+        if allow_current_snapshot:
             try:
                 financials, ak_errors = _akshare_financials(code, as_of=as_of_text)
                 errors.extend(ak_errors)
@@ -1469,389 +860,6 @@ def huoqu_jibenmian(code: str, *, trade_date: str) -> dict[str, Any]:
     }
 
 
-def _fundamental_score(fundamentals: dict[str, Any]) -> tuple[int | None, list[str]]:
-    financials = fundamentals.get("financials") or {}
-    valuation = fundamentals.get("valuation") or {}
-    profile = fundamentals.get("profile") or {}
-    industry = str(profile.get("industry") or profile.get("所属行业") or "")
-    financial_industry = any(
-        keyword in industry for keyword in ("银行", "保险", "证券", "多元金融", "金融服务")
-    )
-    evidence: list[str] = []
-    score = 50.0
-    observed = 0
-
-    roe = _round_optional(financials.get("roe_pct"))
-    if roe is not None:
-        observed += 1
-        if roe >= 15:
-            score += 15
-            evidence.append("ROE 较强")
-        elif roe >= 8:
-            score += 7
-            evidence.append("ROE 为正且处于中等水平")
-        elif roe < 0:
-            score -= 18
-            evidence.append("ROE 为负")
-
-    growth = _round_optional(financials.get("net_profit_yoy_pct"))
-    if growth is not None:
-        observed += 1
-        if growth >= 15:
-            score += 12
-            evidence.append("净利润同比增长较快")
-        elif growth < -15:
-            score -= 15
-            evidence.append("净利润同比明显下降")
-
-    debt = _round_optional(financials.get("debt_to_assets_pct"))
-    if debt is not None:
-        observed += 1
-        if financial_industry:
-            evidence.append("金融行业资产负债率口径特殊，本项只展示、不加减分")
-        elif debt > 75:
-            score -= 12
-            evidence.append("资产负债率偏高，需结合行业解释")
-        elif debt < 45:
-            score += 5
-            evidence.append("资产负债率相对温和")
-
-    pe = _round_optional(valuation.get("pe_ttm"))
-    if pe is None:
-        pe = _round_optional(valuation.get("pe_dynamic"))
-    if pe is not None:
-        observed += 1
-        if pe <= 0:
-            score -= 12
-            evidence.append("市盈率为负，通常意味着当前口径下亏损")
-        elif pe > 80:
-            score -= 8
-            evidence.append("市盈率较高，估值对增长兑现要求较高")
-        else:
-            evidence.append("估值数据可用，需与同行比较后再下结论")
-
-    return (int(round(max(0, min(100, score)))) if observed >= 2 else None), evidence
-
-
-def _a_share_rules(
-    code: str,
-    name: str,
-    *,
-    price_limit_exempt: bool | None = None,
-) -> dict[str, Any]:
-    upper_name = str(name).strip().upper()
-    inferred_exempt = upper_name.startswith(("N", "C"))
-    exempt = inferred_exempt if price_limit_exempt is None else bool(price_limit_exempt)
-    price_rule = _price_limit_rule(code, name, price_limit_exempt=exempt)
-    normalized = str(code).upper()
-    digits = normalized.split(".")[0]
-    if normalized.endswith(".BJ"):
-        buy_lot = "竞价买入单笔不少于 100 股，超过 100 股的部分可按 1 股递增"
-    elif digits.startswith(("688", "689")):
-        buy_lot = "科创板竞价买入单笔不少于 200 股，超过 200 股的部分可按 1 股递增"
-    else:
-        buy_lot = "沪深主板和创业板竞价买入通常按 100 股或其整数倍申报"
-    return {
-        "settlement": "T+1：当日买入的股票最早下一个交易日卖出",
-        "price_limit_status": price_rule.status,
-        "price_limit_pct": (
-            round(price_rule.limit_rate * 100, 2) if price_rule.limit_rate is not None else None
-        ),
-        "price_limit_rule_effective_from": price_rule.effective_from,
-        "price_limit_status_basis": (
-            "股票简称 N/C 标记或调用方提供的无涨跌幅状态"
-            if exempt
-            else "按普通交易日板块规则归类；重新上市、退市整理首日等特殊状态仍以交易所当日信息为准"
-        ),
-        "price_limit_note": (
-            price_rule.reason
-            if exempt
-            else f"{price_rule.reason}；特殊无涨跌幅限制交易日以交易所当日证券状态为准"
-        ),
-        "buy_lot": buy_lot,
-        "prediction_horizon": (
-            "公开三日预测以最近完整收盘日T为基准；T+1/T+2/T+3分别表示之后第1/2/3个实际交易日收盘。"
-            "参考收盘价由模型从T收盘推导，不伪造尚未知开盘价对应的精确目标价"
-        ),
-    }
-
-
-def fenxi_gupiao(
-    *,
-    gupiao: str,
-    source: str = "auto",
-    history_calendar_days: int | None = None,
-    run_dir: str | None = None,
-) -> dict[str, Any]:
-    """Run the first stage of the personal single-stock analysis workflow."""
-    _ensure_dotenv()
-    config, _ = jiazai_lianghua_peizhi()
-    # The public product has one fixed direction-evidence stage and one fixed
-    # three-trading-day forecast stage.  No prediction model is fitted here.
-    configured_history_days = int(config.get("dangu", {}).get("history_calendar_days", 1440))
-    history_calendar_days = configured_history_days if history_calendar_days is None else int(history_calendar_days)
-    history_calendar_days = max(540, min(history_calendar_days, 1800))
-    code, resolved, resolve_warnings = jiexi_gupiao(gupiao, source=source)
-    reference = datetime.now()
-    end = reference.date()
-    start = end - timedelta(days=history_calendar_days)
-    market = huoqu_rili_xingqing(
-        code,
-        start_date=start.strftime("%Y%m%d"),
-        end_date=end.strftime("%Y%m%d"),
-        source=source,
-    )
-    if market.data.empty:
-        return {
-            "status": "error",
-            "error": f"无法取得 {code} 的日线行情",
-            "data_errors": list(market.errors),
-        }
-
-    analysis_history, completion_warnings = _completed_market_history(market.data, reference=reference)
-    market_warnings = list(resolve_warnings) + list(market.warnings) + completion_warnings
-    if analysis_history.empty:
-        return {
-            "status": "error",
-            "error": f"{code} 没有已确认收盘的日线行情",
-            "data_errors": list(market.errors),
-            "market_data": {"warnings": market_warnings},
-        }
-    try:
-        technical = zongjie_jishu(analysis_history)
-    except (KeyError, RuntimeError, ValueError) as exc:
-        return {
-            "status": "error",
-            "error": f"{code} 的有效日线不足，无法完成技术分析：{exc}",
-            "data_errors": list(market.errors),
-            "market_data": {"rows": int(len(analysis_history)), "warnings": market_warnings},
-        }
-    technical_as_of = pd.Timestamp(str(technical["trade_date"])).normalize()
-    raw_analysis_end = pd.to_datetime(analysis_history["trade_date"], errors="coerce").max()
-    if pd.notna(raw_analysis_end) and pd.Timestamp(raw_analysis_end).normalize() > technical_as_of:
-        analysis_history = analysis_history[
-            pd.to_datetime(analysis_history["trade_date"], errors="coerce").dt.normalize() <= technical_as_of
-        ].copy()
-        market_warnings.append("末尾行情缺少形成指标所需的数据，分析时点已回退到最近可用交易日")
-    freshness = _market_data_freshness(technical["trade_date"], reference=reference)
-    if freshness["status"] == "too_stale":
-        return {
-            "status": "error",
-            "error": (
-                f"{code} 最新可用行情停留在 {technical['trade_date']}，"
-                f"距最近应完成交易日已 {freshness['business_days_old']} 个工作日；"
-                "可能处于停牌或数据源延迟状态，已停止输出当前分析"
-            ),
-            "as_of": technical["trade_date"],
-            "market_data": {
-                "source": market.source,
-                "adjustment": market.adjustment,
-                "freshness": freshness,
-                "warnings": market_warnings,
-                "errors": list(market.errors),
-            },
-        }
-    fundamentals = huoqu_jibenmian(code, trade_date=str(technical["trade_date"]))
-    if resolved and not fundamentals.get("profile"):
-        fundamentals["profile"] = resolved
-        fundamentals.setdefault("sources", {})["profile"] = "local_cache"
-    profile = fundamentals.get("profile") or {}
-    name = str(profile.get("name") or resolved.get("name") or "")
-    fundamental_score, fundamental_evidence = _fundamental_score(fundamentals)
-    from src.ashare.dangu_yuce import (
-        fenxi_dangu_yinzi,
-        huoqu_dangqian_kuaizhao,
-        pinggu_kejiaoyixing,
-    )
-
-    execution_reference = datetime.now()
-    current_quote = huoqu_dangqian_kuaizhao(code, reference=execution_reference)
-    tradability = pinggu_kejiaoyixing(
-        code=code,
-        name=name,
-        profile=profile,
-        history=analysis_history,
-        freshness=freshness,
-        current_quote=current_quote,
-        config=config,
-        reference=execution_reference,
-    )
-    industry = str(profile.get("industry") or profile.get("所属行业") or resolved.get("industry") or "")
-    try:
-        fundamentals_for_analysis = {
-            **fundamentals,
-            "score_0_100": fundamental_score,
-            "evidence": fundamental_evidence,
-        }
-        quantitative = fenxi_dangu_yinzi(
-            code=code,
-            name=name,
-            industry=industry,
-            target_history=analysis_history,
-            target_source=market.source,
-            target_adjustment=market.adjustment,
-            source=source,
-            signal_date=str(technical["trade_date"]),
-            config=config,
-            technical=technical,
-            fundamentals=fundamentals_for_analysis,
-            tradability=tradability,
-        )
-    except Exception as exc:
-        fallback_label = "证据偏负面" if not tradability.get("basic_execution_feasible") else "证据不足"
-        fallback_reasons = list(tradability.get("hard_blocks", []))
-        fallback_reasons.append(f"量化因子分析本次不可用：{exc}")
-        quantitative = {
-            "status": "unavailable",
-            "model_status": "not_run",
-            "forecast": {},
-            "future_3_trading_days": {
-                "status": "unavailable",
-                "signal_date": str(technical["trade_date"]),
-                "forecast": {},
-                "error": str(exc),
-            },
-            "validation": {"horizons": {}, "passed_horizons": 0},
-            "analysis_assessment": {
-                "evidence_label": fallback_label,
-                "requested_horizon": "当前因子状态",
-                "summary": f"{fallback_label}：{fallback_reasons[0]}",
-                "reasons": fallback_reasons,
-                "signal_gate": {
-                    "actionable_signal": False,
-                    "decision": "abstain",
-                    "reasons": fallback_reasons,
-                },
-                "responsibility_note": "这是分析证据汇总，不是交易指令；最终决定由用户自行作出。",
-            },
-            "error": str(exc),
-            "failure_category": classify_failure(exc),
-            "failure_stage": "factor_analysis",
-            "factor_analysis": {
-                "status": "unavailable",
-                "model_status": "not_run",
-                "direction": "中性/不确定",
-                "evidence_label": fallback_label,
-                "error": str(exc),
-            },
-            "limitations": ["分析阶段不训练收益预测模型；模型预测请调用第二阶段"],
-            "_prediction_context": None,
-        }
-    prediction_context = quantitative.pop("_prediction_context", None)
-    quantitative_public = {
-        key: value for key, value in quantitative.items() if not str(key).startswith("_")
-    }
-    risks: list[str] = []
-    if market.adjustment == "raw_unadjusted":
-        risks.append("行情未复权，历史分红送转可能影响长周期技术指标")
-    if technical.get("annualized_volatility_20") and float(technical["annualized_volatility_20"]) > 0.55:
-        risks.append("近期波动率较高，短线技术判断的不确定性会增大")
-    if any(keyword in name.upper() for keyword in ["ST", "退"]):
-        risks.append("股票名称包含 ST/退市风险标记")
-    if not fundamentals.get("financials"):
-        risks.append("财务指标接口未返回数据，基本面结论不完整")
-    elif fundamentals["financials"].get("missing_fields"):
-        risks.append(
-            "最新可用财报缺少关键字段："
-            + "、".join(str(field) for field in fundamentals["financials"]["missing_fields"])
-            + "；基本面评分只使用实际取得的字段"
-        )
-    if str(fundamentals.get("sources", {}).get("profile", "")).endswith("stale_cache"):
-        risks.append("股票基本资料刷新失败，名称、行业或风险状态来自过期缓存")
-    if freshness["status"] == "possibly_stale":
-        risks.append(
-            f"最新行情距最近应完成交易日约 {freshness['business_days_old']} 个工作日，"
-            "可能存在停牌、长假或数据接口延迟"
-        )
-    risks.extend(str(value) for value in tradability.get("hard_blocks", []))
-    risks.extend(str(value) for value in tradability.get("cautions", []))
-    if quantitative.get("status") != "ok":
-        risks.append("量化因子分析本次不可用或同行样本不足，方向证据不足")
-
-    peer_universe = quantitative.get("peer_universe", {})
-    history_fetch = peer_universe.get("history_fetch", {})
-    data_health = build_data_health(
-        as_of=str(technical["trade_date"]),
-        expected_as_of=freshness.get("expected_latest_date"),
-        freshness=freshness,
-        sources={
-            "market_history": market.source,
-            "adjustment": market.adjustment,
-            "fundamentals": fundamentals.get("sources", {}),
-            "peer_history": history_fetch.get("history_sources", {}),
-            "daily_factors": quantitative.get("daily_factor_data", {}).get("source"),
-        },
-        warehouse=peer_universe.get("warehouse_range"),
-        warnings=market_warnings + list(history_fetch.get("warnings", [])),
-        errors=list(market.errors) + list(history_fetch.get("errors", [])),
-        constituent_history={
-            **(peer_universe.get("stock_master_snapshot") or {"status": "unavailable"}),
-            "usage": "同行池优先使用不晚于信号日的股票资料快照；仓库建立前的行业成员变化仍无法倒推",
-        },
-    )
-
-    result: dict[str, Any] = {
-        "status": "ok",
-        "tool_contract_version": SINGLE_STOCK_TOOL_CONTRACT_VERSION,
-        "analysis_type": "single_stock",
-        "analysis_request": {
-            "history_calendar_days": history_calendar_days,
-            "prediction_horizons": ["T+1", "T+2", "T+3"],
-            "prediction_training": "deferred_until_explicit_forecast_request",
-        },
-        "stock": {"ts_code": code, "name": name, **{key: value for key, value in profile.items() if key not in {"ts_code", "name"}}},
-        "as_of": technical["trade_date"],
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "market_data": {
-            "source": market.source,
-            "adjustment": market.adjustment,
-            "rows": int(len(analysis_history)),
-            "start_date": analysis_history["trade_date"].iloc[0].strftime("%Y-%m-%d"),
-            "end_date": analysis_history["trade_date"].iloc[-1].strftime("%Y-%m-%d"),
-            "freshness": freshness,
-            "warnings": market_warnings,
-            "errors": list(market.errors),
-        },
-        "data_health": data_health,
-        "current_quote": current_quote,
-        "tradability": tradability,
-        "quantitative_analysis": quantitative_public,
-        "future_3_trading_days": quantitative_public.get("future_3_trading_days", {}),
-        "analysis_assessment": quantitative_public.get("analysis_assessment", {}),
-        "technical_analysis": technical,
-        "fundamental_analysis": {
-            **fundamentals,
-            "score_0_100": fundamental_score,
-            "score_interpretation": (
-                "启发式检查分，只能用于同一数据完整度下的初筛；未做完整同行估值排名，"
-                "不能解释为上涨概率或精确目标分"
-            ),
-            "evidence": fundamental_evidence,
-        },
-        "a_share_rules": _a_share_rules(code, name),
-        "risks": risks,
-        "research_scope": {
-            "data_frequency": "daily",
-            "forecast_horizons": ["T+1", "T+2", "T+3"],
-            "note": "程序固定使用日K；预测只覆盖未来三个实际交易日",
-        },
-        "scope_note": (
-            "这是基于公开数据、量化因子和同行横截面证据的A股研究结果，不是收益保证；"
-            "分析阶段不训练预测模型，LLM只负责把程序生成的证据翻译成通俗说明，不得改写数值"
-        ),
-        "execution_policy": "research_only：程序只做分析和预测，不连接券商、不读取交易账户、不提交委托，也不替用户作买卖决定。",
-        "_prediction_context": prediction_context,
-    }
-
-    if run_dir:
-        try:
-            run_path = safe_run_dir(run_dir)
-            artifact_dir = run_path / "artifacts"
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            output = artifact_dir / f"gupiao_fenxi_{code.replace('.', '_')}.json"
-            artifact_result = {key: value for key, value in result.items() if not str(key).startswith("_")}
-            output.write_text(json.dumps(artifact_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            result["artifact"] = str(output)
-        except Exception as exc:
-            result["artifact_error"] = str(exc)
-    return result
+# 稳定公开接口；保留原私有函数名，避免既有调用方在架构迁移期间失效。
+guolv_wanzheng_jiaoyiri_lishi = _completed_market_history
+guifan_you_xian_shuzhi = _round_optional

@@ -16,6 +16,7 @@ from src.agent.loop import (
     _context_collapse,
     _fix_tool_pairs,
     _is_tool_success,
+    _analysis_run_status,
     _normalize_tool_run_dir,
 )
 
@@ -242,6 +243,13 @@ class TestIsToolSuccess:
     def test_failure_json_error(self) -> None:
         assert _is_tool_success('{"status": "error", "error": "boom"}') is False
 
+    @pytest.mark.parametrize(
+        "status",
+        ["unavailable", "clarification_required", "reanalysis_required", "blocked"],
+    )
+    def test_incomplete_structured_status_is_not_success(self, status: str) -> None:
+        assert _is_tool_success(json.dumps({"status": status})) is False
+
     def test_success_non_dict_json(self) -> None:
         assert _is_tool_success("[1, 2, 3]") is True
 
@@ -250,6 +258,24 @@ class TestIsToolSuccess:
 
     def test_success_invalid_json(self) -> None:
         assert _is_tool_success("{not json}") is True
+
+
+class TestAnalysisRunStatus:
+    def test_unavailable_is_not_business_success(self) -> None:
+        assert _analysis_run_status({"status": "unavailable", "outcome": "data_unavailable"}) == "data_unavailable"
+
+    def test_ok_without_current_contract_is_failed(self) -> None:
+        assert _analysis_run_status({"status": "ok", "outcome": "recommendation"}) == "failed"
+
+    def test_current_no_recommendation_contract_is_distinct(self) -> None:
+        payload = {
+            "status": "ok",
+            "outcome": "no_recommendation",
+            "tool_contract_version": 7,
+            "analysis_id": "fx_test",
+            "analysis_stage": {"status": "completed"},
+        }
+        assert _analysis_run_status(payload) == "no_recommendation"
 
 
 # ---------------------------------------------------------------------------

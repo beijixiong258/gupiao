@@ -7,7 +7,12 @@ import os
 
 import pytest
 
-from src.duihua.huihua import DuihuaCunchu, HuihuaCuoWu, zhengli_xiaoxi
+from src.duihua.huihua import (
+    DuihuaCunchu,
+    HuihuaCuoWu,
+    zhengli_chijiuhua_xiaoxi,
+    zhengli_xiaoxi,
+)
 
 
 def test_utf8_session_round_trip(tmp_path) -> None:
@@ -77,6 +82,41 @@ def test_message_cleanup_preserves_tool_context_and_drops_system() -> None:
     assert [message["role"] for message in cleaned] == ["user", "assistant", "tool"]
     assert "贵州茅台" in cleaned[-1]["content"]
     json.dumps(cleaned, ensure_ascii=False)
+
+
+def test_persisted_analysis_keeps_reference_but_drops_market_result() -> None:
+    result = {
+        "status": "ok",
+        "outcome": "recommendation",
+        "scope": {"requested_name": "电子板块", "canonical_name": "电子"},
+        "primary": {"ts_code": "301282.SZ", "name": "金禄电子"},
+        "data_provenance": {"history": {"rows": [1, 2, 3]}},
+        "reviewed_candidates": [{"factor": {"trend": 88}}],
+    }
+    messages = [
+        {
+            "role": "tool",
+            "name": "gupiao_fenxi",
+            "tool_call_id": "tc_scope",
+            "content": json.dumps(result, ensure_ascii=False),
+        }
+    ]
+
+    persisted = zhengli_chijiuhua_xiaoxi(messages)
+    payload = json.loads(persisted[0]["content"])
+
+    assert payload["status"] == "reanalysis_required"
+    assert payload["scope_request"] == {
+        "fanwei": "named_scope",
+        "mingcheng": "电子板块",
+    }
+    assert payload["stock_reference"] == {
+        "ts_code": "301282.SZ",
+        "name": "金禄电子",
+    }
+    assert payload["market_data_persistence"] == "none"
+    assert "data_provenance" not in payload
+    assert "reviewed_candidates" not in payload
 
 
 def test_clear_keeps_session_identity(tmp_path) -> None:

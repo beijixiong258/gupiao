@@ -17,7 +17,12 @@ _GUPIAO_YUCE = GupiaoYuceTool()
 
 MCP_INSTRUCTIONS = """
 Only provide personal-use research on mainland China A-share stocks. The server has exactly
-two business tools: diagnosis and a single three-trading-day forecast. It never connects to brokers,
+two business tools: unified stock-selection analysis and a single three-trading-day forecast for a
+qualified selected candidate. Natural-language assistants must hide tool parameters and analysis_id
+from end users. When the user names a scope, pass the ordinary phrase unchanged as named_scope;
+the analysis tool dynamically downloads industry and concept catalogs and may return one plain-language
+clarification. Never guess an industry-versus-concept category. Prediction is expensive and may run only
+after the completed quantitative result has been shown and the user confirms in a later message. The server never connects to brokers,
 accepts trading credentials, submits orders, controls trading terminals, or performs
 automatic trading. All outputs are research results for manual review.
 """.strip()
@@ -33,8 +38,8 @@ mcp = FastMCP(
 @mcp.tool(
     name="gupiao_fenxi",
     description=(
-        "第一阶段：分析一只中国大陆 A 股的当前量化因子，返回行情时点、可交易性、基本面、估值、技术面、"
-        "价量、相对强弱、同行与风险证据，不训练收益预测模型，并返回analysis_id。具体预测数值必须再调用gupiao_yuce。"
+        "统一分析：在全市场或用户用日常语言描述的范围中，先动态发现并核验范围，再自动执行风险过滤、八组日K因子、基本面、形态、尾盘证据和排序，"
+        "返回一只首选、最多四只备选或明确不推荐。内部analysis_id只供后续预测工具衔接，不应向自然语言用户展示。"
         "只做个人研究分析和三交易日预测，不替用户作交易决定，不连接券商或下单。"
     ),
     annotations={
@@ -45,15 +50,13 @@ mcp = FastMCP(
     },
 )
 def gupiao_fenxi(
-    gupiao: str,
-    source: Literal["auto", "tushare", "akshare"] = "auto",
-    history_calendar_days: int = 1440,
+    fanwei: Literal["all_market", "named_scope"] = "all_market",
+    mingcheng: str | None = None,
 ) -> dict[str, Any]:
-    """研究一只 A 股；gupiao 可传代码或中文名称。"""
+    """按自然语言解析出的范围执行统一选股分析。"""
     return json.loads(_GUPIAO_FENXI.execute(
-        gupiao=gupiao,
-        source=source,
-        history_calendar_days=history_calendar_days,
+        fanwei=fanwei,
+        mingcheng=mingcheng,
     ))
 
 
@@ -72,10 +75,12 @@ def gupiao_fenxi(
 )
 def gupiao_yuce(
     analysis_id: str,
+    gupiao: str | None = None,
 ) -> dict[str, Any]:
-    """根据一次完成的分析发布未来三个交易日预测。"""
+    """根据一次完成的分析预测首选，或预测明确点名的合格备选。"""
     return json.loads(_GUPIAO_YUCE.execute(
         analysis_id=analysis_id,
+        gupiao=gupiao,
     ))
 
 

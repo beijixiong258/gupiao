@@ -1,11 +1,6 @@
-"""Focused tests for shared A-share market rules and reference-data caching."""
+"""Focused tests for shared A-share market rules and live reference data."""
 
 from __future__ import annotations
-
-import os
-from datetime import datetime, timedelta
-from pathlib import Path
-from uuid import uuid4
 
 import pandas as pd
 import pytest
@@ -74,53 +69,15 @@ def _fresh_frame() -> pd.DataFrame:
     )
 
 
-@pytest.fixture
-def cache_path(monkeypatch: pytest.MonkeyPatch):
-    path = Path(__file__).with_name(f".stock_basic_{uuid4().hex}.csv")
-    monkeypatch.setattr(shuju_yuan, "STOCK_BASIC_CACHE", path)
-    try:
-        yield path
-    finally:
-        path.unlink(missing_ok=True)
-
-
-def test_stock_basic_cache_uses_fresh_file_without_network(
-    cache_path: Path,
-) -> None:
-    _fresh_frame().to_csv(cache_path, index=False)
-    pro = _FakePro(pd.DataFrame())
-    quality: dict[str, object] = {}
-
-    result = shuju_yuan._load_or_fetch_stock_basic(pro, quality)
-
-    assert pro.calls == 0
-    assert result.iloc[0]["ts_code"] == "000001.SZ"
-    assert quality["stock_basic"]["source"] == "cache"  # type: ignore[index]
-
-
-def test_stock_basic_cache_refreshes_after_ttl(
-    cache_path: Path,
-) -> None:
-    pd.DataFrame([{"ts_code": "600000.SH", "name": "旧名称"}]).to_csv(cache_path, index=False)
-    old_time = (datetime.now() - timedelta(days=2)).timestamp()
-    os.utime(cache_path, (old_time, old_time))
+def test_stock_basic_is_always_fetched_from_tushare_without_persistence() -> None:
     pro = _FakePro(_fresh_frame())
     quality: dict[str, object] = {}
 
-    result = shuju_yuan._load_or_fetch_stock_basic(pro, quality, cache_ttl=timedelta(hours=24))
+    first = shuju_yuan.huoqu_gupiao_jichu_ziliao(pro, quality)
+    second = shuju_yuan.huoqu_gupiao_jichu_ziliao(pro, {})
 
-    assert pro.calls == 1
-    assert result.iloc[0]["ts_code"] == "000001.SZ"
-    assert quality["stock_basic"]["source"] == "tushare"  # type: ignore[index]
-
-
-def test_stock_basic_cache_supports_forced_refresh(
-    cache_path: Path,
-) -> None:
-    pd.DataFrame([{"ts_code": "600000.SH", "name": "旧名称"}]).to_csv(cache_path, index=False)
-    pro = _FakePro(_fresh_frame())
-
-    result = shuju_yuan._load_or_fetch_stock_basic(pro, {}, force_refresh=True)
-
-    assert pro.calls == 1
-    assert result.iloc[0]["ts_code"] == "000001.SZ"
+    assert pro.calls == 2
+    assert first.iloc[0]["ts_code"] == "000001.SZ"
+    assert second.iloc[0]["ts_code"] == "000001.SZ"
+    assert quality["stock_basic"]["source"] == "tushare_live"  # type: ignore[index]
+    assert quality["stock_basic"]["persistence"] == "none"  # type: ignore[index]

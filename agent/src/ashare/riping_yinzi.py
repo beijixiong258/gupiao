@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from src.ashare.gupiao_yanjiu import akshare_zhilian
-from src.ashare.shuju_yuan import CACHE_DIR, _tushare_pro
+from src.ashare.shichang_shuju import akshare_zhilian
+from src.ashare.shuju_yuan import _tushare_pro
 from src.ashare.yinzi_gongcheng import add_factor_composites
 
 
@@ -74,49 +72,6 @@ DAILY_FACTOR_FEATURE_COLUMNS = [
 ] + BENCHMARK_FEATURE_COLUMNS
 
 _DAILY_BASIC_FIELDS = ["turnover_rate", "pe_ttm", "pb", "total_mv", "circ_mv"]
-_FACTOR_CACHE_DIR = CACHE_DIR / "daily_factor_cache"
-
-
-def _read_csv(path: Path) -> pd.DataFrame:
-    if not path.is_file():
-        return pd.DataFrame()
-    try:
-        data = pd.read_csv(path)
-        if "trade_date" in data.columns:
-            data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
-        return data.dropna(subset=["trade_date"]) if "trade_date" in data.columns else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
-def _read_meta(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_cache(data: pd.DataFrame, csv_path: Path, meta: dict[str, Any]) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    data.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    csv_path.with_suffix(".json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def _cache_covers(meta: dict[str, Any], start: pd.Timestamp, end: pd.Timestamp) -> bool:
-    cached_start = pd.to_datetime(meta.get("requested_start"), errors="coerce")
-    cached_end = pd.to_datetime(meta.get("requested_end"), errors="coerce")
-    return bool(
-        pd.notna(cached_start)
-        and pd.notna(cached_end)
-        and pd.Timestamp(cached_start).normalize() <= start
-        and pd.Timestamp(cached_end).normalize() >= end
-    )
 
 
 def _normalize_daily_basic(frame: pd.DataFrame, code: str) -> pd.DataFrame:
@@ -146,37 +101,7 @@ def _historical_daily_basic(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     warnings: list[str] = []
     frames: list[pd.DataFrame] = []
-    cache_hits = 0
-    fetched = 0
-    try:
-        from src.ashare.riping_cangku import load_daily_basic_from_warehouse
-
-        warehouse_data, warehouse_meta = load_daily_basic_from_warehouse(
-            codes,
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
-        )
-        if (
-            not warehouse_data.empty
-            and float(warehouse_meta.get("calendar_sync_coverage", 0.0)) >= 0.90
-        ):
-            combined = pd.concat(
-                [
-                    _normalize_daily_basic(group, str(code))
-                    for code, group in warehouse_data.groupby("ts_code")
-                ],
-                ignore_index=True,
-            )
-            return combined, {
-                **warehouse_meta,
-                "status": "ok",
-                "stocks_requested": int(len(set(codes))),
-                "stocks_with_rows": int(combined["ts_code"].nunique()),
-                "merge_rule": "仅按股票代码和同一交易日精确合并，不向前或向后填充",
-                "warnings": [],
-            }
-    except Exception as exc:
-        warnings.append(f"全市场日频仓库估值读取失败，改用逐股缓存：{exc}")
+    requests_attempted = 0
     try:
         pro = _tushare_pro()
     except Exception as exc:
@@ -188,41 +113,18 @@ def _historical_daily_basic(
         }
 
     for code in sorted(set(codes)):
-        safe_code = code.replace(".", "_")
-        cache_path = _FACTOR_CACHE_DIR / "daily_basic" / f"{safe_code}.csv"
-        cached = _normalize_daily_basic(_read_csv(cache_path), code)
-        meta = _read_meta(cache_path.with_suffix(".json"))
-        data = cached
-        if _cache_covers(meta, start, end):
-            cache_hits += 1
-        else:
-            try:
-                raw = pro.daily_basic(
-                    ts_code=code,
-                    start_date=start.strftime("%Y%m%d"),
-                    end_date=end.strftime("%Y%m%d"),
-                    fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv,circ_mv",
-                )
-                fresh = _normalize_daily_basic(raw, code)
-                data = (
-                    pd.concat([cached, fresh], ignore_index=True)
-                    .drop_duplicates(["ts_code", "trade_date"], keep="last")
-                    .sort_values("trade_date")
-                    .reset_index(drop=True)
-                )
-                _write_cache(
-                    data,
-                    cache_path,
-                    {
-                        "source": "tushare_daily_basic",
-                        "requested_start": start.strftime("%Y-%m-%d"),
-                        "requested_end": end.strftime("%Y-%m-%d"),
-                        "rows": int(len(data)),
-                    },
-                )
-                fetched += 1
-            except Exception as exc:
-                warnings.append(f"{code} 历史日频估值获取失败：{exc}")
+        try:
+            requests_attempted += 1
+            raw = pro.daily_basic(
+                ts_code=code,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv,circ_mv",
+            )
+            data = _normalize_daily_basic(raw, code)
+        except Exception as exc:
+            warnings.append(f"{code} 历史日频估值获取失败：{exc}")
+            data = pd.DataFrame()
         if not data.empty:
             frames.append(data[(data["trade_date"] >= start) & (data["trade_date"] <= end)])
 
@@ -233,8 +135,8 @@ def _historical_daily_basic(
         "stocks_requested": int(len(set(codes))),
         "stocks_with_rows": int(combined["ts_code"].nunique()) if not combined.empty else 0,
         "rows": int(len(combined)),
-        "cache_hits": int(cache_hits),
-        "network_refreshes": int(fetched),
+        "network_requests": requests_attempted,
+        "persistence": "none",
         "merge_rule": "仅按股票代码和同一交易日精确合并，不向前或向后填充",
         "warnings": warnings,
     }
@@ -281,11 +183,6 @@ def _fetch_one_benchmark(
     errors: list[str] = []
     providers = [source] if source in {"tushare", "akshare"} else ["tushare", "akshare"]
     for provider in providers:
-        cache_path = _FACTOR_CACHE_DIR / "benchmarks" / f"{key}_{provider}.csv"
-        cached = _normalize_index_history(_read_csv(cache_path), tushare=provider == "tushare")
-        meta = _read_meta(cache_path.with_suffix(".json"))
-        if _cache_covers(meta, start, end) and not cached.empty:
-            return cached[(cached["trade_date"] >= start) & (cached["trade_date"] <= end)], f"{provider}_cache", errors
         try:
             if provider == "tushare":
                 pro = _tushare_pro()
@@ -305,30 +202,9 @@ def _fetch_one_benchmark(
                 fresh = fresh[(fresh["trade_date"] >= start) & (fresh["trade_date"] <= end)]
             if fresh.empty:
                 raise RuntimeError("返回空日线")
-            data = (
-                pd.concat([cached, fresh], ignore_index=True)
-                .drop_duplicates("trade_date", keep="last")
-                .sort_values("trade_date")
-                .reset_index(drop=True)
-            )
-            _write_cache(
-                data,
-                cache_path,
-                {
-                    "source": provider,
-                    "benchmark": spec["name"],
-                    "requested_start": start.strftime("%Y-%m-%d"),
-                    "requested_end": end.strftime("%Y-%m-%d"),
-                    "rows": int(len(data)),
-                },
-            )
-            return data[(data["trade_date"] >= start) & (data["trade_date"] <= end)], provider, errors
+            return fresh[(fresh["trade_date"] >= start) & (fresh["trade_date"] <= end)], provider, errors
         except Exception as exc:
             errors.append(f"{spec['name']} {provider} 日K失败：{exc}")
-            if not cached.empty:
-                overlap = cached[(cached["trade_date"] >= start) & (cached["trade_date"] <= end)]
-                if not overlap.empty:
-                    return overlap, f"{provider}_stale_cache", errors
     return pd.DataFrame(), "unavailable", errors
 
 
@@ -368,6 +244,7 @@ def _benchmark_features(
         "benchmarks": details,
         "warnings": warnings,
         "frequency": "daily_k_only",
+        "persistence": "none",
     }
 
 

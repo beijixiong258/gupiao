@@ -1,4 +1,4 @@
-"""Tool wrapper for single-stock A-share research."""
+"""自然语言智能体使用的统一 A 股选股分析工具。"""
 
 from __future__ import annotations
 
@@ -6,135 +6,103 @@ import json
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.tools.gupiao_analysis_cache import store_analysis
+from src.tools.gupiao_analysis_state import analysis_session_store
 
 
-def _direction_analysis(full_result: dict[str, Any]) -> dict[str, Any]:
-    """Expose the compact directional conclusion from the completed analysis."""
-    quantitative = full_result.get("quantitative_analysis") or {}
-    assessment = quantitative.get("analysis_assessment") or {}
-    factor_analysis = quantitative.get("factor_analysis") or {}
-    if factor_analysis.get("status") == "ok":
-        direction = str(factor_analysis.get("direction") or "中性/不确定")
-        evidence_label = str(factor_analysis.get("evidence_label") or "证据不足")
-        reasons = [str(value) for value in (factor_analysis.get("evidence") or [])]
-        for risk in list(full_result.get("risks") or [])[:3]:
-            risk_text = f"风险提示：{risk}"
-            if risk_text not in reasons:
-                reasons.append(risk_text)
-        return {
-            "horizon": "当前因子状态",
-            "horizon_definition": "只描述最近完整收盘日的量化因子和基本面证据；不代表未来收益预测期限",
-            "direction": direction,
-            "positive_probability": None,
-            "negative_probability": None,
-            "probability_method": None,
-            "probability_definition": "分析阶段不训练方向概率模型，也不把因子分数换算成概率",
-            "evidence_label": evidence_label,
-            "confidence": assessment.get("confidence", "descriptive_factor_evidence"),
-            "summary": assessment.get("summary") or f"{evidence_label}：基于当前量化因子证据",
-            "reasons": reasons[:8],
-            "validation_passed": None,
-            "note": "这是当前因子证据的方向性解读，不是收益保证；如需 T+1/T+2/T+3 数值，请调用 gupiao_yuce。",
-        }
-    evidence_label = str(assessment.get("evidence_label") or "证据不足")
-    direction = (
-        "偏上涨" if evidence_label == "证据偏正面"
-        else "偏下跌" if evidence_label == "证据偏负面"
-        else "中性/不确定"
-    )
-    reasons = [str(value) for value in (factor_analysis.get("evidence") or assessment.get("reasons") or [])]
-    for risk in list(full_result.get("risks") or [])[:3]:
-        risk_text = str(risk)
-        if risk_text not in reasons:
-            reasons.append(f"风险提示：{risk_text}")
-    return {
-        "horizon": "当前因子状态",
-        "horizon_definition": "只描述最近完整收盘日的证据；完整T+1/T+2/T+3数值由gupiao_yuce返回",
-        "direction": direction,
-        "positive_probability": None,
-        "negative_probability": None,
-        "probability_method": None,
-        "probability_definition": "分析阶段不训练方向概率模型，也不把因子分数换算成概率",
-        "evidence_label": evidence_label,
-        "confidence": assessment.get("confidence", "descriptive_factor_evidence"),
-        "summary": assessment.get("summary", "当前没有形成明确方向结论"),
-        "reasons": reasons[:8],
-        "validation_passed": None,
-        "note": "这是当前证据的方向性判断，不是收益保证；具体三日数值由 gupiao_yuce 返回。",
+def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
+    """去掉重复的大字段，同时保留智能体解释与审查所需的完整证据。"""
+    public = {
+        key: value
+        for key, value in result.items()
+        if key != "reviewed_candidates"
     }
+    reviewed = result.get("reviewed_candidates")
+    if isinstance(reviewed, list):
+        public["reviewed_candidate_count"] = len(reviewed)
+
+    provenance = public.get("data_provenance")
+    if isinstance(provenance, dict):
+        # 顶层 scope 已包含同一份已核验信息；不在工具消息中重复一遍。
+        public["data_provenance"] = {
+            key: value for key, value in provenance.items() if key != "scope"
+        }
+    return public
 
 
 class GupiaoFenxiTool(BaseTool):
     name = "gupiao_fenxi"
     description = (
-        "Analyze one mainland China A-share using the latest complete daily data. Calculate deterministic technical, "
-        "fundamental, price/volume, relative-strength and risk factors and return a plain directional evidence summary. "
-        "This first stage does not fit a return-prediction model or probability. The returned analysis_id is required "
-        "by gupiao_yuce when the user explicitly requests the separate three-trading-day forecast."
+        "Run the primary quantitative A-share stock-selection analysis. The scope can be the whole mainland A-share market, "
+        "or one ordinary-language named scope. For a named scope it dynamically queries and verifies the live source "
+        "catalog instead of guessing whether the phrase is an industry or concept. It automatically applies hard risk filters, all eight daily-K factor "
+        "groups, fundamentals and valuation, the limit-up pullback pattern, and late-session evidence when the local "
+        "market time is after 14:30. It returns one primary stock, up to four alternatives, or an explicit decision "
+        "not to recommend. The score is a research ranking score, never an upside probability."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "gupiao": {"type": "string", "description": "A-share code or Chinese name, for example 600519.SH or 贵州茅台"},
-            "source": {
+            "fanwei": {
                 "type": "string",
-                "enum": ["auto", "tushare", "akshare"],
-                "description": (
-                    "Stock-name resolution and daily-bar source. auto means Tushare first, then AKShare fallback. "
-                    "Fundamentals still use their own Tushare-first fallback policy."
-                ),
+                "enum": ["all_market", "named_scope"],
+                "default": "all_market",
+                "description": "Use all_market for the whole market, or named_scope whenever the user says any ordinary industry/board/theme phrase. Never classify it yourself.",
             },
-            "history_calendar_days": {
-                "type": "integer",
-                "minimum": 540,
-                "maximum": 1800,
-                "default": 1440,
-                "description": "Calendar days used for daily-K factor evidence and the deferred prediction context; default 1440.",
+            "mingcheng": {
+                "type": "string",
+                "description": "The user's ordinary-language scope phrase, such as 电子板块. Omit it for all_market; do not translate it into a professional taxonomy.",
             },
         },
-        "required": ["gupiao"],
+        "required": [],
     }
     repeatable = True
-    # Keep this serial in the agent loop: it writes the in-process snapshot
-    # consumed by gupiao_yuce, so the two stages cannot race in one turn.
+    # 只保存多轮对话所需的进程内会话状态，不保存市场时间序列。
     is_readonly = False
 
     def execute(self, **kwargs: Any) -> str:
-        from src.ashare.gupiao_yanjiu import fenxi_gupiao
+        from src.ashare.xuangu_fenxi import fenxi_xuangu
 
-        full_result = fenxi_gupiao(**kwargs)
+        full_result = fenxi_xuangu(
+            fanwei=str(kwargs.get("fanwei") or "all_market"),
+            mingcheng=str(kwargs.get("mingcheng") or "").strip() or None,
+        )
         if full_result.get("status") != "ok":
             return json.dumps(full_result, ensure_ascii=False)
-
         prediction_context = full_result.get("_prediction_context")
         stored_result = {
             key: value for key, value in full_result.items() if not str(key).startswith("_")
         }
-        analysis_id = store_analysis(stored_result, prediction_context=prediction_context)
-        hidden = {"quantitative_analysis", "future_3_trading_days", "analysis_assessment"}
-        public_result = {key: value for key, value in stored_result.items() if key not in hidden}
-        quantitative = stored_result.get("quantitative_analysis") or {}
-        public_result.update(
-            {
-                "tool_contract_version": 4,
-                "analysis_id": analysis_id,
-                "peer_analysis": {
-                    "status": quantitative.get("status"),
-                    "peer_universe": quantitative.get("peer_universe"),
-                    "daily_factor_data": quantitative.get("daily_factor_data"),
-                    "methodology": quantitative.get("methodology"),
-                    "limitations": quantitative.get("limitations"),
-                    "error": quantitative.get("error"),
-                },
-                "analysis_stage": {
-                    "status": "completed",
-                    "scope": "行情时点、基本面、估值、技术面、价量因子、相对强弱、可交易约束、同行和风险已完成；分析阶段未训练预测模型",
-                    "next_tool_for_numbers": "gupiao_yuce",
-                    "instruction": "如需要未来三交易日的具体预测，继续调用 gupiao_yuce；该调用才会训练预测模型",
-                },
-                "direction_analysis": _direction_analysis(full_result),
-                "factor_analysis": quantitative.get("factor_analysis") or {},
-            }
+        analysis_id = analysis_session_store.save(
+            stored_result,
+            prediction_context=prediction_context,
         )
+        recommendation_available = bool(stored_result.get("recommendation_available"))
+        public_result = {
+            **_mianxiang_zhinengti_jieguo(stored_result),
+            "analysis_id": analysis_id,
+            "selected_stock": stored_result.get("primary"),
+            "analysis_stage": {
+                "status": "completed",
+                "scope": "候选池、风险硬过滤、八组日K因子、基本面、形态、尾盘证据、深度复核和排序已完成",
+                "prediction_status": "not_requested" if recommendation_available else "not_available",
+                "prediction_confirmation_required": recommendation_available,
+                "confirmation_timing": (
+                    "later_user_turn_after_analysis_result"
+                    if recommendation_available
+                    else "not_applicable"
+                ),
+                "initial_preapproval_counts": False,
+                "affirmative_reply_defaults_to": "primary" if recommendation_available else None,
+                "prediction_data_policy": "fresh_remote_download_without_local_market_cache",
+                "next_step": (
+                    "先用自然语言讲清量化结论，再单独询问是否预测；即使用户最初说不用再问，也必须在分析结果后询问一次。"
+                    "后续回复‘行’或‘继续’即默认预测首选，点名合格备选则预测该备选，不再重复确认；确认后才重新下载远端数据并训练 T+1/T+2/T+3 模型"
+                    if recommendation_available
+                    else "当前没有达到门槛的候选，不能继续预测"
+                ),
+            },
+        }
         return json.dumps(public_result, ensure_ascii=False)
+
+
+__all__ = ["GupiaoFenxiTool"]

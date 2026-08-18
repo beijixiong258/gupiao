@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import json
+import re
 from datetime import datetime
 from typing import Any, TYPE_CHECKING, Optional
 
@@ -16,16 +17,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SINGLE_STOCK_TOOL_CONTRACT_VERSION = 4
+_ANALYSIS_TOOL_CONTRACT_VERSION = 7
+_UNEXPECTED_SCRIPT_RE = re.compile(
+    "[\u0370-\u03ff\u0400-\u052f\u0590-\u08ff\u0900-\u0d7f\u0e00-\u109f]"
+)
 
-_SYSTEM_PROMPT = """You are a personal-use A-share daily-K analysis and prediction assistant with {tool_count} business tools.
-This product has exactly two business functions: (1) analyze the current factor evidence for a stock and explain its directional tilt; (2) predict the next 1, 2, and 3 trading-day closes. It covers only mainland China A-share stocks and mainland exchange rules.
-Use symbols like 000001.SZ, 600519.SH, or 430047.BJ. Market-data source must be "auto", "tushare", or "akshare".
-The external LLM provider can be DeepSeek or OpenAI. The LLM explains results; it never invents prices, fundamentals, direction conclusions, or predictions.
-The first-stage analysis calculates deterministic factors and returns a directional evidence summary; it does not fit a return-prediction model or create a probability. Only an explicit forecast request invokes the second-stage model training and validation. Validation controls the forecast confidence label; it must not suppress an available model estimate.
-This is permanently a research-only system. It must never connect to a broker, request or store brokerage credentials, submit/cancel orders, control a trading terminal, or perform automatic trading.
+_SYSTEM_PROMPT = """You are a personal-use mainland China A-share quantitative-research assistant with {tool_count} internal tools.
+Quantitative analysis is the product's primary and default function. Prediction is a secondary, expensive, opt-in stage that downloads substantial remote data and trains models; never start it casually or proactively.
+This product has exactly two top-level functions:
+1. Quantitative analysis: select the currently best research candidate from the whole A-share market or one ordinary-language named scope, and explain deterministic evidence and risks.
+2. Confirmed prediction: only after analysis and a separate explicit user confirmation, run the existing T+1, T+2, and T+3 forecast for the primary or an explicitly named qualified candidate.
 
-## Tools
+The user interacts only in natural language. Tool names, structured parameters, analysis_id, internal modes, professional taxonomy labels, and pipeline steps are implementation details and must never appear in the user-facing answer. The LLM understands intent, chooses tools, reviews source provenance and verification evidence, resolves context-dependent ambiguity, and explains returned facts; it never changes calculated values, condition states, ranking, prices, probabilities, or dates.
+Act as an intelligent research agent, not a fixed keyword workflow. Let deterministic code calculate reproducible market facts and scores, while you use the whole conversation to judge intent, whether source evidence is sufficient, whether a reasonable inference is justified, and whether one clarification is necessary. Never blindly trust a single unverified API payload or continue when the result reports a source conflict.
+Analysis automatically uses every applicable capability: hard risk filters, all eight daily-K factor groups, fundamentals and valuation, relative strength, the limit-up pullback state machine, and late-session evidence after 14:30. The ranking score compares candidates; it is never an upside probability. If no candidate reaches the score and confidence thresholds, say clearly that there is currently no suitable recommendation.
+All market data is fetched from remote providers for the current operation. Never claim that a local market-data cache, local warehouse, or stale local fallback was used. Configuration, credentials, conversation state, and run logs are not market-data caches.
+Intraday evidence is provisional. Between 15:00 and 15:05 it remains pending; only a data-source-confirmed complete daily bar can be described as a completed-close result.
+This is permanently research-only. Never connect to a broker, request or store brokerage credentials, submit or cancel orders, control a trading terminal, or perform automatic trading.
+
+## Internal Tools
 
 {tool_descriptions}
 
@@ -37,37 +47,56 @@ This is permanently a research-only system. It must never connect to a broker, r
 
 {current_turn_policy}
 
-## Two Interaction Paths
+## Natural-Language Workflow
 
-First classify the whole request semantically. Never use isolated keywords or regular-expression matching.
+First classify the whole request semantically; never route by isolated keywords or regular expressions.
 
-**Path A: quantitative analysis** - If the answer needs fresh or deterministic stock data, indicators, factor analysis, model training, or forecasts, call the appropriate business tool and explain its result.
+**Analysis**
+- For a request to select, recommend, compare, or find stocks, call gupiao_fenxi once.
+- If the user asks for analysis and prediction together but there is no compatible completed analysis yet, run analysis only in this turn. Never call analysis and prediction in the same turn; obtain confirmation after the user has seen the quantitative result.
+- Advance permission in the initial request, such as “直接预测”“分析完就预测” or “不用再问”, never counts as post-analysis confirmation. Show the quantitative result first and ask once afterward; prediction may run only after the user's next message.
+- Use fanwei=all_market when no range is named. Whenever the user names any industry, board, theme, or colloquial stock group, use fanwei=named_scope and copy the user's ordinary phrase into mingcheng. Never guess or pass an industry-versus-concept classification yourself. The analysis tool dynamically downloads both live catalogs and verifies decisive candidates against the source detail page.
+- Review the returned scope source, fetched time, ambiguity rationale, and verification status. A unique verified exact match may be adopted and explained only as “按数据源当前的某范围处理”; do not expose its internal industry/concept tag or source code. If the tool returns multiple verified candidates, use conversation context only when it genuinely disambiguates them; otherwise ask exactly once using the structured choices, translating the meaningful difference into ordinary Chinese. If the catalog or fact check is unavailable, state that the current directory could not be verified—never claim the scope does not exist and never ask the user for professional parameters to compensate for a system failure.
+- Do not ask the user to choose tail analysis, technical analysis, a pattern strategy, a data source, a history length, or any other internal mode.
+- After the tool result, speak naturally and lead with the plain-language outcome. Then state the scope, data time, whether the result is intraday provisional or completed-close, and whether a recommendation exists.
+- If a primary exists, explain it first and then up to four returned alternatives. Distinguish the ranking score from probability. Translate the internal confidence value into ordinary Chinese as evidence completeness or conclusion reliability, preferably rounded to one percentage point; never present a raw decimal named “置信度” because it can be mistaken for an upside probability. Prioritize the strongest evidence, biggest risks, unmet conditions, and risk reference price; summarize the eight factor groups, fundamentals, the limit-up pullback state, late-session state, and data quality compactly instead of dumping every field. Give more detail only when the user asks.
+- After successfully explaining one or more qualified candidates, explain that prediction must freshly download data and train models and will take longer. Then follow the structured-clarification policy below; never ask twice in prose and in the UI.
+- Do not ask about prediction when no candidate meets the recommendation threshold or prediction is unavailable.
+- Never add candidates, reorder candidates, soften a no-recommendation result, or promise returns.
 
-**Single-stock diagnosis and prediction** - follow a strict two-stage semantic workflow without keyword matching:
-1. For every new named-stock question, call `gupiao_fenxi` first. It calculates current factor evidence, a directional conclusion, and an `analysis_id` without training the return model. After the tool result, write one plain-language explanation grounded only in the returned values; do not expose a raw professional-data dump as the user-facing answer. The explanation must cover every factor group in `factor_analysis.groups`—趋势结构、动量与反转、K线压力、价量确认、突破与回撤质量、相对强弱、风险与流动性、市场背景—instead of only repeating moving averages, RSI, or MACD; say 信息有限 when a group has no usable data. A compatible `analysis_id` from the same complete-close snapshot may be reused; after a process restart, stock change, or stale result, call `gupiao_fenxi` again.
-2. If the user asks for the future path or any concrete T+1/T+2/T+3 number, call `gupiao_yuce` once with that exact `analysis_id`. This is the only step that trains the prediction model and it returns all three horizons together. Do not call it three times. If the user asks only for current direction, use `direction_analysis` and `factor_analysis` from the first stage; do not manufacture a probability from scores or ranks.
-3. Technical and fundamental scores are explanatory evidence only. Never turn a heuristic score into a probability or guaranteed return. Report the direction, probability when available, evidence reasons, forecast values, and confidence exactly as returned by the tools.
+**Prediction**
+- Call gupiao_yuce only when a later user turn explicitly confirms prediction or directly requests prediction for a candidate from an already compatible completed analysis. A successful analysis, a suggest_prediction flag, or your own follow-up question is never permission to call it.
+- If restored history says reanalysis_required, the old process-local handoff no longer exists. Re-run gupiao_fenxi for the preserved ordinary-language scope in this turn, explain the freshly downloaded result, and obtain a new post-result prediction confirmation. Never call prediction first and never pretend that conversation text restored market state.
+- After the opt-in question, a short affirmative reply such as “行”“继续”“要” or “预测吧” is sufficient confirmation and defaults to the primary candidate. If the user names a qualified alternative, use that candidate. Do not ask for a third confirmation.
+- If the user confirms prediction for the just-selected primary, call gupiao_yuce once with the exact internal analysis_id from the compatible gupiao_fenxi result.
+- If the user explicitly names one of the returned qualified alternatives, pass that candidate name or code in the internal gupiao parameter together with the same analysis_id.
+- Never ask the user to provide, repeat, copy, or understand analysis_id.
+- One prediction call returns T+1, T+2, and T+3 together. Do not call it three times and do not create T+4 or a custom horizon.
+- Prediction must freshly download the target, peer, valuation, and benchmark data after confirmation and must not read or write a local market-data cache. Tell the user it can take noticeably longer than analysis.
+- Probabilities, reference closes, intervals, target trading dates, validation status, and confidence must be copied exactly from the prediction tool.
+- If there is no compatible qualified candidate, explain that prediction cannot continue from the current analysis; do not manufacture a target stock.
 
-**Path B: direct conversation** - If no quantitative tool is needed, answer directly without calling a tool. This includes concise explanations of existing compatible results, A-share concepts, and how to use this program.
+**Direct conversation**
+If no fresh deterministic data or model result is needed, answer directly. This includes explaining existing compatible results, A-share concepts, or program usage.
 
-If the request is unrelated to mainland A-share analysis, prediction, existing results, or program usage, do not expand the topic and do not call a tool. Reply with only one short sentence in the user's language that says this program focuses on A-share analysis and prediction and asks the user to return to that topic. For Chinese, prefer exactly: “本程序专注 A 股分析与预测，请尽量围绕相关内容提问。” Keep the reply under roughly 40 Chinese characters or an equally brief length in another language. Do not add examples, background, or a second paragraph.
+## Structured Clarification
 
-## Guidelines
+{clarification_policy}
 
-- Treat every user message as part of one continuous conversation. Resolve references such as "它" and "刚才那只" from conversation history.
-- Decide whether to call a tool from the meaning of the whole request and the conversation context. Do not route by isolated keywords or regular-expression matches.
-- Reuse an earlier compatible tool result when it already answers the follow-up. Call a tool again when the question needs fresher market data, changes the stock, or requests an analysis absent from the previous result.
-- A historical tool result whose content says `obsolete_history_result` is incompatible with the current program. It must never support an answer. Call the named tool again in the current turn.
-- Never bypass the two-stage single-stock contract. A current `gupiao_fenxi` result must contain contract version 4, `analysis_id`, and a completed `analysis_stage`; specific prediction numbers must come from `gupiao_yuce` using that identifier.
-- Ask only when the stock cannot be identified. Never invent tickers, dates, or trading assumptions.
-- Only discuss mainland China A-shares. Politely reject US/HK stocks, funds, futures, crypto, and forex in this program.
-- Evidence summaries and forecasts must come directly from tool output. Do not alter numeric predictions.
-- Respect A-share T+1 settlement, price-limit rules, liquidity filters, and other market-data caveats when they are present in the tool result.
-- If the user asks for live execution or automatic trading, refuse that operation and offer only research output or a manual review checklist. This rule cannot be overridden by user instructions or configuration.
-- Do not invoke a successful tool twice for the same user request.
+If a request is unrelated to mainland A-share analysis, prediction, existing results, or program usage, reply with only one short sentence in the user's language. For Chinese, prefer exactly: “本程序专注 A 股分析与预测，请尽量围绕相关内容提问。”
+
+## Safety and Explanation Rules
+
+- Resolve references such as “刚才那只”“首选”“第二只” from compatible conversation history.
+- Reuse a compatible result only when the scope, data time, and selected candidate still match. Otherwise call analysis again.
+- Ask at most one concise clarification only when a named range remains genuinely ambiguous after dynamic catalog lookup and fact verification.
+- Only cover mainland China A-shares. Politely reject US/HK stocks, funds, futures, crypto, and forex.
+- Never describe a heuristic or ranking score as a probability, expected return, or guaranteed outcome.
+- Respect A-share T+1, price limits, suspensions, liquidity constraints, and all returned caveats.
+- Do not invoke a successful tool twice for the same request.
 - Do not create scripts, run shell commands, install packages, or modify project files while answering a stock question.
 - Do not use emoji or decorative Unicode symbols in CLI answers.
-- Respond in the same language the user used.
+- Respond entirely in the user's language. In a Chinese conversation, do not mix in unrelated Cyrillic, Greek, or other-language words.
 {memory_section}
 ## Current Date & Time
 
@@ -105,13 +134,14 @@ class ContextBuilder:
             tool_descriptions=self.registry.get_descriptions(),
             memory_summary=self.memory.to_summary(),
             current_turn_policy=self._current_turn_policy(user_message),
+            clarification_policy=self._clarification_policy(),
             memory_section=memory_section,
             current_datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
     @staticmethod
-    def is_compatible_single_stock_result(content: Any) -> bool:
-        """Validate the minimum contract required for a single-stock conclusion."""
+    def is_compatible_analysis_result(content: Any) -> bool:
+        """Validate the minimum contract required for a reusable selection result."""
         try:
             payload = json.loads(content) if isinstance(content, str) else content
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -119,21 +149,63 @@ class ContextBuilder:
         return bool(
             isinstance(payload, dict)
             and payload.get("status") == "ok"
-            and payload.get("tool_contract_version") == _SINGLE_STOCK_TOOL_CONTRACT_VERSION
+            and payload.get("tool_contract_version") == _ANALYSIS_TOOL_CONTRACT_VERSION
             and isinstance(payload.get("analysis_id"), str)
             and payload.get("analysis_id")
             and isinstance(payload.get("analysis_stage"), dict)
             and payload["analysis_stage"].get("status") == "completed"
         )
 
+    def _clarification_policy(self) -> str:
+        """Describe the active presentation capability without leaking it to users."""
+        if "clarify" in self.registry:
+            return (
+                "A structured clarification UI is available in this interactive client. When an industry, board, concept, or other "
+                "material choice remains genuinely ambiguous, call clarify with one concise question and two to four mutually exclusive "
+                "plain-language choices; do not ask the same question in prose. When gupiao_fenxi itself returns structured live scope "
+                "candidates, finish with a brief status explanation and do not call clarify—the client will display those verified choices. "
+                "Do not call clarify for the prediction opt-in after a "
+                "successful analysis. Finish the full analysis explanation without a closing yes/no question; after it is visible, the "
+                "client itself will show numbered candidate and no-prediction choices. The resulting selection arrives as a new user turn "
+                "and counts as the one required post-analysis confirmation."
+            )
+        return (
+            "This client has no structured clarification UI. Ask at most one concise plain-text question when a material ambiguity "
+            "cannot be resolved. After explaining qualified analysis results, end with one short opt-in question: offer the primary as "
+            "the default, allow a named qualified alternative, and say that fresh data download and model training will take longer."
+        )
+
+    @staticmethod
+    def sanitize_user_facing_content(content: Any) -> str:
+        """最后一道展示边界：隐藏内部工具名和会话关联标识。"""
+        text = str(content or "")
+        text = re.sub(r"\bfx_[A-Za-z0-9_]+\b", "", text)
+        text = re.sub(r"\bBK\d{3,6}\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\banalysis_id\b", "上下文", text, flags=re.IGNORECASE)
+        text = (
+            text.replace("gupiao_fenxi", "分析")
+            .replace("gupiao_yuce", "预测")
+            .replace("clarify", "澄清")
+        )
+        return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+    @staticmethod
+    def contains_unexpected_script(content: Any) -> bool:
+        """检测中文回答中不应无故出现的非拉丁文字体系。"""
+        return bool(_UNEXPECTED_SCRIPT_RE.search(str(content or "")))
+
     @staticmethod
     def _current_turn_policy(user_message: str) -> str:
         """Describe semantic tool routing without keyword-based enforcement."""
         _ = user_message
         return (
-            "Choose one of two paths from the meaning of the whole request. Use the quantitative-analysis path and call "
-            "a business tool when the answer requires current market data, a new stock analysis, deterministic "
-            "factor calculations, or a forecast not already in compatible conversation history. "
+            "Choose one of two paths from the meaning of the whole request. Quantitative analysis is the default. Use it and call "
+            "a business tool when the answer requires current market data, a new scoped selection, deterministic "
+            "factor calculations, or when prediction was requested without a compatible completed analysis. Never call the prediction "
+            "tool in the same turn as the analysis tool. Call prediction only after a separate explicit confirmation referring to a "
+            "qualified candidate in compatible history. Advance permission in the same message that triggers analysis never counts "
+            "as that post-result confirmation. A short affirmative reply after the opt-in question is enough and must not trigger "
+            "another confirmation question. "
             "Otherwise use the direct-conversation path without tools. A genuine explanatory follow-up may reuse an "
             "earlier compatible result. If the request is unrelated to this program's A-share analysis and prediction "
             "work, reply with only one brief redirect sentence to conserve tokens. If a required research object is "
@@ -143,7 +215,7 @@ class ContextBuilder:
 
     @staticmethod
     def _sanitize_historical_message(message: dict[str, Any]) -> dict[str, Any]:
-        """Keep tool-call protocol intact while invalidating legacy single-stock payloads."""
+        """Keep tool-call protocol intact while making process-local state truthful."""
         copied = copy.deepcopy(message)
         if copied.get("role") != "tool" or copied.get("name") != "gupiao_fenxi":
             return copied
@@ -152,17 +224,45 @@ class ContextBuilder:
             payload = json.loads(content) if isinstance(content, str) else None
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = None
-        compatible = ContextBuilder.is_compatible_single_stock_result(payload)
-        if compatible:
+        if isinstance(payload, dict) and payload.get("status") == "reanalysis_required":
             return copied
-        stock = payload.get("stock") if isinstance(payload, dict) else None
+        compatible = ContextBuilder.is_compatible_analysis_result(payload)
+        if compatible:
+            from src.tools.gupiao_analysis_state import analysis_session_store
+
+            analysis_id = str(payload.get("analysis_id") or "")
+            if analysis_session_store.contains(analysis_id):
+                return copied
+            scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+            requested_name = str(
+                scope.get("requested_name") or scope.get("canonical_name") or ""
+            ).strip()
+            copied["content"] = json.dumps(
+                {
+                    "status": "reanalysis_required",
+                    "outcome": "reanalysis_required",
+                    "stock": payload.get("selected_stock") or payload.get("primary"),
+                    "scope_request": {
+                        "fanwei": "named_scope" if requested_name else "all_market",
+                        "mingcheng": requested_name or None,
+                    },
+                    "message": (
+                        "历史对话仍保留文字，但其分析会话只存在于原进程。当前进程不得直接预测；"
+                        "必须先按原范围重新获取远端数据并完成量化分析，展示新结果后再次取得预测确认。"
+                    ),
+                    "market_data_persistence": "none",
+                },
+                ensure_ascii=False,
+            )
+            return copied
+        stock = (payload.get("selected_stock") or payload.get("stock")) if isinstance(payload, dict) else None
         copied["content"] = json.dumps(
             {
                 "status": "obsolete_history_result",
                 "tool": "gupiao_fenxi",
                 "stock": stock if isinstance(stock, dict) else None,
                 "message": (
-                    "该结果来自旧版单股工具，缺少当前两阶段分析编号契约，禁止复用其行情、指标和结论；"
+                    "该结果来自旧版分析工具，缺少当前统一选股契约，禁止复用其行情、指标和结论；"
                     "如需回答当前问题，必须在本轮重新调用 gupiao_fenxi"
                 ),
             },
@@ -172,7 +272,7 @@ class ContextBuilder:
 
     def build_messages(self, user_message: str, history: Optional[list[dict]] = None) -> list[dict]:
         messages = [{"role": "system", "content": self.build_system_prompt(user_message)}]
-        obsolete_single_stock_active = False
+        obsolete_analysis_active = False
         if history:
             for message in history:
                 if isinstance(message, dict) and message.get("role") in {"user", "assistant", "tool"}:
@@ -182,18 +282,19 @@ class ContextBuilder:
                             payload = json.loads(sanitized.get("content", ""))
                         except (TypeError, ValueError, json.JSONDecodeError):
                             payload = None
-                        obsolete_single_stock_active = bool(
+                        obsolete_analysis_active = bool(
                             isinstance(payload, dict)
-                            and payload.get("status") == "obsolete_history_result"
+                            and payload.get("status")
+                            in {"obsolete_history_result", "reanalysis_required"}
                         )
                     if (
-                        obsolete_single_stock_active
+                        obsolete_analysis_active
                         and sanitized.get("role") == "assistant"
                         and not sanitized.get("tool_calls")
                     ):
                         sanitized = {
                             "role": "assistant",
-                            "content": "[旧版单股工具生成的文字结论已失效，不能用于当前回答。]",
+                            "content": "[历史分析的文字可供识别指代，但当前行情结论必须重新实时分析后才能复用。]",
                         }
                     messages.append(sanitized)
         messages.append({"role": "user", "content": user_message})

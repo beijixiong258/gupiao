@@ -15,7 +15,7 @@ from src.ashare.chengben_huadian import (
 )
 
 
-def _load_cost_assumption(scenario_name: str) -> tuple[float, CostScenario, str, list[str]]:
+def jiazai_chengben_jiashe(scenario_name: str) -> tuple[float, CostScenario, str, list[str]]:
     if scenario_name != "research_reference":
         raise ValueError(f"仅支持程序内固定研究成本假设：{scenario_name}")
     return DEFAULT_NOTIONAL_YUAN, DEFAULT_SCENARIO, DEFAULT_COST_SOURCE, []
@@ -111,7 +111,7 @@ def _dynamic_slippage_roundtrip_bps(
     }
 
 
-def _stock_roundtrip_cost(
+def jisuan_gupiao_wangfan_chengben(
     ts_code: str,
     price: float,
     budget_yuan: float,
@@ -178,7 +178,7 @@ def _stock_roundtrip_cost(
 
 
 def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
-    notional, scenario, source, errors = _load_cost_assumption(scenario_name)
+    notional, scenario, source, errors = jiazai_chengben_jiashe(scenario_name)
     buy_commission = _commission_rate(scenario.buy_commission_rate, scenario.min_commission_yuan, notional)
     sell_commission = _commission_rate(scenario.sell_commission_rate, scenario.min_commission_yuan, notional)
     buy_cost = buy_commission + scenario.transfer_fee_buy_rate + scenario.buy_slippage_bps / 10000.0
@@ -202,32 +202,40 @@ def _roundtrip_cost(scenario_name: str) -> tuple[float, dict[str, Any]]:
     }
 
 
-def _apply_cost(gross_return: float, cost_rate: float) -> float:
+def koujian_jiaoyi_chengben(gross_return: float, cost_rate: float) -> float:
     return (1.0 + gross_return) * (1.0 - cost_rate) - 1.0
 
 
-def _round_price_tick(value: float) -> float:
+def guifan_gujia_jingdu(value: float) -> float:
     return float(Decimal(str(max(float(value), 0.01))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def _price_limit_bounds(reference_price: float, limit_rate: float | None, sessions: int) -> tuple[float, float]:
+def jisuan_zhangdieting_bianjie(reference_price: float, limit_rate: float | None, sessions: int) -> tuple[float, float]:
     if limit_rate is None or not math.isfinite(float(limit_rate)) or float(limit_rate) <= 0:
         return 0.01, math.inf
-    lower = _round_price_tick(reference_price)
+    lower = guifan_gujia_jingdu(reference_price)
     upper = lower
     for _ in range(max(1, int(sessions))):
-        lower = _round_price_tick(lower * (1.0 - float(limit_rate)))
-        upper = _round_price_tick(upper * (1.0 + float(limit_rate)))
+        lower = guifan_gujia_jingdu(lower * (1.0 - float(limit_rate)))
+        upper = guifan_gujia_jingdu(upper * (1.0 + float(limit_rate)))
     return lower, upper
 
 
+# 兼容既有内部调用；新代码只应依赖上面的公开领域接口。
+_load_cost_assumption = jiazai_chengben_jiashe
+_stock_roundtrip_cost = jisuan_gupiao_wangfan_chengben
+_apply_cost = koujian_jiaoyi_chengben
+_round_price_tick = guifan_gujia_jingdu
+_price_limit_bounds = jisuan_zhangdieting_bianjie
+
+
 __all__ = [
-    "_apply_cost",
+    "koujian_jiaoyi_chengben",
     "_buy_order_rule",
-    "_load_cost_assumption",
+    "jiazai_chengben_jiashe",
     "_position_for_budget",
-    "_price_limit_bounds",
-    "_round_price_tick",
+    "jisuan_zhangdieting_bianjie",
+    "guifan_gujia_jingdu",
     "_roundtrip_cost",
-    "_stock_roundtrip_cost",
+    "jisuan_gupiao_wangfan_chengben",
 ]

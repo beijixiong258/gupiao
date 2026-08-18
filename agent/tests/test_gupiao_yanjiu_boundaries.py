@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import sys
-import os
 from contextlib import nullcontext
-from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +12,9 @@ import pandas as pd
 import pytest
 
 from src.ashare import gupiao_yanjiu
+from src.ashare import peizhi
+from src.ashare.fenxi_yinzi import jisuan_shendu_jibenmian
+from src.ashare.shuju_yuan import huoqu_zhangdieting_guize
 
 
 def _flat_history(rows: int = 30) -> pd.DataFrame:
@@ -31,17 +31,19 @@ def _flat_history(rows: int = 30) -> pd.DataFrame:
     )
 
 
-def test_quant_config_hard_rejects_minute_bars(
+def test_quant_config_requires_minute_bars_only_for_late_session_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = json.loads(gupiao_yanjiu.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
-    config["shuju"]["minute_bars_enabled"] = True
-    path = tmp_path / "minute_config.json"
+    import json
+
+    config = json.loads(peizhi.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    config["shuju"]["minute_bars_enabled"] = False
+    path = tmp_path / "no_minute_config.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
-    monkeypatch.setattr(gupiao_yanjiu, "DEFAULT_CONFIG_PATH", path)
-    with pytest.raises(ValueError, match="分钟K不属于产品范围"):
-        gupiao_yanjiu.jiazai_lianghua_peizhi()
+    monkeypatch.setattr(peizhi, "DEFAULT_CONFIG_PATH", path)
+    with pytest.raises(ValueError, match="尾盘复核需要少量 5 分钟行情"):
+        peizhi.jiazai_lianghua_peizhi()
 
 
 def test_short_history_keeps_unformed_ma60_and_macd_neutral() -> None:
@@ -89,11 +91,10 @@ def test_explicit_akshare_name_resolution_never_calls_tushare(monkeypatch: pytes
 
 
 def test_explicit_tushare_name_resolution_never_calls_akshare(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gupiao_yanjiu, "_stock_basic_cache", lambda: pd.DataFrame())
     monkeypatch.setattr(gupiao_yanjiu, "_tushare_pro", lambda: object())
     monkeypatch.setattr(
         gupiao_yanjiu,
-        "_load_or_fetch_stock_basic",
+        "huoqu_gupiao_jichu_ziliao",
         lambda _pro, _quality: pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}]),
     )
     monkeypatch.setattr(
@@ -117,69 +118,34 @@ def test_only_known_920_segment_is_inferred_from_a_code_starting_with_nine() -> 
         gupiao_yanjiu.biaozhunhua_daima("400001")
 
 
-def test_single_stock_rules_recognize_n_and_c_no_limit_markers() -> None:
-    n_rules = gupiao_yanjiu._a_share_rules("688001.SH", "N样本")
-    c_rules = gupiao_yanjiu._a_share_rules("300001.SZ", "C样本")
-    normal_rules = gupiao_yanjiu._a_share_rules("688001.SH", "样本")
+def test_price_limit_exemption_is_an_explicit_upstream_fact_not_a_name_guess() -> None:
+    exempt = huoqu_zhangdieting_guize(
+        "688001.SH",
+        "N样本",
+        price_limit_exempt=True,
+    )
+    normal = huoqu_zhangdieting_guize("688001.SH", "N样本")
 
-    assert n_rules["price_limit_status"] == "no_limit"
-    assert n_rules["price_limit_pct"] is None
-    assert c_rules["price_limit_status"] == "no_limit"
-    assert normal_rules["price_limit_status"] == "limited"
-    assert normal_rules["price_limit_pct"] == 20.0
+    assert exempt.status == "no_limit"
+    assert exempt.limit_rate is None
+    assert normal.status == "limited"
+    assert normal.limit_rate == 0.20
 
 
-def test_expired_akshare_name_cache_is_refreshed(monkeypatch: pytest.MonkeyPatch) -> None:
-    old = datetime.now().timestamp() - 7200
+def test_akshare_name_table_always_fetches_remote(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"count": 0}
-
-    class FakePath:
-        parent: "FakePath"
-
-        def __init__(self) -> None:
-            self.parent = self
-
-        def is_file(self) -> bool:
-            return True
-
-        def stat(self):
-            return SimpleNamespace(st_mtime=old)
-
-        def mkdir(self, **_kwargs) -> None:
-            return None
 
     def fetch_names() -> pd.DataFrame:
         calls["count"] += 1
         return pd.DataFrame([{"code": "600000", "name": "新名称"}])
 
-    monkeypatch.setattr(gupiao_yanjiu, "AK_STOCK_NAMES_CACHE", FakePath())
-    monkeypatch.setattr(gupiao_yanjiu, "AK_STOCK_NAMES_CACHE_TTL_SECONDS", 60)
     monkeypatch.setattr(gupiao_yanjiu, "akshare_zhilian", nullcontext)
-    monkeypatch.setattr(
-        gupiao_yanjiu.pd,
-        "read_csv",
-        lambda *_args, **_kwargs: pd.DataFrame([{"ts_code": "600000.SH", "name": "旧名称"}]),
-    )
-    monkeypatch.setattr(pd.DataFrame, "to_csv", lambda *_args, **_kwargs: None)
     monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_info_a_code_name=fetch_names))
 
     result = gupiao_yanjiu._akshare_name_table()
 
     assert calls["count"] == 1
     assert result.to_dict("records") == [{"ts_code": "600000.SH", "name": "新名称"}]
-
-
-def test_expired_tushare_name_cache_is_not_used_as_current_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cache = tmp_path / "stock_basic.csv"
-    pd.DataFrame([{"ts_code": "600000.SH", "name": "旧名称"}]).to_csv(cache, index=False)
-    old = (datetime.now() - timedelta(days=2)).timestamp()
-    os.utime(cache, (old, old))
-    monkeypatch.setattr(gupiao_yanjiu, "STOCK_BASIC_CACHE", cache)
-
-    assert gupiao_yanjiu._stock_basic_cache().empty
 
 
 def test_adj_factor_failure_is_limited_to_one_request() -> None:
@@ -273,7 +239,7 @@ def test_financials_use_only_announcements_known_by_as_of(monkeypatch: pytest.Mo
     pro = Pro()
     profile = pd.DataFrame([{"ts_code": "600000.SH", "name": "浦发银行"}])
     monkeypatch.setattr(gupiao_yanjiu, "_tushare_pro", lambda: pro)
-    monkeypatch.setattr(gupiao_yanjiu, "_load_or_fetch_stock_basic", lambda _pro, _cache: profile)
+    monkeypatch.setattr(gupiao_yanjiu, "huoqu_gupiao_jichu_ziliao", lambda _pro, _quality: profile)
 
     result = gupiao_yanjiu.huoqu_jibenmian("600000.SH", trade_date="2024-06-28")
 
@@ -283,7 +249,7 @@ def test_financials_use_only_announcements_known_by_as_of(monkeypatch: pytest.Mo
     assert result["financials"]["missing_fields"] == ["net_profit_yoy_pct"]
 
 
-def test_profile_cache_quality_and_refresh_warning_are_preserved(
+def test_profile_live_source_quality_is_preserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Pro:
@@ -294,23 +260,21 @@ def test_profile_cache_quality_and_refresh_warning_are_preserved(
             return pd.DataFrame()
 
     def load(_pro, quality: dict[str, object]) -> pd.DataFrame:
-        quality["stock_basic"] = {"source": "stale_cache", "rows": 1}
-        quality["warnings"] = ["stock_basic refresh failed; using stale cache"]
-        return pd.DataFrame([{"ts_code": "600000.SH", "name": "旧名称"}])
+        quality["stock_basic"] = {"source": "tushare_live", "rows": 1, "persistence": "none"}
+        return pd.DataFrame([{"ts_code": "600000.SH", "name": "实时名称"}])
 
     monkeypatch.setattr(gupiao_yanjiu, "_tushare_pro", lambda: Pro())
-    monkeypatch.setattr(gupiao_yanjiu, "_load_or_fetch_stock_basic", load)
+    monkeypatch.setattr(gupiao_yanjiu, "huoqu_gupiao_jichu_ziliao", load)
     monkeypatch.setattr(gupiao_yanjiu, "_akshare_info", lambda _code: ({}, []))
 
     result = gupiao_yanjiu.huoqu_jibenmian("600000.SH", trade_date="2024-06-28")
 
-    assert result["sources"]["profile"] == "tushare_stale_cache"
-    assert result["data_quality"]["stock_basic"]["source"] == "stale_cache"
-    assert any("refresh failed" in warning for warning in result["warnings"])
+    assert result["sources"]["profile"] == "tushare_live"
+    assert result["data_quality"]["stock_basic"]["source"] == "tushare_live"
+    assert result["data_quality"]["stock_basic"]["persistence"] == "none"
 
 
-def test_market_freshness_uses_completed_weekdays_and_marks_old_data() -> None:
-    during_session = datetime(2025, 1, 20, 10, 0)
+def test_completed_history_uses_calendar_confirmed_date_instead_of_weekday_guess() -> None:
     history = _flat_history(30)
     history.loc[len(history)] = {
         "trade_date": pd.Timestamp("2025-01-20"),
@@ -321,29 +285,13 @@ def test_market_freshness_uses_completed_weekdays_and_marks_old_data() -> None:
         "volume": 1_000_000,
     }
 
-    completed, warnings = gupiao_yanjiu._completed_market_history(history, reference=during_session)
-    freshness = gupiao_yanjiu._market_data_freshness("2025-01-03", reference=datetime(2025, 1, 20, 16, 0))
+    completed, warnings = gupiao_yanjiu.guolv_wanzheng_jiaoyiri_lishi(
+        history,
+        latest_completed_date="2025-01-17",
+    )
 
     assert completed["trade_date"].max() < pd.Timestamp("2025-01-20")
     assert any("尚未确认收盘" in warning for warning in warnings)
-    assert freshness["status"] == "too_stale"
-    assert freshness["business_days_old"] > gupiao_yanjiu.MARKET_DATA_STALE_ERROR_BUSINESS_DAYS
-
-
-def test_undated_akshare_snapshot_is_not_used_during_the_trading_session() -> None:
-    monday_morning = datetime(2025, 1, 20, 10, 0)
-    monday_closed = datetime(2025, 1, 20, 16, 0)
-    saturday = datetime(2025, 1, 18, 10, 0)
-
-    assert not gupiao_yanjiu._can_use_current_akshare_snapshot(
-        "2025-01-17", reference=monday_morning
-    )
-    assert gupiao_yanjiu._can_use_current_akshare_snapshot(
-        "2025-01-20", reference=monday_closed
-    )
-    assert gupiao_yanjiu._can_use_current_akshare_snapshot(
-        "2025-01-17", reference=saturday
-    )
 
 
 def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company() -> None:
@@ -357,7 +305,7 @@ def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company(
         "valuation": {"pe_ttm": 8},
     }
 
-    _, evidence = gupiao_yanjiu._fundamental_score(fundamentals)
+    _, evidence = jisuan_shendu_jibenmian(fundamentals)
 
     assert "金融行业资产负债率口径特殊，本项只展示、不加减分" in evidence
     assert "资产负债率偏高，需结合行业解释" not in evidence
@@ -366,11 +314,13 @@ def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company(
 def test_quant_config_rejects_out_of_range_validation_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = json.loads(gupiao_yanjiu.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    import json
+
+    config = json.loads(peizhi.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
     config["moxing"]["validation_ratio"] = 0.9
     path = tmp_path / "invalid_quant.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
-    monkeypatch.setattr(gupiao_yanjiu, "DEFAULT_CONFIG_PATH", path)
+    monkeypatch.setattr(peizhi, "DEFAULT_CONFIG_PATH", path)
     with pytest.raises(ValueError, match="validation_ratio"):
-        gupiao_yanjiu.jiazai_lianghua_peizhi()
+        peizhi.jiazai_lianghua_peizhi()

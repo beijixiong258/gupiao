@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
-from src.ashare import gupiao_yanjiu
-from src.ashare.bankuai_yuce import goujian_moxing_shuju, xunlian_yuce_moxing
 from src.ashare.dangu_yuce import _future_schedule_unavailable_reason
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
-    _a_share_rules,
-    akshare_zhilian,
     biaozhunhua_daima,
-    jiazai_lianghua_peizhi,
     jisuan_tezheng_biao,
     zongjie_jishu,
 )
+from src.ashare.moxing_gongju import goujian_moxing_shuju
+from src.ashare.peizhi import jiazai_lianghua_peizhi
+from src.ashare.shichang_shuju import akshare_zhilian
+from src.ashare.yuce_xunlian import xunlian_chiyouqi_yuce_moxing
 from src.tools import build_registry
 
 
@@ -83,10 +82,11 @@ def test_internal_config_hard_caps_horizons_at_t3() -> None:
     config, path = jiazai_lianghua_peizhi()
     assert path.endswith("lianghua_peizhi.json")
     assert config["moxing"]["horizons"] == [1, 2, 3]
-    assert config["shuju"]["akshare_bypass_proxy"] is True
+    assert config["wangluo"]["domestic_connection_mode"] == "direct"
+    assert "akshare_bypass_proxy" not in config["shuju"]
     assert "jiaoyi" not in config
     assert "source" not in config["shuju"]
-    assert "min_list_days" not in config["guolv"]
+    assert "guolv" not in config
 
 
 def test_trading_configuration_is_not_loaded() -> None:
@@ -97,31 +97,21 @@ def test_trading_configuration_is_not_loaded() -> None:
 def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("NO_PROXY", "localhost")
     with akshare_zhilian():
         assert "HTTP_PROXY" not in os.environ
         assert "HTTPS_PROXY" not in os.environ
+        assert os.environ["NO_PROXY"] == "*"
+        # Windows 的 requests 还会读取系统代理；NO_PROXY=* 是确保其
+        # 内部新建 Session 也真正直连的关键回归断言。
+        assert requests.utils.get_environ_proxies("https://example.com") == {}
     assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:7890"
     assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+    assert os.environ["NO_PROXY"] == "localhost"
 
 
 def test_agent_exposes_research_tools_only() -> None:
     assert build_registry().tool_names == ["gupiao_fenxi", "gupiao_yuce"]
-
-
-def test_stock_basic_cache_reads_existing_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cache_path = tmp_path / "stock_basic.csv"
-    pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}]).to_csv(cache_path, index=False)
-    monkeypatch.setattr(gupiao_yanjiu, "STOCK_BASIC_CACHE", cache_path)
-
-    cached = gupiao_yanjiu._stock_basic_cache()
-
-    assert cached.to_dict("records") == [{"ts_code": "600519.SH", "name": "贵州茅台"}]
-
-
-def test_single_stock_rules_describe_supported_t3_forecast() -> None:
-    rules = _a_share_rules("600519.SH", "贵州茅台")
-    assert "公开三日预测" in rules["prediction_horizon"]
-    assert "不伪造" in rules["prediction_horizon"]
 
 
 def test_model_panel_builds_literal_next_three_session_close_labels() -> None:
@@ -180,16 +170,25 @@ def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:
         .reset_index(drop=True)
     )
 
-    predictions, validation = xunlian_yuce_moxing(panel, latest, config)
+    predictions, validation = xunlian_chiyouqi_yuce_moxing(
+        panel=panel,
+        latest=latest,
+        config=config,
+        budget_yuan=100_000.0,
+    )
 
     assert {"pred_t1", "pred_t2", "pred_t3"}.issubset(predictions.columns)
     assert "pred_t5" not in predictions.columns
     assert set(validation["horizons"]) == {"T+1", "T+2", "T+3"}
-    cutoff = pd.Timestamp(validation["cutoff_date"])
     for horizon in [1, 2, 3]:
-        target_date = pd.to_datetime(panel[f"target_date_t{horizon}"])
-        train_mask = (pd.to_datetime(panel["trade_date"]) < cutoff) & (target_date < cutoff)
-        assert not (target_date[train_mask] >= cutoff).any()
         metrics = validation["horizons"][f"T+{horizon}"]
-        assert metrics["train_samples"] >= config["moxing"]["min_training_samples"]
-        assert metrics["validation_samples"] >= config["moxing"]["min_validation_samples"]
+        target_date = pd.to_datetime(panel[f"target_date_t{horizon}"])
+        trade_date = pd.to_datetime(panel["trade_date"])
+        assert metrics["folds"]
+        for fold in metrics["folds"]:
+            validation_start = pd.Timestamp(fold["validation_start"])
+            train_mask = (trade_date < validation_start) & (target_date < validation_start)
+            assert not (target_date[train_mask] >= validation_start).any()
+            if fold["status"] == "ok":
+                assert fold["train_samples"] >= config["dangu"]["min_fold_training_samples"]
+                assert fold["validation_samples"] >= config["dangu"]["min_fold_validation_samples"]

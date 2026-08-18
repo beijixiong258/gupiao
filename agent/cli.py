@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 console = Console()
 AGENT_DIR = Path(__file__).resolve().parent
@@ -68,6 +69,7 @@ def _console_safe(value: object) -> str:
 def _build_agent(
     max_iter: int = 50,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    clarification_handler: Callable[[Any], Any] | None = None,
 ):
     from src.agent.loop import AgentLoop
     from src.memory.persistent import PersistentMemory
@@ -76,7 +78,11 @@ def _build_agent(
 
     pm = PersistentMemory()
     return AgentLoop(
-        registry=build_registry(persistent_memory=pm, include_shell_tools=False),
+        registry=build_registry(
+            persistent_memory=pm,
+            include_shell_tools=False,
+            clarification_handler=clarification_handler,
+        ),
         llm=ChatLLM(),
         event_callback=event_callback,
         max_iterations=max_iter,
@@ -107,7 +113,11 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
 
     if json_mode:
         print(json.dumps(result, ensure_ascii=False))
-        return EXIT_SUCCESS if result.get("status") == "success" else EXIT_RUN_FAILED
+        return (
+            EXIT_SUCCESS
+            if result.get("status") in {"success", "no_recommendation", "clarification_required"}
+            else EXIT_RUN_FAILED
+        )
 
     elapsed = time.perf_counter() - started
     status = result.get("status", "unknown")
@@ -122,7 +132,11 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
         body.append("")
         body.append(_console_safe(content))
     console.print(Panel(_console_safe("\n".join(body)), title="A股分析与三交易日预测"))
-    return EXIT_SUCCESS if status == "success" else EXIT_RUN_FAILED
+    return (
+        EXIT_SUCCESS
+        if status in {"success", "no_recommendation", "clarification_required"}
+        else EXIT_RUN_FAILED
+    )
 
 
 def _dayin_duihua_bangzhu() -> None:
@@ -132,6 +146,7 @@ def _dayin_duihua_bangzhu() -> None:
             "/new      新建空白会话\n"
             "/clear    清空当前会话\n"
             "/clear-history 清除全部历史会话\n"
+            "/clear-runs 清除量化运行记录\n"
             "/sessions 查看最近会话\n"
             "/resume ID 切换到指定会话\n"
             "/history  查看当前会话最近内容\n"
@@ -183,8 +198,9 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
-        "gupiao_fenxi": "正在核对股票时点、计算量化因子并整理方向证据...",
+        "gupiao_fenxi": "正在构建候选池、计算量化因子并整理排序证据...",
         "gupiao_yuce": "正在按需训练模型并生成未来三个交易日预测...",
+        "clarify": "需要你补充一个选择...",
     }
 
     def callback(event_type: str, data: dict[str, Any]) -> None:
@@ -194,7 +210,11 @@ def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict
         if event_type == "tool_call":
             message = tool_text.get(str(data.get("tool")), "正在调用研究工具...")
         elif event_type == "tool_result":
-            message = "数据计算完成，正在整理研判..."
+            message = (
+                "正在根据你的选择继续..."
+                if data.get("tool") == "clarify"
+                else "数据计算完成，正在整理研判..."
+            )
         elif event_type == "text_delta":
             message = "正在组织回答..."
         else:
@@ -205,7 +225,9 @@ def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict
 
 
 def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool = False) -> int:
+    from src.agent.clarification import ClarificationRequest
     from src.preflight import run_preflight
+    from src.duihua.chengqing_ui import RichChengqingTishi
     from src.duihua.huihua import DuihuaCunchu, HuihuaCuoWu, zhengli_xiaoxi
 
     results = run_preflight(console)
@@ -226,17 +248,24 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
 
     history: list[dict[str, Any]] = zhengli_xiaoxi(huihua.xiaoxi)
     status_ref: dict[str, Any] = {"value": None}
-    agent = _build_agent(max_iter=max_iter, event_callback=_chuangjian_jindu_huidiao(status_ref))
+    chengqing_ui = RichChengqingTishi(console, status_ref)
+    agent = _build_agent(
+        max_iter=max_iter,
+        event_callback=_chuangjian_jindu_huidiao(status_ref),
+        clarification_handler=chengqing_ui.xunwen,
+    )
     mode = f"已续接 {huihua.lunshu} 轮" if huihua.lunshu else "新会话"
+    queued_prompt: str | None = None
 
     console.print(
         Panel(
             f"{mode}\n会话：{huihua.huihua_id}\n"
-            "可直接连续追问。示例：分析贵州茅台，然后追问：它目前主要有哪些风险？\n\n"
+            "可直接连续追问。示例：从白酒行业里选股票，然后追问：首选目前主要有哪些风险？\n\n"
             "可用斜杠命令：\n"
             "/new            新建空白会话\n"
             "/clear          清空当前会话\n"
             "/clear-history  清除全部历史会话\n"
+            "/clear-runs     清除量化运行记录\n"
             "/sessions       查看最近会话\n"
             "/resume 会话ID  切换到指定会话\n"
             "/history        查看当前会话最近内容\n"
@@ -247,12 +276,17 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
     )
 
     while True:
-        try:
-            prompt = console.input("[bold cyan]你 > [/bold cyan]").strip()
-        except (KeyboardInterrupt, EOFError):
-            _restore_rich_io()
-            console.print("\n[dim]已退出[/dim]")
-            return EXIT_SUCCESS
+        if queued_prompt is not None:
+            prompt = queued_prompt
+            queued_prompt = None
+            console.print("[bold cyan]你 >[/bold cyan]", Text(_console_safe(prompt)))
+        else:
+            try:
+                prompt = console.input("[bold cyan]你 > [/bold cyan]").strip()
+            except (KeyboardInterrupt, EOFError):
+                _restore_rich_io()
+                console.print("\n[dim]已退出[/dim]")
+                return EXIT_SUCCESS
 
         if not prompt:
             continue
@@ -279,7 +313,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             console.print("[green]当前会话已清空[/green]")
             continue
         if command in {"/clear-history", "/clearhistory", "清除历史"}:
-            console.print("[yellow]这会永久删除全部已保存的历史会话，但不会删除运行记录或行情缓存。[/yellow]")
+            console.print("[yellow]这会永久删除全部已保存的历史会话，但不会删除运行记录、配置或认证信息。[/yellow]")
             try:
                 confirmation = console.input("请输入 [bold]确认清除[/bold] 继续，直接回车取消：").strip()
             except (KeyboardInterrupt, EOFError):
@@ -292,6 +326,21 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             huihua = cunchu.xinjian()
             history = []
             console.print(f"[green]已清除 {deleted} 个历史会话，并新建空白会话：{huihua.huihua_id}[/green]")
+            continue
+        if command in {"/clear-runs", "/clearruns", "清除运行记录"}:
+            console.print("[yellow]这会永久删除 agent/runs 下的量化运行记录，不影响会话、配置或认证信息。[/yellow]")
+            try:
+                confirmation = console.input("请输入 [bold]确认清除运行记录[/bold] 继续，直接回车取消：").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]已取消清除运行记录[/dim]")
+                continue
+            if confirmation != "确认清除运行记录":
+                console.print("[dim]已取消清除运行记录[/dim]")
+                continue
+            from src.core.run_policy import clear_run_directories
+
+            deleted_runs = clear_run_directories(RUNS_DIR)
+            console.print(f"[green]已永久删除 {len(deleted_runs)} 条运行记录[/green]")
             continue
         if command in {"/sessions", "会话列表"}:
             _dayin_huihua_liebiao(cunchu, huihua.huihua_id)
@@ -335,7 +384,13 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
         run_id = result.get("run_id", "")
         content = str(result.get("content") or result.get("reason") or "")
 
-        if status == "success" and content:
+        conversation_statuses = {
+            "success",
+            "no_recommendation",
+            "clarification_required",
+            "data_unavailable",
+        }
+        if status in conversation_statuses and content:
             returned_history = result.get("history")
             if isinstance(returned_history, list):
                 history = zhengli_xiaoxi(returned_history)
@@ -351,9 +406,20 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
                 cunchu.baocun(huihua)
             except OSError as exc:
                 console.print(f"[yellow]会话暂未写入磁盘：{_console_safe(exc)}[/yellow]")
-            console.print("\n[bold green]研究员 >[/bold green]")
+            heading_style = "green" if status in {"success", "no_recommendation"} else "yellow"
+            console.print(f"\n[bold {heading_style}]研究员 >[/bold {heading_style}]")
             console.print(Markdown(_console_safe(content)))
             console.print(f"[dim]{elapsed:.1f}s | {run_id} | 会话已保存[/dim]")
+            clarification_payload = result.get("clarification")
+            if isinstance(clarification_payload, dict):
+                try:
+                    clarification = ClarificationRequest.from_dict(clarification_payload)
+                except ValueError as exc:
+                    console.print(f"[yellow]交互提示无效，已跳过：{_console_safe(exc)}[/yellow]")
+                else:
+                    answer = chengqing_ui.xunwen(clarification)
+                    if not answer.cancelled and answer.response:
+                        queued_prompt = answer.response
         else:
             reason = content or "本轮没有生成有效回答"
             console.print(Panel(_console_safe(reason), title=f"本轮未完成 | {status} | {elapsed:.1f}s", style="red"))
@@ -425,211 +491,19 @@ def cmd_openai_logout() -> int:
     return EXIT_SUCCESS
 
 
-def _build_analysis_explanation(result: dict[str, Any]) -> str:
-    """Ask the configured LLM for one plain-language explanation of factors.
+def cmd_clean_runs(*, confirmed: bool) -> int:
+    if not confirmed:
+        console.print("[yellow]该操作会永久删除全部运行记录；确认后请加 --yes。[/yellow]")
+        return EXIT_USAGE_ERROR
+    from src.core.run_policy import clear_run_directories
 
-    The CLI's ``--json`` mode remains machine-readable and skips this call.
-    For the normal human-facing command, the model receives only the
-    deterministic analysis payload; it is explicitly forbidden to invent a
-    probability or a forecast.
-    """
-    factor = result.get("factor_analysis") or {}
-    direction = result.get("direction_analysis") or {}
-    groups = factor.get("groups") or {}
-    compact_groups = []
-    if isinstance(groups, dict):
-        for group, value in groups.items():
-            if not isinstance(value, dict):
-                continue
-            compact_groups.append(
-                {
-                    "group": group,
-                    "label": value.get("label") or group,
-                    "economic_meaning": value.get("economic_meaning"),
-                    "role": value.get("role"),
-                    "status": value.get("status"),
-                    "available_factor_count": value.get("available_factor_count"),
-                    "factor_count": value.get("factor_count"),
-                    "interpretation": value.get("interpretation"),
-                    "score_0_100": value.get("score_0_100"),
-                    "factors": list(value.get("factors") or [])[:6],
-                }
-            )
-    payload = {
-        "stock": result.get("stock"),
-        "as_of": result.get("as_of"),
-        "direction_analysis": {
-            "direction": direction.get("direction"),
-            "evidence_label": direction.get("evidence_label"),
-            "reasons": list(direction.get("reasons") or [])[:8],
-        },
-        "factor_analysis": {
-            "direction": factor.get("direction"),
-            "evidence_label": factor.get("evidence_label"),
-            "overall_evidence_score_0_100": factor.get("overall_evidence_score_0_100"),
-            "technical_score_0_100": factor.get("technical_score_0_100"),
-            "fundamental_score_0_100": factor.get("fundamental_score_0_100"),
-            "groups": compact_groups,
-            "factor_evidence": list(factor.get("factor_evidence") or [])[:8],
-            "evidence": list(factor.get("evidence") or [])[:24],
-            "limitations": list(factor.get("limitations") or [])[:5],
-        },
-        "risks": list(result.get("risks") or [])[:8],
-        "data_health": result.get("data_health"),
-        "analysis_stage": result.get("analysis_stage"),
-    }
-    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    prompt = (
-        "你是面向普通投资者的A股研究解读员。请严格只根据下面的程序输出写一段中文解读，不能补充外部事实。"
-        "先给一句结论，再按因子组逐组解释量化结果，最后说明数据日期和局限。"
-        "必须覆盖这 8 组：趋势结构、动量与反转、K线压力、价量确认、突破与回撤质量、相对强弱、风险与流动性、市场背景。"
-        "每组都要说明使用的因子类别、当前结果以及它对普通投资者意味着什么；即使数据不足，也要明确写‘信息有限’，不能只讲均线、RSI或MACD。"
-        "把 0-100 分和同日分位数称为‘证据强弱/相对位置’，绝不能说成上涨概率、收益率或目标价。"
-        "本次是分析阶段，明确写出‘尚未训练三交易日预测模型’，不要输出 T+1/T+2/T+3 数字，也不要给买卖指令。"
-        "如果证据不足，要直说证据不足。控制在 650 字以内，可使用 8 个短项目符号。\n\n程序输出 JSON：\n"
-        + serialized[:30000]
-    )
-    try:
-        from src.providers.chat import ChatLLM
-
-        response = ChatLLM().chat(
-            [
-                {
-                    "role": "system",
-                    "content": "你只负责把已计算的量化证据翻译成易懂中文，不得改写或臆测数值。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            timeout=45,
-        )
-        content = str(response.content or "").strip()
-        if content:
-            return content
-    except Exception:
-        # The deterministic result is still useful when the optional LLM
-        # explanation provider is unavailable or rate-limited.
-        pass
-
-    stock = result.get("stock") or {}
-    stock_name = stock.get("name") or stock.get("ts_code") or "该股票"
-    label = factor.get("evidence_label") or direction.get("evidence_label") or "证据不足"
-    tilt = factor.get("direction") or direction.get("direction") or "中性/不确定"
-    score = factor.get("overall_evidence_score_0_100")
-    score_text = f"，综合证据强弱 {score}/100" if score is not None else ""
-    factor_evidence = [str(item) for item in (factor.get("factor_evidence") or [])[:8]]
-    reasons = [str(item) for item in (factor.get("evidence") or direction.get("reasons") or [])[:4]]
-    reason_text = "；".join(reasons) if reasons else "当前没有足够的可解释因子"
-    group_text = "；".join(factor_evidence)
-    risks = [str(item) for item in (result.get("risks") or [])[:2]]
-    risk_text = f"需要留意：{'；'.join(risks)}。" if risks else "暂未发现额外数据风险。"
-    return (
-        f"{stock_name}截至 {result.get('as_of') or '最近完整收盘日'} 的当前因子倾向为“{tilt}”（{label}{score_text}）。"
-        f"主要依据是：{reason_text}。各量化因子组：{group_text or '信息有限'}。{risk_text}"
-        "这只是对当前量化证据的通俗解释，分析阶段尚未训练三交易日预测模型，也不构成买卖建议。"
-    )
-
-
-def _print_human_analysis(result: dict[str, Any]) -> None:
-    """Render a concise human view instead of dumping the raw JSON payload."""
-    console.print(Panel(Markdown(_console_safe(_build_analysis_explanation(result))), title="A股分析解读"))
-    factor = result.get("factor_analysis") or {}
-    direction = result.get("direction_analysis") or {}
-    table = Table(title="量化依据（描述性，不是概率）")
-    table.add_column("项目")
-    table.add_column("结果")
-    table.add_row("当前方向", _console_safe(factor.get("direction") or direction.get("direction") or "中性/不确定"))
-    table.add_row("证据标签", _console_safe(factor.get("evidence_label") or direction.get("evidence_label") or "证据不足"))
-    table.add_row("综合证据强弱", _console_safe(factor.get("overall_evidence_score_0_100", "—")))
-    table.add_row("技术因子", _console_safe(factor.get("technical_score_0_100", "—")))
-    table.add_row("基本面因子", _console_safe(factor.get("fundamental_score_0_100", "—")))
-    table.add_row("模型状态", "未训练（明确调用 yuce 后才训练）")
-    console.print(table)
-
-    groups = factor.get("groups") or {}
-    if isinstance(groups, dict) and groups:
-        group_table = Table(title="因子分组结果（已使用全部量化因子；描述性，不是概率）")
-        group_table.add_column("因子组")
-        group_table.add_column("使用内容")
-        group_table.add_column("结果")
-        group_table.add_column("相对位置")
-        for group, value in groups.items():
-            if not isinstance(value, dict):
-                continue
-            score = value.get("score_0_100")
-            position = f"{score}/100" if score is not None else "信息有限"
-            used = f"{value.get('available_factor_count', 0)}/{value.get('factor_count', 0)} 个因子"
-            group_table.add_row(
-                _console_safe(value.get("label") or group),
-                _console_safe(value.get("economic_meaning") or used),
-                _console_safe(value.get("interpretation") or "信息有限"),
-                _console_safe(position),
-            )
-        console.print(group_table)
-
-
-def cmd_gupiao(
-    gupiao: str,
-    source: str,
-    history_calendar_days: int,
-    json_mode: bool,
-) -> int:
-    from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
-
-    result = json.loads(GupiaoFenxiTool().execute(
-        gupiao=gupiao,
-        source=source,
-        history_calendar_days=history_calendar_days,
-    ))
-    if json_mode:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        if result.get("status") == "ok":
-            _print_human_analysis(result)
-        else:
-            console.print_json(json.dumps(result, ensure_ascii=False))
-    return EXIT_SUCCESS if result.get("status") == "ok" else EXIT_RUN_FAILED
-
-
-def cmd_yuce(
-    gupiao: str,
-    source: str,
-    history_calendar_days: int,
-    json_mode: bool,
-) -> int:
-    """Run diagnosis once, then print model forecasts for the next three market sessions."""
-    from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
-    from src.tools.gupiao_yuce_tool import GupiaoYuceTool
-
-    diagnosis = json.loads(GupiaoFenxiTool().execute(
-        gupiao=gupiao,
-        source=source,
-        history_calendar_days=history_calendar_days,
-    ))
-    prediction: dict[str, Any] = {}
-    analysis_id = diagnosis.get("analysis_id")
-    if diagnosis.get("status") == "ok" and analysis_id:
-        prediction = json.loads(GupiaoYuceTool().execute(analysis_id=analysis_id))
-    compact = {
-        "status": diagnosis.get("status"),
-        "stock": diagnosis.get("stock"),
-        "as_of": diagnosis.get("as_of"),
-        "generated_at": diagnosis.get("generated_at"),
-        "analysis_id": analysis_id,
-        "direction_analysis": diagnosis.get("direction_analysis"),
-        "prediction": prediction,
-        "market_data": diagnosis.get("market_data"),
-        "error": diagnosis.get("error"),
-    }
-    if json_mode:
-        print(json.dumps(compact, ensure_ascii=False))
-    else:
-        console.print_json(json.dumps(compact, ensure_ascii=False))
-    has_forecast = bool(prediction.get("forecast"))
-    return EXIT_SUCCESS if compact.get("status") == "ok" and has_forecast else EXIT_RUN_FAILED
+    deleted = clear_run_directories(RUNS_DIR)
+    console.print(f"已永久删除 {len(deleted)} 条 agent/runs 运行记录；会话、配置和认证信息未受影响。")
+    return EXIT_SUCCESS
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="个人 A 股日 K 分析与未来三交易日预测工具")
+    parser = argparse.ArgumentParser(description="个人 A 股自然语言选股分析与三交易日预测工具")
     sub = parser.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="执行一次自然语言研究")
@@ -646,28 +520,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     list_cmd = sub.add_parser("list", help="列出最近运行记录")
     list_cmd.add_argument("--limit", type=int, default=20)
-
-    gupiao = sub.add_parser("gupiao", help="按代码或名称直接分析一只 A 股")
-    gupiao.add_argument("gupiao", help="例如 600519.SH 或贵州茅台")
-    gupiao.add_argument(
-        "--source",
-        choices=["auto", "tushare", "akshare"],
-        default="auto",
-        help="股票名称解析和日线行情来源；基本面仍可能混合使用 Tushare/AKShare",
-    )
-    gupiao.add_argument("--history-calendar-days", type=int, default=1440)
-    gupiao.add_argument("--json", action="store_true")
-
-    yuce = sub.add_parser("yuce", help="预测一只 A 股未来第 1、2、3 个交易日收盘")
-    yuce.add_argument("gupiao", help="例如 600519.SH 或贵州茅台")
-    yuce.add_argument(
-        "--source",
-        choices=["auto", "tushare", "akshare"],
-        default="auto",
-        help="股票名称解析和日线行情来源",
-    )
-    yuce.add_argument("--history-calendar-days", type=int, default=1440)
-    yuce.add_argument("--json", action="store_true")
+    clean_runs = sub.add_parser("clean-runs", help="永久清除全部量化运行记录")
+    clean_runs.add_argument("--yes", action="store_true", help="确认永久删除")
 
     sub.add_parser("settings", help="查看当前运行配置")
     openai_login = sub.add_parser("openai-login", help="使用 ChatGPT OAuth 登录 OpenAI Provider")
@@ -679,27 +533,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "run":
         prompt = args.prompt_opt or args.prompt
         if not prompt:
-            console.print('[red]Missing prompt. Use: gpyj run -p "分析 600519.SH"[/red]')
+            console.print('[red]Missing prompt. Use: gpyj run -p "帮我选股票"[/red]')
             return EXIT_USAGE_ERROR
         return cmd_run(prompt, args.max_iter, json_mode=args.json)
     if args.command == "chat":
         return cmd_chat(args.max_iter, session_id=args.session, new_session=args.new_session)
     if args.command == "list":
         return cmd_list(args.limit)
-    if args.command == "gupiao":
-        return cmd_gupiao(
-            args.gupiao,
-            args.source,
-            args.history_calendar_days,
-            args.json,
-        )
-    if args.command == "yuce":
-        return cmd_yuce(
-            args.gupiao,
-            args.source,
-            args.history_calendar_days,
-            args.json,
-        )
+    if args.command == "clean-runs":
+        return cmd_clean_runs(confirmed=args.yes)
     if args.command == "settings":
         return cmd_settings()
     if args.command == "openai-login":

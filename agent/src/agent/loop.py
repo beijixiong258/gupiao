@@ -22,11 +22,17 @@ import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from src.agent.clarification import (
+    ClarificationRequest,
+    build_prediction_clarification,
+    build_scope_clarification,
+)
 from src.agent.context import ContextBuilder
 from src.agent.memory import WorkspaceMemory
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
 from src.core.state import RunStateStore
+from src.core.run_policy import redact_for_log
 from src.providers.chat import ChatLLM
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
@@ -243,14 +249,45 @@ Rules:
 
 
 def _is_tool_success(result: str) -> bool:
-    """Return True if the tool result does not look like an error response."""
+    """Return True only when a structured result is not an incomplete/failure state."""
     try:
         data = json.loads(result)
-        if isinstance(data, dict) and data.get("status") == "error":
-            return False
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").strip().lower()
+            if status in {
+                "error",
+                "failed",
+                "unavailable",
+                "blocked",
+                "cancelled",
+                "clarification_required",
+                "reanalysis_required",
+            }:
+                return False
     except (json.JSONDecodeError, TypeError):
         pass
     return True
+
+
+def _analysis_run_status(payload: dict[str, Any] | None) -> str | None:
+    """Map the quantitative business result to a truthful outer run status."""
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if status == "ok":
+        # ``ok`` 只表示工具自己声称成功。缺少当前契约所需的完成标记时，
+        # 外层不能把一段模型说明文字当成一次真正完成的量化分析。
+        if not ContextBuilder.is_compatible_analysis_result(payload):
+            return "failed"
+        return "no_recommendation" if outcome == "no_recommendation" else "success"
+    if status == "clarification_required":
+        return "clarification_required"
+    if status == "unavailable":
+        return "data_unavailable"
+    if status in {"error", "failed"}:
+        return "failed"
+    return None
 
 
 def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) -> dict[str, Any]:
@@ -315,6 +352,9 @@ class AgentLoop:
         self._event_callback = event_callback
         self.max_iterations = max_iterations
         self._called_ok: set[str] = set()
+        self._analysis_attempted_this_turn = False
+        self._pending_clarification: ClarificationRequest | None = None
+        self._latest_analysis_payload: dict[str, Any] | None = None
         self._cancelled: bool = False
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
@@ -340,10 +380,14 @@ class AgentLoop:
         # Reset per-run state (safe for reuse across multiple run() calls)
         self._cancelled = False
         self._called_ok = set()
+        self._analysis_attempted_this_turn = False
+        self._pending_clarification = None
+        self._latest_analysis_payload = None
         self._previous_summary = ""
 
         state_store = RunStateStore()
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        if state_store.policy.enabled:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
         self.memory.run_dir = None
         self.memory.counters.clear()
         run_dir = state_store.create_run_dir(RUNS_DIR)
@@ -357,7 +401,7 @@ class AgentLoop:
         react_trace: List[Dict[str, Any]] = []
         durable_history = _export_history(messages)
 
-        trace = TraceWriter(run_dir)
+        trace = TraceWriter(run_dir, policy=state_store.policy)
         trace.write({"type": "start", "prompt": user_message[:500]})
 
         iteration = 0
@@ -406,7 +450,15 @@ class AgentLoop:
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
                 if not response.has_tool_calls:
-                    final_content = response.content or ""
+                    if context.contains_unexpected_script(response.content):
+                        from src.agent.fenxi_zhanshi import goujian_fenxi_anquan_huitui
+
+                        logger.warning("Blocked user-facing answer containing an unexpected script")
+                        final_content = goujian_fenxi_anquan_huitui(
+                            self._latest_analysis_payload
+                        )
+                    else:
+                        final_content = context.sanitize_user_facing_content(response.content)
                     answer_message = {"role": "assistant", "content": final_content}
                     messages.append(answer_message)
                     durable_history.append(copy.deepcopy(answer_message))
@@ -449,22 +501,32 @@ class AgentLoop:
                     "history": durable_history,
                 },
             )
+            public_run_dir, public_run_id = state_store.public_location(run_dir)
+            state_store.cleanup_ephemeral(run_dir)
             return {
                 "status": "failed",
                 "reason": str(exc),
-                "run_dir": str(run_dir),
-                "run_id": run_dir.name,
+                "run_dir": public_run_dir,
+                "run_id": public_run_id,
                 "content": "",
                 "react_trace": react_trace,
                 "history": durable_history,
             }
 
-        # Determine final status
+        # Determine final status without treating an LLM fallback sentence as business success.
         if self._cancelled:
             state_store.mark_failure(run_dir, "cancelled by user")
             final_status = "cancelled"
+        elif self._latest_analysis_payload is not None:
+            final_status = _analysis_run_status(self._latest_analysis_payload) or "failed"
+            reason = (
+                str(self._latest_analysis_payload.get("error") or "")
+                if final_status in {"data_unavailable", "failed"}
+                else ""
+            )
+            state_store.mark_status(run_dir, final_status, reason)
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
-            state_store.mark_success(run_dir)
+            state_store.mark_status(run_dir, "success")
             final_status = "success"
         else:
             state_store.mark_failure(run_dir, "pipeline did not complete")
@@ -472,6 +534,17 @@ class AgentLoop:
 
         trace.write({"type": "end", "status": final_status, "iterations": iteration})
         trace.close()
+        clarification = (
+            self._pending_clarification.to_dict()
+            if final_status in {"success", "clarification_required"}
+            and self._pending_clarification is not None
+            else None
+        )
+        business_outcome = (
+            str(self._latest_analysis_payload.get("outcome") or "")
+            if self._latest_analysis_payload is not None
+            else None
+        )
         state_store.save_response(
             run_dir,
             {
@@ -481,17 +554,24 @@ class AgentLoop:
                 "iterations": iteration,
                 "react_trace": react_trace,
                 "history": durable_history,
+                "clarification": clarification,
+                "business_outcome": business_outcome,
             },
         )
 
+        public_run_dir, public_run_id = state_store.public_location(run_dir)
+        state_store.cleanup_ephemeral(run_dir)
+
         return {
             "status": final_status,
-            "run_dir": str(run_dir),
-            "run_id": run_dir.name,
+            "run_dir": public_run_dir,
+            "run_id": public_run_id,
             "content": final_content,
             "reason": "",
             "react_trace": react_trace,
             "history": durable_history,
+            "clarification": clarification,
+            "business_outcome": business_outcome,
         }
 
     # -- Tool execution with read/write batching --------------------------------
@@ -522,6 +602,12 @@ class AgentLoop:
         compact_requested = False
         focus_topic = ""
         to_execute = []
+        analysis_requested_in_batch = any(
+            tool_call.name == "gupiao_fenxi" for tool_call in tool_calls
+        )
+        self._analysis_attempted_this_turn = (
+            self._analysis_attempted_this_turn or analysis_requested_in_batch
+        )
 
         for tc in tool_calls:
             # Layer 4: compact tool — mark then defer execution
@@ -534,16 +620,68 @@ class AgentLoop:
                 trace.write({"type": "compact_requested", "iter": iteration})
                 continue
 
+            if tc.name == "clarify" and (
+                analysis_requested_in_batch or self._pending_clarification is not None
+            ):
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "status": "blocked",
+                        "error_code": "structured_clarification_managed_by_client",
+                        "error": "交互客户端会在本轮回答后显示当前结构化选择窗口；此处不要重复询问",
+                    },
+                    reason="structured_clarification_managed_by_client",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
+            if tc.name == "gupiao_yuce" and (
+                self._analysis_attempted_this_turn
+            ):
+                logger.warning("Blocked same-turn prediction after quantitative analysis")
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "status": "blocked",
+                        "error_code": "prediction_requires_next_user_turn",
+                        "error": (
+                            "本轮只完成量化分析；即使用户已经预先同意预测，也必须先展示结果并询问一次，"
+                            "只有后续用户消息明确确认后才能预测"
+                        ),
+                    },
+                    reason="prediction_requires_next_user_turn",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
             tool_def = self.registry.get(tc.name)
             is_repeatable = tool_def.repeatable if tool_def else False
             if tc.name in self._called_ok and not is_repeatable:
                 logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
-                skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
-                skipped_result = context.format_tool_result(tc.id, tc.name, skip_msg)
-                messages.append(skipped_result)
-                durable_history.append(copy.deepcopy(skipped_result))
-                trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
-                react_trace.append({"type": "tool_skipped", "tool": tc.name})
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "skipped": True,
+                        "reason": f"{tc.name} already completed successfully. Use the previous result.",
+                    },
+                    reason="already_completed",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
                 continue
 
             to_execute.append(tc)
@@ -558,6 +696,34 @@ class AgentLoop:
             self._batch_execute(to_execute, context, messages, durable_history, trace, react_trace, iteration)
 
         return compact_requested, focus_topic
+
+    @staticmethod
+    def _record_skipped_tool_call(
+        *,
+        tc: Any,
+        payload: dict[str, Any],
+        reason: str,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Record one policy-blocked tool call through the normal tool-result protocol."""
+        skip_message = json.dumps(payload, ensure_ascii=False)
+        skipped_result = context.format_tool_result(tc.id, tc.name, skip_message)
+        messages.append(skipped_result)
+        durable_history.append(copy.deepcopy(skipped_result))
+        trace.write(
+            {
+                "type": "tool_skipped",
+                "iter": iteration,
+                "tool": tc.name,
+                "reason": reason,
+            }
+        )
+        react_trace.append({"type": "tool_skipped", "tool": tc.name, "reason": reason})
 
     def _batch_execute(
         self,
@@ -718,8 +884,19 @@ class AgentLoop:
         self._update_memory(tc.name)
 
         success = _is_tool_success(result)
-        if success and tc.name == "gupiao_fenxi":
-            success = context.is_compatible_single_stock_result(result)
+        if tc.name == "gupiao_fenxi":
+            try:
+                parsed = json.loads(result)
+                self._latest_analysis_payload = parsed if isinstance(parsed, dict) else None
+            except (json.JSONDecodeError, TypeError):
+                self._latest_analysis_payload = None
+            success = success and context.is_compatible_analysis_result(result)
+            if "clarify" in self.registry:
+                self._pending_clarification = (
+                    build_prediction_clarification(result)
+                    if success
+                    else build_scope_clarification(result)
+                )
         if success:
             self._called_ok.add(tc.name)
 
@@ -751,11 +928,24 @@ class AgentLoop:
             trace: TraceWriter.
             focus_topic: Optional topic to prioritize in the summary.
         """
-        # Save full transcript before compressing
-        transcript_path = run_dir / f"transcript_{int(_time.time())}.jsonl"
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+        # 完整对话只在用户明确选择 full_redacted 时落盘；默认元数据策略下
+        # 压缩仍可在内存完成，不能绕过运行记录隐私配置。
+        transcript_reference = "not persisted by current run-log policy"
+        if trace.policy.enabled and trace.policy.content_mode == "full_redacted":
+            transcript_path = run_dir / f"transcript_{int(_time.time())}.jsonl"
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    safe_message = redact_for_log(msg)
+                    f.write(json.dumps(safe_message, default=str, ensure_ascii=False) + "\n")
+            transcript_reference = str(transcript_path)
+        else:
+            trace.write(
+                {
+                    "type": "transcript_not_saved",
+                    "message_count": len(messages),
+                    "policy": trace.policy.content_mode,
+                }
+            )
 
         system_msg = messages[0]
         body = messages[1:]
@@ -815,7 +1005,10 @@ class AgentLoop:
 
         # Reconstruct: system + summary + acknowledge + preserved tail
         state_summary = self.memory.to_summary()
-        compressed = f"[Conversation compressed — handoff summary. Transcript: {transcript_path}]\n\n{summary}"
+        compressed = (
+            "[Conversation compressed — handoff summary. "
+            f"Transcript: {transcript_reference}]\n\n{summary}"
+        )
         if state_summary and state_summary != "(empty state)":
             compressed += f"\n\nCurrent agent state:\n{state_summary}"
 

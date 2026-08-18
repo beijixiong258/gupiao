@@ -117,7 +117,7 @@ def _check_tushare() -> CheckResult:
             name="Tushare",
             status="not_configured",
             message="TUSHARE_TOKEN not set (optional)",
-            impact="A-share data unavailable",
+            impact="部分基本面、宽基指数和备用数据不可用；动态范围与主日线仍可工作",
         )
 
     try:
@@ -127,24 +127,53 @@ def _check_tushare() -> CheckResult:
             name="Tushare",
             status="skipped",
             message="package not installed",
-            impact="A-share data unavailable",
+            impact="部分基本面、宽基指数和备用数据不可用",
         )
 
     return CheckResult(name="Tushare", status="ready", message="token configured", impact="")
 
 
 def _check_akshare() -> CheckResult:
-    """Check akshare availability."""
+    """检查安装版本以及新浪日历解码能力，不发起市场数据请求。"""
     try:
-        import akshare  # noqa: F401
-    except ImportError:
+        from src.ashare.shichang_shuju import _duqu_akshare_rili_jiemao
+
+        _, capability = _duqu_akshare_rili_jiemao()
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
         return CheckResult(
             name="akshare",
             status="skipped",
-            message="package not installed",
-            impact="A-share fallback unavailable",
+            message=f"capability unavailable: {exc}",
+            impact="新浪交易日历解码和部分行情备用适配器不可用",
         )
-    return CheckResult(name="akshare", status="ready", message="installed", impact="")
+    return CheckResult(
+        name="akshare",
+        status="ready",
+        message=f"{capability['akshare_version']} calendar decoder ready",
+        impact="",
+    )
+
+
+def _check_market_data_policy() -> CheckResult:
+    """检查动态数据源和 Windows 连接策略配置，不预取行情。"""
+    try:
+        from src.ashare.peizhi import jiazai_lianghua_peizhi
+
+        config, _ = jiazai_lianghua_peizhi()
+        mode = str(config["wangluo"]["domestic_connection_mode"])
+    except Exception as exc:
+        return CheckResult(
+            name="公开数据策略",
+            status="error",
+            message=str(exc),
+            impact="动态范围发现和远端量化数据不可用",
+        )
+    return CheckResult(
+        name="公开数据策略",
+        status="ready",
+        message=f"dynamic catalogs; connection={mode}; persistence=none",
+        impact="",
+    )
 
 
 # -- Status icons and colors --------------------------------------------------
@@ -173,6 +202,7 @@ def run_preflight(console: Optional[Console] = None) -> List[CheckResult]:
         _check_llm_provider,
         _check_tushare,
         _check_akshare,
+        _check_market_data_policy,
     ]
 
     results: List[CheckResult] = []

@@ -10,4 +10,3 @@ __pycache__/
 .env
 agent/.env
 agent/runs/
-agent/cache/
