@@ -216,6 +216,20 @@ class GupiaoYuceTool(BaseTool):
             )
         full_result = session.result
         stored_context = session.prediction_context
+        if str(full_result.get("analysis_type") or "") == "single_stock_analysis":
+            return json.dumps(
+                {
+                    "status": "unavailable",
+                    "outcome": "prediction_not_available",
+                    "tool_contract_version": 6,
+                    "analysis_id": analysis_id,
+                    "stock": _selected_stock(full_result),
+                    "forecast": {},
+                    "error": "单股买入建议不产生统一选股的预测资格；预测仍只面向范围选股中的合格候选",
+                    "next_action": "如需未来三交易日预测，请先完成选股分析并确认合格候选",
+                },
+                ensure_ascii=False,
+            )
         prediction_context, context_error = _resolve_prediction_context(
             stored_context,
             str(kwargs.get("gupiao") or "").strip() or None,

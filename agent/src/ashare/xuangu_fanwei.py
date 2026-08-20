@@ -19,6 +19,7 @@ from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 class FanweiLeixing(str, Enum):
     QUAN_SHICHANG = "all_market"
     MINGMING_FANWEI = "named_scope"
+    DANGU_GUPIAO = "single_stock"
 
 
 @dataclass(frozen=True)
@@ -27,11 +28,25 @@ class FenxiFanwei:
 
     leixing: FanweiLeixing
     mingcheng: str | None = None
+    gupiao: str | None = None
 
     @classmethod
-    def create(cls, leixing: str, mingcheng: str | None) -> "FenxiFanwei":
+    def create(
+        cls,
+        leixing: str,
+        mingcheng: str | None,
+        gupiao: str | None = None,
+    ) -> "FenxiFanwei":
         key = str(leixing or "all_market").strip().lower()
         all_aliases = {"all", "all_market", "quan_shichang", "全市场"}
+        single_aliases = {
+            "single_stock",
+            "single",
+            "stock",
+            "dangu",
+            "单股",
+            "个股",
+        }
         # 旧会话可能仍携带 industry/board；只视为“用户给了名称”，不据此约束目录类型。
         named_aliases = {
             "named_scope",
@@ -45,8 +60,18 @@ class FenxiFanwei:
             "板块",
             "概念",
         }
+        if key in all_aliases and gupiao:
+            query = " ".join(str(gupiao).split()) or None
+            if not query:
+                raise ValueError("按单只股票分析时，请提供股票名称或 6 位股票代码")
+            return cls(leixing=FanweiLeixing.DANGU_GUPIAO, gupiao=query)
         if key in all_aliases:
             return cls(leixing=FanweiLeixing.QUAN_SHICHANG)
+        if key in single_aliases:
+            query = " ".join(str(gupiao or mingcheng or "").split()) or None
+            if not query:
+                raise ValueError("按单只股票分析时，请提供股票名称或 6 位股票代码")
+            return cls(leixing=FanweiLeixing.DANGU_GUPIAO, gupiao=query)
         if key not in named_aliases:
             raise ValueError("分析范围只能是全市场或一个用日常语言描述的股票范围")
         name = " ".join(str(mingcheng or "").split()) or None

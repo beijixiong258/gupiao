@@ -8,11 +8,11 @@ import pandas as pd
 
 from src.ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from src.ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
+from src.ashare.dangu_fenxi import DANGU_ANALYSIS_TYPE, fenxi_dangu
 from src.ashare.fenxi_yinzi import (
     goujian_fenxi_yinzi_mianban,
     huizong_houxuan_yinzi,
     jisuan_hengjiemian_jibenmian,
-    jisuan_shendu_jibenmian,
     zengjia_dangri_guzhi_yinzi,
 )
 from src.ashare.gupiao_yanjiu import huoqu_jibenmian, zongjie_jishu
@@ -32,18 +32,67 @@ from src.ashare.xuangu_guize import (
     goujian_kejiaoyixing_zhaiyao,
     goujian_kuaizhao_jilu,
     guolv_lishi_wanzhengxing,
+    hecheng_hengjiemian_yu_shendu_jibenmian,
     hecheng_houxuan_fenshu,
     jichu_ying_guolv,
     jisuan_fengxian_koufen,
-    jisuan_jibenmian_xinren,
     shibie_yizijia_zhangting,
     xuyao_shishi_kuaizhao,
     zhuan_json_zhi,
-    zhuan_you_xian_shuzhi,
 )
 
 
-XUANGU_TOOL_CONTRACT_VERSION = 7
+XUANGU_TOOL_CONTRACT_VERSION = 9
+
+
+def _normalize_requested_count(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(5, count))
+
+
+def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[str, Any]:
+    """按用户明确要求的数量裁剪公开候选及预测交接身份。"""
+
+    count = _normalize_requested_count(requested_count)
+    if (
+        count is None
+        or result.get("status") != "ok"
+        or result.get("analysis_type") != "unified_stock_selection"
+        or not result.get("recommendation_available")
+    ):
+        return result
+    primary = result.get("primary")
+    if not isinstance(primary, dict):
+        return result
+    alternatives = result.get("alternatives")
+    alternatives = alternatives if isinstance(alternatives, list) else []
+    selected = [primary, *[item for item in alternatives if isinstance(item, dict)][: max(0, count - 1)]]
+    limited = dict(result)
+    limited["alternatives"] = selected[1:]
+    limited["requested_candidate_count"] = count
+    limited["displayed_candidate_count"] = len(selected)
+    prediction_context = result.get("_prediction_context")
+    if isinstance(prediction_context, dict) and isinstance(prediction_context.get("candidates"), dict):
+        selected_codes = {
+            str(item.get("ts_code"))
+            for item in selected
+            if item.get("ts_code")
+        }
+        limited["_prediction_context"] = {
+            **prediction_context,
+            "primary_code": str(primary.get("ts_code") or prediction_context.get("primary_code") or ""),
+            "candidates": {
+                code: candidate
+                for code, candidate in prediction_context["candidates"].items()
+                if str(code) in selected_codes
+            },
+        }
+    return limited
 
 
 class XuanguFenxiFuWu:
@@ -59,6 +108,12 @@ class XuanguFenxiFuWu:
         self._context = context
 
     def fenxi(self, fanwei: FenxiFanwei) -> dict[str, Any]:
+        if fanwei.leixing is FanweiLeixing.DANGU_GUPIAO:
+            return fenxi_dangu(
+                gupiao=str(fanwei.gupiao or ""),
+                config=self._config,
+                context=self._context,
+            )
         settings = self._config["fenxi"]
         if fanwei.leixing is FanweiLeixing.MINGMING_FANWEI:
             discovery = self._context.faxian_fanwei(str(fanwei.mingcheng or ""))
@@ -376,51 +431,33 @@ class XuanguFenxiFuWu:
                 fundamentals = {"profile": item["profile"], "financials": {}, "valuation": {}, "errors": [str(exc)]}
             if not fundamentals.get("profile"):
                 fundamentals["profile"] = item["profile"]
-            deep_score, deep_evidence = jisuan_shendu_jibenmian(fundamentals)
-            if deep_score is not None:
-                cross_section = item["fundamental"]
-                cross_score = zhuan_you_xian_shuzhi(cross_section.get("score_0_100"))
-                deep_confidence = jisuan_jibenmian_xinren(fundamentals)
-                deep_weight = float(settings["fundamental_deep_weight"])
-                combined_score = (
-                    (1.0 - deep_weight) * float(cross_score) + deep_weight * float(deep_score)
-                    if cross_score is not None
-                    else float(deep_score)
-                )
-                combined_confidence = (
-                    (1.0 - deep_weight) * float(cross_section.get("confidence") or 0.0)
-                    + deep_weight * deep_confidence
-                    if cross_score is not None
-                    else deep_confidence
-                )
-                item["fundamental"] = {
-                    **fundamentals,
-                    "status": "ok",
-                    "score_0_100": round(combined_score, 2),
-                    "confidence": round(combined_confidence, 4),
-                    "evidence": list(
-                        dict.fromkeys(
-                            [
-                                *[str(value) for value in cross_section.get("evidence", [])],
-                                *deep_evidence,
-                            ]
-                        )
-                    ),
-                    "cross_section_analysis": cross_section,
-                    "deep_score_0_100": deep_score,
-                    "deep_weight": deep_weight,
-                    "score_definition": "同日相对估值与少量候选深度财务证据的组合分，不是上涨概率",
-                }
-            else:
-                item["fundamental"] = {
-                    **item["fundamental"],
-                    "deep_analysis": fundamentals,
-                    "deep_analysis_status": "insufficient_fields",
-                }
+            item["fundamental"] = hecheng_hengjiemian_yu_shendu_jibenmian(
+                item["fundamental"],
+                fundamentals,
+                deep_weight=float(settings["fundamental_deep_weight"]),
+            )
             try:
-                item["technical"] = zongjie_jishu(item["history"])
+                technical = zongjie_jishu(
+                    item["history"],
+                    macd_structure_config=settings.get("macd_structure"),
+                )
+                if technical.get("status") == "error":
+                    item["technical"] = {
+                        "status": "error",
+                        "outcome": "program_error",
+                        "error": str(
+                            (technical.get("macd_structure") or {}).get("reason")
+                            or "技术结构研判发生程序错误"
+                        ),
+                    }
+                else:
+                    item["technical"] = technical
             except Exception as exc:
-                item["technical"] = {"status": "unavailable", "error": str(exc)}
+                item["technical"] = {
+                    "status": "error",
+                    "outcome": "program_error",
+                    "error": str(exc),
+                }
             item["tradability"] = goujian_kejiaoyixing_zhaiyao(
                 code=item["ts_code"],
                 name=item["name"],
@@ -561,20 +598,31 @@ def fenxi_xuangu(
     *,
     fanwei: str = "all_market",
     mingcheng: str | None = None,
+    gupiao: str | None = None,
+    shuliang: int | str | None = None,
     context: FenxiShujuShangxiawen | None = None,
 ) -> dict[str, Any]:
     """自然语言智能体调用的统一分析入口。"""
+    analysis_type = DANGU_ANALYSIS_TYPE if str(fanwei or "").strip().lower() in {
+        "single_stock",
+        "single",
+        "stock",
+        "dangu",
+        "单股",
+        "个股",
+    } or (gupiao and str(fanwei or "all_market").strip().lower() in {"", "all_market", "all", "quan_shichang", "全市场"}) else "unified_stock_selection"
     try:
         config, _ = jiazai_lianghua_peizhi()
-        resolved_scope = FenxiFanwei.create(fanwei, mingcheng)
+        resolved_scope = FenxiFanwei.create(fanwei, mingcheng, gupiao)
         request_context = context or FenxiShujuShangxiawen()
-        return XuanguFenxiFuWu(config=config, context=request_context).fenxi(resolved_scope)
+        result = XuanguFenxiFuWu(config=config, context=request_context).fenxi(resolved_scope)
+        return xianzhi_xuangu_jieguo(result, shuliang)
     except WangluoQingqiuYichang as exc:
         return {
             "status": "unavailable",
             "outcome": "data_unavailable",
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
-            "analysis_type": "unified_stock_selection",
+            "analysis_type": analysis_type,
             "error_code": exc.error_code,
             "stage": "data_acquisition",
             "source": "remote_market_data",
@@ -592,7 +640,7 @@ def fenxi_xuangu(
             "status": "clarification_required",
             "outcome": "clarification_required",
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
-            "analysis_type": "unified_stock_selection",
+            "analysis_type": analysis_type,
             "error_code": "analysis_request_invalid",
             "stage": "request_validation",
             "source": None,
@@ -609,7 +657,7 @@ def fenxi_xuangu(
             "status": "unavailable",
             "outcome": "data_unavailable",
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
-            "analysis_type": "unified_stock_selection",
+            "analysis_type": analysis_type,
             "error_code": "analysis_data_unavailable",
             "stage": "quantitative_data_pipeline",
             "source": "remote_market_data",
@@ -626,7 +674,7 @@ def fenxi_xuangu(
             "status": "error",
             "outcome": "error",
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
-            "analysis_type": "unified_stock_selection",
+            "analysis_type": analysis_type,
             "error_code": "analysis_internal_error",
             "stage": "quantitative_analysis",
             "source": None,
@@ -646,4 +694,5 @@ __all__ = [
     "XuanguFenxiFuWu",
     "XUANGU_TOOL_CONTRACT_VERSION",
     "fenxi_xuangu",
+    "xianzhi_xuangu_jieguo",
 ]

@@ -34,6 +34,7 @@ YINZI_FANGXIANG: dict[str, int] = {
     "ma_trend_5_20": 1,
     "trend_slope_20": 1,
     "trend_fit_quality_20": 1,
+    "ma_5_20_gap_change": 1,
     "golden_cross_speed": 1,
     "ret_1": 1,
     "ret_3": 1,
@@ -198,6 +199,8 @@ def goujian_fenxi_yinzi_mianban(
         profile = profile_by_code.get(str(code), {})
         features["name"] = str(profile.get("name") or "")
         features["industry"] = str(profile.get("industry") or "")
+        if profile.get("peer_role") is not None:
+            features["peer_role"] = str(profile.get("peer_role") or "market_reference")
         frames.append(features)
     if not frames:
         return pd.DataFrame(), {"status": "unavailable", "warnings": warnings or ["没有可构造因子面板的历史行情"]}

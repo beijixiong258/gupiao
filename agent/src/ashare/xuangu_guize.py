@@ -265,6 +265,9 @@ def jisuan_fengxian_koufen(
     volatility = None
     if technical:
         volatility = zhuan_you_xian_shuzhi(technical.get("annualized_volatility_20"))
+        macd_structure = technical.get("macd_structure") or {}
+        if macd_structure.get("status") == "ok":
+            risks.extend(str(value) for value in macd_structure.get("risk_warnings", [])[:2])
     if volatility is None:
         volatility = zhuan_you_xian_shuzhi(((factor.get("groups") or {}).get("risk_liquidity") or {}).get("values", {}).get("volatility_20"))
     if volatility is not None and volatility > float(settings.get("high_volatility_threshold", 0.55)):
@@ -371,6 +374,57 @@ def jisuan_jibenmian_xinren(fundamentals: dict[str, Any]) -> float:
     return round(min(1.0, observed / 4.0), 4)
 
 
+def hecheng_hengjiemian_yu_shendu_jibenmian(
+    cross_section: dict[str, Any],
+    fundamentals: dict[str, Any],
+    *,
+    deep_weight: float,
+) -> dict[str, Any]:
+    """复用统一口径，合并横截面估值和深度财务证据。"""
+
+    # 局部导入避免因子模块与规则模块形成模块级循环依赖。
+    from src.ashare.fenxi_yinzi import jisuan_shendu_jibenmian
+
+    deep_score, deep_evidence = jisuan_shendu_jibenmian(fundamentals)
+    if deep_score is None:
+        return {
+            **cross_section,
+            "deep_analysis": fundamentals,
+            "deep_analysis_status": "insufficient_fields",
+        }
+    cross_score = zhuan_you_xian_shuzhi(cross_section.get("score_0_100"))
+    deep_confidence = jisuan_jibenmian_xinren(fundamentals)
+    combined_score = (
+        (1.0 - deep_weight) * float(cross_score) + deep_weight * float(deep_score)
+        if cross_score is not None
+        else float(deep_score)
+    )
+    combined_confidence = (
+        (1.0 - deep_weight) * float(cross_section.get("confidence") or 0.0)
+        + deep_weight * deep_confidence
+        if cross_score is not None
+        else deep_confidence
+    )
+    return {
+        **fundamentals,
+        "status": "ok",
+        "score_0_100": round(combined_score, 2),
+        "confidence": round(combined_confidence, 4),
+        "evidence": list(
+            dict.fromkeys(
+                [
+                    *[str(value) for value in cross_section.get("evidence", [])],
+                    *deep_evidence,
+                ]
+            )
+        ),
+        "cross_section_analysis": cross_section,
+        "deep_score_0_100": deep_score,
+        "deep_weight": deep_weight,
+        "score_definition": "同日相对估值与少量候选深度财务证据的组合分，不是上涨概率",
+    }
+
+
 def goujian_kejiaoyixing_zhaiyao(
     *,
     code: str,
@@ -381,6 +435,12 @@ def goujian_kejiaoyixing_zhaiyao(
 ) -> dict[str, Any]:
     latest = history.iloc[-1]
     amount = zhuan_you_xian_shuzhi(latest.get("amount_yuan"))
+    amount_trade_date_raw = pd.to_datetime(latest.get("trade_date"), errors="coerce")
+    amount_trade_date = (
+        pd.Timestamp(amount_trade_date_raw).strftime("%Y-%m-%d")
+        if not pd.isna(amount_trade_date_raw)
+        else None
+    )
     hard_blocks: list[str] = []
     cautions: list[str] = []
     if amount is None or amount < minimum_amount:
@@ -415,6 +475,8 @@ def goujian_kejiaoyixing_zhaiyao(
             else "latest_completed_qfq_close"
         ),
         "amount_yuan": amount,
+        "amount_basis": "latest_completed_daily_bar",
+        "amount_trade_date": amount_trade_date,
         "minimum_amount_yuan": minimum_amount,
         "price_limit_status": price_limit_status,
         "price_limit_pct": price_limit_pct,
@@ -467,6 +529,32 @@ def goujian_houxuan_zhaiyao(
     if confidence < minimum_confidence:
         unmet.append(f"证据可信度低于门槛 {minimum_confidence:.2f}")
     technical = item.get("technical") or {}
+    macd_structure = technical.get("macd_structure") or {}
+    technical_status = technical.get("status") or macd_structure.get("status")
+    technical_outcome = technical.get("outcome") or macd_structure.get("outcome")
+    technical_reason = technical.get("reason") or macd_structure.get("reason")
+    if macd_structure.get("status") == "ok":
+        positive = [
+            *[str(value) for value in macd_structure.get("supporting_evidence", [])[:2]],
+            *positive,
+        ]
+        unmet = [
+            *[str(value) for value in macd_structure.get("counter_evidence", [])[:2]],
+            *unmet,
+        ]
+    elif macd_structure:
+        reason = str(macd_structure.get("reason") or "指数平滑异同移动平均线结构信息不足")
+        unmet.append(reason)
+    prioritized_risks = list(
+        dict.fromkeys(
+            [
+                *[str(value) for value in macd_structure.get("risk_warnings", [])],
+                *[str(value) for value in item.get("risks") or []],
+            ]
+        )
+    )
+    all_positive_evidence = list(dict.fromkeys(positive))
+    all_unmet_conditions = list(dict.fromkeys(unmet))
     return {
         "rank": rank,
         "ts_code": item["ts_code"],
@@ -476,22 +564,27 @@ def goujian_houxuan_zhaiyao(
         "ranking_score_definition": ranking.get("definition"),
         "confidence": confidence,
         "meets_recommendation_threshold": eligible,
-        "positive_evidence": list(dict.fromkeys(positive))[:8],
-        "unmet_conditions": list(dict.fromkeys(unmet))[:8],
+        "positive_evidence": all_positive_evidence[:8],
+        "unmet_conditions": all_unmet_conditions[:8],
+        "all_unmet_conditions": all_unmet_conditions,
         "daily_factor_analysis": factor,
         "fundamental_analysis": item.get("fundamental"),
         "limit_up_pullback_pattern": item.get("pattern"),
         "late_session_analysis": item.get("late"),
         "technical_summary": {
+            "status": technical_status,
+            "outcome": technical_outcome,
+            "reason": technical_reason,
             "trade_date": technical.get("trade_date"),
             "close": technical.get("close"),
             "score_0_100": technical.get("score_0_100"),
             "annualized_volatility_20": technical.get("annualized_volatility_20"),
             "evidence": technical.get("evidence"),
+            "macd_structure": macd_structure,
         },
         "tradability": item.get("tradability"),
         "data_quality": item.get("data_quality"),
-        "risks": item.get("risks"),
+        "risks": prioritized_risks,
         "risk_reference_price": item.get("pattern", {}).get("risk_reference_price"),
         "ranking_details": ranking,
         "suggest_prediction_stage": eligible,
@@ -504,6 +597,7 @@ __all__ = [
     "goujian_kejiaoyixing_zhaiyao",
     "goujian_kuaizhao_jilu",
     "guolv_lishi_wanzhengxing",
+    "hecheng_hengjiemian_yu_shendu_jibenmian",
     "hecheng_houxuan_fenshu",
     "jichu_ying_guolv",
     "jisuan_fengxian_koufen",

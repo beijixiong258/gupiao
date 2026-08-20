@@ -18,6 +18,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -258,6 +259,7 @@ def _is_tool_success(result: str) -> bool:
                 "error",
                 "failed",
                 "unavailable",
+                "insufficient_data",
                 "blocked",
                 "cancelled",
                 "clarification_required",
@@ -281,6 +283,8 @@ def _analysis_run_status(payload: dict[str, Any] | None) -> str | None:
         if not ContextBuilder.is_compatible_analysis_result(payload):
             return "failed"
         return "no_recommendation" if outcome == "no_recommendation" else "success"
+    if status == "insufficient_data":
+        return "information_insufficient"
     if status == "clarification_required":
         return "clarification_required"
     if status == "unavailable":
@@ -288,6 +292,222 @@ def _analysis_run_status(payload: dict[str, Any] | None) -> str | None:
     if status in {"error", "failed"}:
         return "failed"
     return None
+
+
+def _single_stock_prediction_offer(content: str) -> bool:
+    """识别单股量化回答中误加的预测邀请，避免展示层越过业务边界。"""
+
+    text = "".join(str(content or "").split())
+    if "预测" not in text:
+        return False
+    # 这些是安全边界说明，不是邀请；去掉后只要还出现“预测”，就交给
+    # 确定性单股摘要重写，避免模型用“如需/如果希望”绕过提示词。
+    for phrase in (
+        "不产生自动预测资格",
+        "不产生预测资格",
+        "不具备预测资格",
+        "不提供预测",
+        "不能预测",
+        "不可预测",
+    ):
+        text = text.replace(phrase, "")
+    return "预测" in text or any(
+        marker in text
+        for marker in (
+            "T+1",
+            "T＋1",
+            "T+2",
+            "T＋2",
+            "T+3",
+            "T＋3",
+        )
+    )
+
+
+def _remove_single_stock_prediction_offer(content: str) -> str:
+    """只移除单股回答里的预测邀请段，尽量保留已核验的分析理由。"""
+
+    paragraphs = str(content or "").split("\n\n")
+    kept: list[str] = []
+    removed = False
+    for paragraph in paragraphs:
+        if _single_stock_prediction_offer(paragraph):
+            removed = True
+            continue
+        if paragraph.strip():
+            kept.append(paragraph.strip())
+    cleaned = "\n\n".join(kept).strip()
+    if not removed or _single_stock_prediction_offer(cleaned):
+        return ""
+    return cleaned
+
+
+def _replace_single_stock_classification_code(content: str, payload: dict[str, Any]) -> str:
+    """用结构结果自带的中文标签替换模型可能照抄的内部分类代码。"""
+
+    technical = payload.get("technical_summary")
+    structure = technical.get("macd_structure") if isinstance(technical, dict) else None
+    classification = structure.get("structure_classification") if isinstance(structure, dict) else None
+    if not isinstance(classification, dict):
+        return content
+    code = str(classification.get("code") or "").strip()
+    label = str(classification.get("label") or "").strip()
+    if not code or not label:
+        return content
+    return re.sub(rf"\b{re.escape(code)}\b", label, str(content or ""))
+
+
+def _contains_number(text: str, value: Any, *, scale: float = 1.0) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return True
+    number = float(value) * scale
+    variants = {
+        f"{number:.0f}",
+        f"{number:.1f}",
+        f"{number:.2f}",
+        f"{number:.3f}",
+    }
+    variants.update(item.rstrip("0").rstrip(".") for item in list(variants))
+    return any(item and item in text for item in variants)
+
+
+def _single_stock_answer_has_verifiable_reasons(content: str, payload: dict[str, Any]) -> bool:
+    """检查单股回答是否展示了足以复核结论的关键返回证据。"""
+
+    text = " ".join(str(content or "").split())
+    technical = payload.get("technical_summary")
+    if not text or not isinstance(technical, dict):
+        return False
+    buy_decision = payload.get("buy_decision")
+    if not isinstance(buy_decision, dict):
+        return False
+    decision_label = str(buy_decision.get("label") or "").strip()
+    if not decision_label or decision_label not in text:
+        return False
+    ranking_score = buy_decision.get("score_0_100")
+    if ranking_score is not None and not _contains_number(text, ranking_score):
+        return False
+    decision_confidence = buy_decision.get("confidence")
+    if decision_confidence is not None and not _contains_number(text, decision_confidence, scale=100.0):
+        return False
+    if not any(marker in text for marker in ("不是收益概率", "不是上涨概率", "不是概率")):
+        return False
+    factor = buy_decision.get("daily_factor_analysis")
+    if not isinstance(factor, dict):
+        factor = payload.get("daily_factor_analysis")
+    groups = factor.get("groups") if isinstance(factor, dict) else None
+    if not isinstance(groups, dict) or len(groups) < 8:
+        return False
+    for group in groups.values():
+        if not isinstance(group, dict):
+            return False
+        label = str(group.get("label") or "").strip()
+        group_score = group.get("score_0_100")
+        if label and label not in text:
+            return False
+        if group_score is not None and not _contains_number(text, group_score):
+            return False
+    if not all(marker in text for marker in ("5 日", "10 日", "20 日")):
+        return False
+    blockers = buy_decision.get("blocking_conditions")
+    if isinstance(blockers, list):
+        for blocker in blockers[:8]:
+            reason = " ".join(str(blocker or "").split())
+            if reason and reason not in text:
+                return False
+    plain_summary = " ".join(str(buy_decision.get("plain_language_summary") or "").split())
+    if plain_summary and plain_summary not in text:
+        return False
+    returns = technical.get("returns") if isinstance(technical.get("returns"), dict) else {}
+    moving_averages = (
+        technical.get("moving_averages")
+        if isinstance(technical.get("moving_averages"), dict)
+        else {}
+    )
+    score = technical.get("score_0_100")
+    drawdown = technical.get("drawdown_from_20d_high")
+    if isinstance(drawdown, (int, float)) and not isinstance(drawdown, bool):
+        drawdown = abs(float(drawdown))
+    required_numeric = (
+        ("收盘", technical.get("close"), 1.0),
+        ("20 日", returns.get("20d"), 100.0),
+        ("MA20", moving_averages.get("ma20"), 1.0),
+        ("波动", technical.get("annualized_volatility_20"), 100.0),
+        ("回撤", drawdown, 100.0),
+    )
+    for marker, value, scale in required_numeric:
+        if value is not None and (marker not in text or not _contains_number(text, value, scale=scale)):
+            return False
+    if score is not None:
+        if not any(marker in text for marker in ("技术状态分", "技术分", "启发式")):
+            return False
+        if not _contains_number(text, score):
+            return False
+        if not any(marker in text for marker in ("不是上涨概率", "非上涨概率", "不是概率")):
+            return False
+
+    structure = technical.get("macd_structure")
+    if isinstance(structure, dict):
+        counter = structure.get("counter_evidence")
+        cross = structure.get("latest_cross")
+        if isinstance(counter, list) and counter and not any(marker in text for marker in ("反向", "冲突", "弱势")):
+            return False
+        if isinstance(cross, dict) and cross.get("status") == "active":
+            event_date = str(cross.get("event_date") or "")
+            if event_date and event_date not in text:
+                return False
+
+    fundamentals = payload.get("fundamental_analysis")
+    if isinstance(fundamentals, dict) and fundamentals.get("status") != "ok":
+        errors = " ".join(str(item) for item in fundamentals.get("errors") or []).lower()
+        cause_markers = (
+            (("频率", "限频", "rate limit"), ("频率", "限频")),
+            (("权限", "permission"), ("权限",)),
+            (("connection", "连接", "remote end", "timeout"), ("连接", "中断", "超时")),
+            (("公告日",), ("公告日",)),
+        )
+        for source_markers, answer_markers in cause_markers:
+            if any(marker in errors for marker in source_markers) and not any(
+                marker in text for marker in answer_markers
+            ):
+                return False
+        if (
+            any(marker in errors for marker in ("与分析日", "与历史分析日"))
+            and "不一致" in errors
+            and not ("估值" in text and "不一致" in text)
+        ):
+            return False
+        available_fields = fundamentals.get("available_fields")
+        if isinstance(available_fields, dict):
+            if available_fields.get("profile") and not available_fields.get("valuation") and not available_fields.get("financials"):
+                if not all(marker in text for marker in ("基本资料", "估值", "财务")):
+                    return False
+        if "基本面" not in text or not any(marker in text for marker in ("不能据此", "不代表", "数据可用性")):
+            return False
+
+    tradability = payload.get("tradability")
+    if isinstance(tradability, dict) and tradability.get("amount_yuan") is not None:
+        if tradability.get("amount_basis") == "latest_completed_daily_bar":
+            amount_date = str(tradability.get("amount_trade_date") or "")
+            if not any(marker in text for marker in ("完整交易日成交额", "最近完整交易日成交额")):
+                return False
+            if amount_date and amount_date not in text:
+                return False
+            if any(marker in text for marker in ("今日盘中成交额", "当前盘中成交额")):
+                return False
+
+    history = payload.get("data_provenance")
+    history = history.get("history") if isinstance(history, dict) else None
+    coverage = history.get("session_coverage") if isinstance(history, dict) else None
+    minimum_coverage = coverage.get("minimum") if isinstance(coverage, dict) else None
+    if minimum_coverage is not None:
+        if "覆盖" not in text or not _contains_number(text, minimum_coverage, scale=100.0):
+            return False
+    if payload.get("result_confirmation") == "intraday_provisional" and not any(
+        marker in text for marker in ("盘中", "暂定")
+    ):
+        return False
+    return True
 
 
 def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) -> dict[str, Any]:
@@ -459,6 +679,40 @@ class AgentLoop:
                         )
                     else:
                         final_content = context.sanitize_user_facing_content(response.content)
+                        single_stock_payload = (
+                            self._latest_analysis_payload
+                            if isinstance(self._latest_analysis_payload, dict)
+                            and self._latest_analysis_payload.get("analysis_type") == "single_stock_analysis"
+                            else None
+                        )
+                        if single_stock_payload is not None:
+                            final_content = _replace_single_stock_classification_code(
+                                final_content,
+                                single_stock_payload,
+                            )
+                        if single_stock_payload is not None and _single_stock_prediction_offer(final_content):
+                            from src.agent.fenxi_zhanshi import goujian_fenxi_anquan_huitui
+
+                            cleaned_content = _remove_single_stock_prediction_offer(final_content)
+                            if cleaned_content:
+                                logger.warning("Removed an invalid prediction-offer paragraph from single-stock analysis")
+                                final_content = cleaned_content
+                            else:
+                                logger.warning("Rebuilt single-stock analysis after an inseparable prediction offer")
+                                final_content = goujian_fenxi_anquan_huitui(
+                                    single_stock_payload
+                                )
+                        if (
+                            single_stock_payload is not None
+                            and not _single_stock_answer_has_verifiable_reasons(
+                                final_content,
+                                single_stock_payload,
+                            )
+                        ):
+                            from src.agent.fenxi_zhanshi import goujian_fenxi_anquan_huitui
+
+                            logger.warning("Rebuilt single-stock analysis because key reasons were missing")
+                            final_content = goujian_fenxi_anquan_huitui(single_stock_payload)
                     answer_message = {"role": "assistant", "content": final_content}
                     messages.append(answer_message)
                     durable_history.append(copy.deepcopy(answer_message))
@@ -655,6 +909,27 @@ class AgentLoop:
                         ),
                     },
                     reason="prediction_requires_next_user_turn",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
+            if tc.name == "gupiao_yuce" and isinstance(self._latest_analysis_payload, dict) and (
+                self._latest_analysis_payload.get("analysis_type") == "single_stock_analysis"
+            ):
+                logger.warning("Blocked prediction for a single-stock buy assessment")
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "status": "blocked",
+                        "error_code": "prediction_not_available_for_single_stock",
+                        "error": "单股买入建议不产生统一选股的预测资格",
+                    },
+                    reason="prediction_not_available_for_single_stock",
                     context=context,
                     messages=messages,
                     durable_history=durable_history,

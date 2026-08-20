@@ -23,7 +23,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 
-FACTOR_ENGINEERING_VERSION = "daily-factor-engineering-v1"
+FACTOR_ENGINEERING_VERSION = "daily-factor-engineering-v2"
 
 
 # The registry is intentionally data rather than executable logic.  It is
@@ -41,7 +41,7 @@ FACTOR_GROUPS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
                 "ma_trend_5_20",
                 "trend_slope_20",
                 "trend_fit_quality_20",
-                "golden_cross_speed",
+                "ma_5_20_gap_change",
             ),
         ),
         (
@@ -178,7 +178,7 @@ RAW_PRICE_VOLUME_FEATURE_COLUMNS: tuple[str, ...] = (
     "breakout_volume_confirmation",
     "pullback_quality_20",
     "stalling_pressure_20",
-    "golden_cross_speed",
+    "ma_5_20_gap_change",
     "low_volume_long_lower_shadow",
 )
 
@@ -221,6 +221,9 @@ _FEATURE_TO_GROUP = {
     feature: group for group, members in FACTOR_GROUPS.items() for feature in members
 }
 _FEATURE_TO_GROUP.update({f"factor_{group}_composite": group for group in FACTOR_GROUPS})
+# 旧字段实际描述 MA5 与 MA20 相对间距的日变化，并非 MACD 金叉。
+# 仅保留查询兼容，不再把旧名放入生产因子列表，避免同一证据重复计权。
+_FEATURE_TO_GROUP["golden_cross_speed"] = "trend_structure"
 
 
 def factor_group(feature: str) -> str:
@@ -342,7 +345,7 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         ma_trend = _numeric(local, "ma_trend_5_20")
         pullback = (-c.pct_change(5, fill_method=None)).clip(lower=0.0) * (1.0 - ratio).clip(lower=0.0) * ma_trend.clip(lower=0.0)
         stalling = position20.clip(lower=0.0, upper=1.0) * anomaly.clip(lower=0.0) * (1.0 - location.fillna(0.5))
-        cross_speed = (_numeric(local, "ma_gap_5") - ma_gap20).diff()
+        ma_gap_change = (_numeric(local, "ma_gap_5") - ma_gap20).diff()
         low_volume_shadow = (1.0 - position20).clip(lower=0.0, upper=1.0) * lower.clip(lower=0.0) / (1.0 + ratio.clip(lower=0.0))
         values = {
             "gap_open": gap,
@@ -367,7 +370,9 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
             "breakout_volume_confirmation": breakout_confirmation,
             "pullback_quality_20": pullback,
             "stalling_pressure_20": stalling,
-            "golden_cross_speed": cross_speed,
+            "ma_5_20_gap_change": ma_gap_change,
+            # 兼容仍读取旧列名的调用方；因子注册表只登记上面的准确名称。
+            "golden_cross_speed": ma_gap_change,
             "low_volume_long_lower_shadow": low_volume_shadow,
         }
         for column, series in values.items():

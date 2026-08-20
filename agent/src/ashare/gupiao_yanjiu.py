@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from src.ashare.macd_jiegou import yanpan_macd_jiegou
 from src.ashare.shuju_yuan import (
     _tushare_pro,
     biaozhunhua_gupiao_daima,
@@ -146,8 +147,15 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
         raise ValueError("source 必须是 auto、tushare 或 akshare")
     warnings: list[str] = []
     raw = str(gupiao).strip()
-    if shi_a_gu(raw):
-        code = biaozhunhua_daima(raw)
+    code_query = raw if shi_a_gu(raw) else ""
+    if not code_query:
+        for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", raw):
+            candidate = match.group(1)
+            if shi_a_gu(candidate):
+                code_query = candidate
+                break
+    if code_query:
+        code = biaozhunhua_daima(code_query)
         resolved: dict[str, Any] = {}
         if source in {"auto", "tushare"}:
             try:
@@ -383,7 +391,20 @@ def huoqu_rili_xingqing(
 
 def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     """Calculate leak-free daily technical features used by analysis and ML."""
-    data = history.copy().sort_values("trade_date").reset_index(drop=True)
+    if history is None or history.empty:
+        raise ValueError("日线行情为空")
+    if "trade_date" not in history.columns:
+        raise ValueError("日线行情缺少 trade_date")
+    data = history.copy()
+    data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
+    data = (
+        data.dropna(subset=["trade_date"])
+        .sort_values("trade_date")
+        .drop_duplicates("trade_date", keep="last")
+        .reset_index(drop=True)
+    )
+    if data.empty:
+        raise ValueError("日线行情没有有效交易日期")
     close = pd.to_numeric(data["close"], errors="coerce")
     high = pd.to_numeric(data["high"], errors="coerce")
     low = pd.to_numeric(data["low"], errors="coerce")
@@ -416,8 +437,18 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     data["macd_dif"] = dif
     data["macd_dea"] = dea
     data["macd_hist"] = histogram
-    data["macd_dif_pct"] = dif / close
-    data["macd_hist_pct"] = histogram / close
+    valid_close = close.where(close > 0)
+    data["macd_dif_pct"] = dif / valid_close
+    data["macd_dea_pct"] = dea / valid_close
+    data["macd_gap_pct"] = (dif - dea) / valid_close
+    data["macd_hist_pct"] = histogram / valid_close
+    data["macd_dif_change_pct"] = data["macd_dif_pct"].diff()
+    data["macd_dea_change_pct"] = data["macd_dea_pct"].diff()
+    data["macd_gap_change_pct"] = data["macd_gap_pct"].diff()
+    data["macd_zero_distance_pct"] = pd.concat(
+        [data["macd_dif_pct"].abs(), data["macd_dea_pct"].abs()],
+        axis=1,
+    ).max(axis=1, skipna=False)
 
     true_range = pd.concat(
         [(high - low).abs(), (high - previous_close).abs(), (low - previous_close).abs()],
@@ -519,10 +550,10 @@ def _technical_score(latest: pd.Series) -> tuple[int, list[str]]:
     if macd_hist is not None:
         if macd_hist > 0:
             score += 7
-            reasons.append("MACD 柱为正")
+            reasons.append("MACD 柱为正（既有状态分，不代表刚发生金叉）")
         elif macd_hist < 0:
             score -= 4
-            reasons.append("MACD 柱为负")
+            reasons.append("MACD 柱为负（既有状态分，不代表刚发生死叉）")
         else:
             reasons.append("MACD 柱接近零，本项不加减分")
     volatility = _round_optional(latest.get("volatility_20"))
@@ -532,7 +563,11 @@ def _technical_score(latest: pd.Series) -> tuple[int, list[str]]:
     return int(round(max(0, min(100, score)))), reasons
 
 
-def zongjie_jishu(history: pd.DataFrame) -> dict[str, Any]:
+def zongjie_jishu(
+    history: pd.DataFrame,
+    *,
+    macd_structure_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     features = jisuan_tezheng_biao(history)
     usable = features.dropna(subset=["ma_20", "rsi_14", "atr_14_pct", "volatility_20"])
     if usable.empty:
@@ -544,7 +579,22 @@ def zongjie_jishu(history: pd.DataFrame) -> dict[str, Any]:
         indicator_warnings.append("历史不足 60 个交易日，MA60 暂不可用且未参与评分")
     if _round_optional(latest.get("macd_hist")) is None:
         indicator_warnings.append("历史不足以形成完整 MACD，MACD 暂不可用且未参与评分")
+    macd_structure = yanpan_macd_jiegou(features, macd_structure_config)
+    if macd_structure.get("status") != "ok":
+        reason = str(macd_structure.get("reason") or "MACD 结构研判暂不可用")
+        indicator_warnings.append(f"MACD 结构研判未完成：{reason}")
+    structure_status = str(macd_structure.get("status") or "error")
+    if structure_status == "error":
+        summary_status, summary_outcome = "error", "program_error"
+    elif structure_status == "unavailable":
+        summary_status, summary_outcome = "unavailable", "data_unavailable"
+    elif structure_status == "insufficient_data":
+        summary_status, summary_outcome = "insufficient_data", "information_insufficient"
+    else:
+        summary_status, summary_outcome = "ok", "analysis_success"
     return {
+        "status": summary_status,
+        "outcome": summary_outcome,
         "trade_date": _json_value(latest["trade_date"]),
         "close": _round_optional(latest["close"], 3),
         "returns": {f"{period}d": _round_optional(latest[f"ret_{period}"], 6) for period in [1, 3, 5, 10, 20]},
@@ -554,7 +604,12 @@ def zongjie_jishu(history: pd.DataFrame) -> dict[str, Any]:
             "dif": _round_optional(latest["macd_dif"], 4),
             "dea": _round_optional(latest["macd_dea"], 4),
             "histogram": _round_optional(latest["macd_hist"], 4),
+            "dif_pct": _round_optional(latest["macd_dif_pct"], 8),
+            "dea_pct": _round_optional(latest["macd_dea_pct"], 8),
+            "gap_pct": _round_optional(latest["macd_gap_pct"], 8),
+            "zero_distance_pct": _round_optional(latest["macd_zero_distance_pct"], 8),
         },
+        "macd_structure": macd_structure,
         "atr_14_pct": _round_optional(latest["atr_14_pct"], 6),
         "annualized_volatility_20": _round_optional(latest["volatility_20"], 6),
         "drawdown_from_20d_high": _round_optional(latest["drawdown_20"], 6),

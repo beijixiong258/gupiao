@@ -71,6 +71,10 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
         scope.get("requested_name") or scope.get("canonical_name") or ""
     ).strip()
     stock = payload.get("selected_stock") or payload.get("primary")
+    single_stock = str(payload.get("analysis_type") or "") == "single_stock_analysis"
+    stock_query = str(payload.get("query") or "").strip()
+    if not stock_query and isinstance(stock, dict):
+        stock_query = str(stock.get("ts_code") or stock.get("name") or "").strip()
     minimal_stock = (
         {
             key: stock.get(key)
@@ -80,16 +84,19 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
         if isinstance(stock, dict)
         else None
     )
+    scope_request = {
+        "fanwei": "single_stock" if single_stock else "named_scope" if requested_name else "all_market",
+        "mingcheng": requested_name or None,
+    }
+    if single_stock:
+        scope_request["gupiao"] = stock_query or None
     copied["content"] = json.dumps(
         {
             "status": "reanalysis_required",
             "outcome": "reanalysis_required",
             "previous_business_outcome": payload.get("outcome"),
             "stock_reference": minimal_stock,
-            "scope_request": {
-                "fanwei": "named_scope" if requested_name else "all_market",
-                "mingcheng": requested_name or None,
-            },
+            "scope_request": scope_request,
             "message": (
                 "会话只保留范围和股票指代，不保存行情、板块成分、因子或预测输入；"
                 "恢复会话后必须重新获取远端数据并分析。"

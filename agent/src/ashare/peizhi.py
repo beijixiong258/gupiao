@@ -89,6 +89,82 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
         raise ValueError("fenxi.high_volatility_threshold 必须大于 0")
     if not 0 <= _youxian_shuzhi(analysis, "fundamental_deep_weight", "fenxi") <= 1:
         raise ValueError("fenxi.fundamental_deep_weight 必须在 0 到 1 之间")
+    macd_structure = analysis.get("macd_structure")
+    if not isinstance(macd_structure, dict):
+        raise ValueError("fenxi.macd_structure 必须是 JSON 对象")
+    required_macd_keys = {
+        "zero_near_threshold_pct",
+        "pivot_left_sessions",
+        "pivot_right_sessions",
+        "pivot_match_sessions",
+        "minimum_pivot_separation_sessions",
+        "maximum_pivot_separation_sessions",
+        "minimum_price_change_pct",
+        "minimum_indicator_change_pct",
+        "cross_fresh_sessions",
+        "cross_recent_sessions",
+        "cross_max_age_sessions",
+        "divergence_max_age_sessions",
+        "invalidation_price_tolerance_pct",
+    }
+    if set(macd_structure) != required_macd_keys:
+        raise ValueError("fenxi.macd_structure 的结构检测字段不完整或包含未知字段")
+    integer_macd_keys = {
+        "pivot_left_sessions",
+        "pivot_right_sessions",
+        "pivot_match_sessions",
+        "minimum_pivot_separation_sessions",
+        "maximum_pivot_separation_sessions",
+        "cross_fresh_sessions",
+        "cross_recent_sessions",
+        "cross_max_age_sessions",
+        "divergence_max_age_sessions",
+    }
+    macd_numbers = {
+        key: _youxian_shuzhi(macd_structure, key, "fenxi.macd_structure")
+        for key in required_macd_keys
+    }
+    if any(macd_numbers[key] != int(macd_numbers[key]) for key in integer_macd_keys):
+        raise ValueError("fenxi.macd_structure 的交易日窗口必须是整数")
+    if not 1 <= int(macd_numbers["pivot_left_sessions"]) <= 10:
+        raise ValueError("fenxi.macd_structure.pivot_left_sessions 必须在 1 到 10 之间")
+    if not 1 <= int(macd_numbers["pivot_right_sessions"]) <= 10:
+        raise ValueError("fenxi.macd_structure.pivot_right_sessions 必须在 1 到 10 之间")
+    if not 0 <= int(macd_numbers["pivot_match_sessions"]) <= 10:
+        raise ValueError("fenxi.macd_structure.pivot_match_sessions 必须在 0 到 10 之间")
+    if not (
+        2 <= int(macd_numbers["minimum_pivot_separation_sessions"])
+        < int(macd_numbers["maximum_pivot_separation_sessions"])
+        <= 250
+    ):
+        raise ValueError("fenxi.macd_structure 的拐点间隔范围无效")
+    if not (
+        0 <= int(macd_numbers["cross_fresh_sessions"])
+        <= int(macd_numbers["cross_recent_sessions"])
+        <= int(macd_numbers["cross_max_age_sessions"])
+        <= 250
+    ):
+        raise ValueError("fenxi.macd_structure 的交叉新鲜度窗口必须递增")
+    if not 1 <= int(macd_numbers["divergence_max_age_sessions"]) <= 250:
+        raise ValueError("fenxi.macd_structure.divergence_max_age_sessions 必须在 1 到 250 之间")
+    for key in (
+        "zero_near_threshold_pct",
+        "minimum_price_change_pct",
+        "minimum_indicator_change_pct",
+        "invalidation_price_tolerance_pct",
+    ):
+        if not 0 < macd_numbers[key] <= 0.2:
+            raise ValueError(f"fenxi.macd_structure.{key} 必须在 0 到 0.2 之间")
+    macd_validation = analysis.get("macd_structure_validation")
+    if not isinstance(macd_validation, dict):
+        raise ValueError("fenxi.macd_structure_validation 必须是 JSON 对象")
+    # 回放模块自身是这组研究口径的唯一校验入口，避免配置层复制一套逐渐分叉的规则。
+    from src.ashare.macd_huifang import MacdHuifangPeizhi
+
+    required_validation_keys = set(MacdHuifangPeizhi.__dataclass_fields__)
+    if set(macd_validation) != required_validation_keys:
+        raise ValueError("fenxi.macd_structure_validation 的历史回放字段不完整或包含未知字段")
+    MacdHuifangPeizhi.from_mapping(macd_validation)
     component_weights = analysis.get("component_weights")
     factor_group_weights = analysis.get("factor_group_weights")
     if not isinstance(component_weights, dict) or not isinstance(factor_group_weights, dict):
