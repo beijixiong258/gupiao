@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.ashare.shuju_yuan import heyan_kuaizhao_shidian
+
 
 class WeipanJieduan(str, Enum):
     BU_SHIYONG = "not_applicable"
@@ -37,25 +39,6 @@ def _number(value: Any) -> float | None:
 def _minute(value: Any) -> int:
     hour, minute = (int(part) for part in str(value).split(":"))
     return hour * 60 + minute
-
-
-def _interval_score(value: float | None, low: float, high: float) -> float | None:
-    """目标区间内满分，区间外按一个区间宽度连续衰减。"""
-    if value is None:
-        return None
-    if low <= value <= high:
-        return 100.0
-    width = max(high - low, abs(high) * 0.25, 1e-9)
-    distance = low - value if value < low else value - high
-    return round(max(0.0, 100.0 * (1.0 - distance / width)), 4)
-
-
-def _threshold_score(value: float | None, target: float) -> float | None:
-    if value is None:
-        return None
-    if value >= target:
-        return round(min(100.0, 50.0 + 50.0 * (value - target) / max(target * 0.5, 1e-9)), 4)
-    return round(max(0.0, 50.0 * value / max(target, 1e-9)), 4)
 
 
 def panduan_weipan_jieduan(clock: dict[str, Any], config: dict[str, Any]) -> WeipanJieduan:
@@ -164,10 +147,10 @@ def _minute_evidence(
     if vwap is None and "average_price" in data.columns:
         vwap = _number(data.iloc[-1]["average_price"])
     if vwap is not None:
-        above_vwap = current_price is not None and current_price >= vwap
+        above_vwap = current_price >= vwap if current_price is not None else None
         actuals["vwap"] = round(vwap, 4)
         actuals["above_vwap"] = above_vwap
-        evidence.append(f"当前价{'位于' if above_vwap else '低于'}累计成交均价 {vwap:.3f}")
+        evidence.append(f"累计成交均价 {vwap:.3f}" + ("，当前价不可用" if above_vwap is None else "，当前价位于其上方" if above_vwap else "，当前价低于它"))
     else:
         unavailable.append("累计成交均价 VWAP")
 
@@ -196,7 +179,7 @@ def fenxi_weipan(
     config: dict[str, Any],
     minute_data: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """计算尾盘连续分和分钟形态；缺失项不按失败处理。"""
+    """提取尾盘实际值与逐项条件，不计算分数或人为权重。"""
     stage = panduan_weipan_jieduan(clock, config)
     base = {
         "status": "not_applicable" if stage is WeipanJieduan.BU_SHIYONG else "ok",
@@ -211,22 +194,34 @@ def fenxi_weipan(
             if stage is WeipanJieduan.SHOUPAN_DAIDING
             else "not_used"
         ),
-        "score_definition": "尾盘价量适配分，只用于综合排序，不是上涨概率",
+        "interpretation": "逐项尾盘证据与状态，不计算综合分",
     }
     if stage is WeipanJieduan.BU_SHIYONG:
-        return {**base, "score_0_100": None, "confidence": 0.0, "evidence": [], "unavailable_items": []}
+        return {**base, "evidence": [], "unavailable_items": []}
     if stage is WeipanJieduan.SHOUPAN_DAIDING:
         return {
             **base,
-            "score_0_100": None,
-            "confidence": 0.0,
             "evidence": ["15:00 至 15:05 等待数据源确认完整收盘，不提升为正式信号"],
             "unavailable_items": ["完整收盘日线确认"],
         }
     captured = pd.to_datetime(clock.get("captured_at"), errors="coerce")
     if pd.isna(captured):
-        return {**base, "status": "unavailable", "score_0_100": None, "confidence": 0.0, "error": "市场时钟无效"}
+        return {**base, "status": "unavailable", "error": "市场时钟无效"}
     captured = pd.Timestamp(captured)
+    time_check = heyan_kuaizhao_shidian(
+        snapshot, expected_trade_date=captured, reference_time=captured,
+        require_timestamp=stage is not WeipanJieduan.SHOUPAN_FUHE,
+    )
+    if not time_check["verified"]:
+        return {**base, "status": "unavailable", "confirmation_level": "not_confirmed",
+                "reason": time_check["reason"], "quote_time_verification": time_check,
+                "evidence": [], "unavailable_items": ["已核验时点的行情"]}
+    if stage is WeipanJieduan.SHOUPAN_FUHE and time_check["provider_quote_time"]:
+        quote_time = pd.Timestamp(time_check["provider_quote_time"])
+        if quote_time.hour * 60 + quote_time.minute < _minute(config.get("market_close", "15:00")):
+            return {**base, "status": "unavailable", "confirmation_level": "not_confirmed",
+                    "reason": "来源更新时间仍在收盘之前，不能冒充完整收盘行情",
+                    "quote_time_verification": time_check, "evidence": [], "unavailable_items": ["完整收盘行情"]}
     prior_history = _history_before_current_session(history, captured)
     last_price = _number(snapshot.get("last_price") if snapshot.get("last_price") is not None else snapshot.get("latest_price"))
     pct_change = _number(snapshot.get("pct_change") if snapshot.get("pct_change") is not None else snapshot.get("pct_chg"))
@@ -242,16 +237,13 @@ def fenxi_weipan(
     above_ma5 = last_price is not None and dynamic_ma5 is not None and last_price >= dynamic_ma5
     above_ma10 = last_price is not None and dynamic_ma10 is not None and last_price >= dynamic_ma10
 
-    pct_range = [float(value) for value in config.get("pct_change_high_score_range", [3.0, 5.0])]
-    turnover_range = [float(value) for value in config.get("turnover_high_score_range", [5.0, 10.0])]
-    mv_range = [float(value) for value in config.get("circulating_market_value_high_score_range_yuan", [5e9, 2e10])]
-    scores: list[tuple[str, float | None, float]] = [
-        ("pct_change", _interval_score(pct_change, *pct_range), 0.16),
-        ("volume_ratio", _threshold_score(volume_ratio, float(config.get("volume_ratio_target_min", 1.0))), 0.14),
-        ("turnover", _interval_score(turnover, *turnover_range), 0.14),
-        ("circulating_market_value", _interval_score(circulating_mv, *mv_range), 0.10),
-        ("above_dynamic_ma", 100.0 if above_ma5 and above_ma10 else 50.0 if above_ma5 or above_ma10 else 0.0 if dynamic_ma5 is not None and dynamic_ma10 is not None else None, 0.13),
-        ("dynamic_ma5_rising", 100.0 if ma5_rising else 0.0 if dynamic_ma5 is not None and completed_ma5 is not None else None, 0.08),
+    volume_target = float(config.get("volume_ratio_target_min", 1.0))
+    comparisons = [
+        ("positive_return", "当日涨幅为正", pct_change > 0 if pct_change is not None else None),
+        ("volume_ratio", "实时量比达到观察条件", volume_ratio >= volume_target if volume_ratio is not None else None),
+        ("above_ma5", "价格位于动态MA5上方", above_ma5 if last_price is not None and dynamic_ma5 is not None else None),
+        ("above_ma10", "价格位于动态MA10上方", above_ma10 if last_price is not None and dynamic_ma10 is not None else None),
+        ("ma5_rising", "动态MA5抬升", ma5_rising if dynamic_ma5 is not None and completed_ma5 is not None else None),
     ]
     evidence = [
         f"当日涨幅 {pct_change:.2f}%" if pct_change is not None else "当日涨幅不可用",
@@ -259,7 +251,11 @@ def fenxi_weipan(
         f"换手率 {turnover:.2f}%" if turnover is not None else "换手率不可用",
         f"流通市值约 {circulating_mv / 1e8:.2f} 亿元" if circulating_mv is not None else "流通市值不可用",
     ]
-    unavailable = [name for name, score, _ in scores if score is None]
+    unavailable = [label for _, label, state in comparisons if state is None]
+    if turnover is None:
+        unavailable.append("换手率")
+    if circulating_mv is None:
+        unavailable.append("流通市值")
     minute_actuals: dict[str, Any] = {}
     if stage is WeipanJieduan.PANZHONG_ZANDING:
         minute_actuals, minute_evidence, minute_unavailable = _minute_evidence(
@@ -270,32 +266,15 @@ def fenxi_weipan(
         )
         evidence.extend(minute_evidence)
         unavailable.extend(minute_unavailable)
-        shape_parts = [
-            100.0 if minute_actuals.get("high_after_threshold") else 0.0 if "high_after_threshold" in minute_actuals else None,
-            100.0 if minute_actuals.get("above_vwap") else 0.0 if "above_vwap" in minute_actuals else None,
-            _interval_score(
-                _number(minute_actuals.get("pullback_from_high_pct")),
-                0.0,
-                float(config.get("max_pullback_from_high_pct", 1.5)),
-            ),
-        ]
-        available_shape = [value for value in shape_parts if value is not None]
-        scores.append(("late_price_shape", float(np.mean(available_shape)) if available_shape else None, 0.25))
-    else:
-        scores.append(("late_price_shape", None, 0.25))
-    valid_scores = [(score, weight) for _, score, weight in scores if score is not None]
-    total_weight = sum(weight for _, weight in valid_scores)
-    score = (
-        round(sum(float(value) * weight for value, weight in valid_scores) / total_weight, 2)
-        if total_weight > 0
-        else None
-    )
-    configured_weight = sum(weight for _, _, weight in scores)
-    confidence = round(total_weight / configured_weight, 4) if configured_weight > 0 else 0.0
+        comparisons.extend((key, label, minute_actuals.get(key)) for key, label in (
+            ("high_after_threshold", "日内高点出现在尾盘观察时点之后"),
+            ("above_vwap", "价格位于累计成交均价上方"),
+            ("pullback_within_limit", "较日内高点回撤未超过观察上限"),
+        ))
+    conditions = [{"key": key, "label": label, "status": "unavailable" if state is None else "met" if state else "unmet"} for key, label, state in comparisons]
     return {
         **base,
-        "score_0_100": score,
-        "confidence": confidence,
+        "status": "partial" if unavailable else "ok",
         "captured_at": clock.get("captured_at"),
         "actuals": {
             "pct_change": pct_change,
@@ -313,10 +292,11 @@ def fenxi_weipan(
             "above_ma10": above_ma10 if dynamic_ma10 is not None and last_price is not None else None,
             "definition": "使用前 N-1 个完整收盘价与当前实时价计算，不覆盖历史日 K 特征",
         },
-        "component_scores": {name: value for name, value, _ in scores},
+        "conditions": conditions,
+        "observation_thresholds": {"volume_ratio_min": volume_target, "high_time_after": config.get("high_time_after", "14:40"), "max_pullback_from_high_pct": config.get("max_pullback_from_high_pct", 1.5)},
         "evidence": evidence,
         "unavailable_items": list(dict.fromkeys(unavailable)),
-        "data_quality_note": "缺失项不按失败处理；有效证据重新归一，同时降低 confidence",
+        "data_quality_note": "缺失项标为不可用，不当作不满足，也不作加减分",
     }
 
 

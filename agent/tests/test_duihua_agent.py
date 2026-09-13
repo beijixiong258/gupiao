@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src.agent.loop import AgentLoop
-from src.agent.context import ContextBuilder
+from src.agent.context import ContextBuilder, _ANALYSIS_TOOL_CONTRACT_VERSION
 from src.agent.tools import BaseTool, ToolRegistry
 from src.providers.chat import LLMResponse, ToolCallRequest
 
@@ -19,11 +21,11 @@ class _StockTool(BaseTool):
         return json.dumps(
             {
                 "status": "ok",
-                "tool_contract_version": 7,
+                "tool_contract_version": _ANALYSIS_TOOL_CONTRACT_VERSION,
                 "analysis_id": "fx_test",
                 "analysis_stage": {"status": "completed"},
                 "stock": {"name": kwargs["gupiao"]},
-                "score": 81,
+                "latest_close": 81,
             },
             ensure_ascii=False,
         )
@@ -79,8 +81,8 @@ def test_tool_messages_flow_into_follow_up_turn(tmp_path, monkeypatch) -> None:
     registry.register(_StockTool())
     llm = _QueueLLM([
         LLMResponse(tool_calls=[ToolCallRequest(id="tc_1", name="gupiao_fenxi", arguments={"gupiao": "贵州茅台"})]),
-        LLMResponse(content="贵州茅台当前量化分为 81。"),
-        LLMResponse(content="你说的“它”是贵州茅台，上一轮量化分为 81。"),
+        LLMResponse(content="贵州茅台最近完整日线收盘价为 81 元。"),
+        LLMResponse(content="你说的“它”是贵州茅台，上一轮收盘价为 81 元。"),
     ])
     agent = AgentLoop(registry=registry, llm=llm, max_iterations=5)
 
@@ -93,7 +95,7 @@ def test_tool_messages_flow_into_follow_up_turn(tmp_path, monkeypatch) -> None:
     assert second["status"] == "success"
     assert second["run_id"] != first["run_id"]
     assert second["history"][-2]["content"] == "那它呢？"
-    assert "上一轮量化分为 81" in second["history"][-1]["content"]
+    assert "上一轮收盘价为 81" in second["history"][-1]["content"]
     assert any(message.get("role") == "tool" for message in llm.seen_messages[-1])
 
 
@@ -117,22 +119,21 @@ def test_history_system_messages_are_not_replayed(tmp_path, monkeypatch) -> None
     assert [message["role"] for message in result["history"]] == ["user", "assistant", "user", "assistant"]
 
 
-def test_system_prompt_defines_analysis_first_prediction_confirmation_and_short_redirect(tmp_path, monkeypatch) -> None:
+def test_system_prompt_defines_analysis_only_and_short_redirect(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.agent.loop.RUNS_DIR", tmp_path / "runs")
-    llm = _QueueLLM([LLMResponse(content="本程序专注 A 股分析与预测，请尽量围绕相关内容提问。")])
+    llm = _QueueLLM([LLMResponse(content="本程序专注 A 股分析与诊断，请尽量围绕相关内容提问。")])
     agent = AgentLoop(registry=ToolRegistry(), llm=llm, max_iterations=2)
 
     result = agent.run("给我讲一个太空故事")
 
     system_prompt = llm.seen_messages[0][0]["content"]
-    assert "Quantitative analysis is the product's primary and default function" in system_prompt
-    assert "Never call analysis and prediction in the same turn" in system_prompt
-    assert "later user turn explicitly confirms prediction" in system_prompt
-    assert "Advance permission in the initial request" in system_prompt
-    assert "Do not ask for a third confirmation" in system_prompt
-    assert "freshly download the target, peer, valuation, and benchmark data" in system_prompt
-    assert "本程序专注 A 股分析与预测，请尽量围绕相关内容提问。" in system_prompt
-    assert result["content"] == "本程序专注 A 股分析与预测，请尽量围绕相关内容提问。"
+    assert "complete evidence analysis for one named stock" in system_prompt
+    assert "Prediction and model training are unavailable" in system_prompt
+    assert "reassessment conditions" in system_prompt
+    assert "status=partial" in system_prompt
+    assert "Call gupiao_yuce" not in system_prompt
+    assert "本程序专注 A 股分析与诊断，请尽量围绕相关内容提问。" in system_prompt
+    assert result["content"] == "本程序专注 A 股分析与诊断，请尽量围绕相关内容提问。"
 
 
 def test_large_tool_result_stays_in_memory_but_default_run_log_saves_only_metadata(tmp_path, monkeypatch) -> None:
@@ -200,6 +201,48 @@ def test_unavailable_analysis_cannot_become_success_because_llm_wrote_text(tmp_p
     assert result["business_outcome"] == "data_unavailable"
     state = json.loads((tmp_path / "runs" / result["run_id"] / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "data_unavailable"
+
+
+def test_retired_forecast_call_is_blocked_even_when_a_legacy_tool_is_registered(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.agent.loop.RUNS_DIR", tmp_path / "runs")
+    class LegacyPredictionTool(BaseTool):
+        name = "gupiao_yuce"
+        def execute(self, **kwargs):
+            pytest.fail("已移除的预测入口不得执行")
+    registry = ToolRegistry()
+    registry.register(LegacyPredictionTool())
+    result = AgentLoop(
+        registry=registry,
+        llm=_QueueLLM([
+            LLMResponse(tool_calls=[ToolCallRequest(id="legacy", name="gupiao_yuce", arguments={})]),
+            LLMResponse(content="预测功能已移除，当前仅提供股票分析与诊断。"),
+        ]),
+        max_iterations=3,
+    ).run("确认预测上一轮首选")
+    assert result["status"] == "failed"
+    assert result["business_outcome"] == "feature_removed"
+    assert "预测功能已移除" in result["reason"]
+    tool_result = next(item for item in result["history"] if item.get("role") == "tool")
+    assert json.loads(tool_result["content"])["error_code"] == "feature_removed"
+
+
+def test_completed_analysis_does_not_open_confirmation_window(tmp_path, monkeypatch):
+    from src.tools.clarify_tool import ClarifyTool
+
+    monkeypatch.setattr("src.agent.loop.RUNS_DIR", tmp_path / "runs")
+    registry = ToolRegistry()
+    registry.register(_StockTool())
+    registry.register(ClarifyTool(lambda request: pytest.fail("完成诊断后不应询问预测确认")))
+    result = AgentLoop(
+        registry=registry,
+        llm=_QueueLLM([
+            LLMResponse(tool_calls=[ToolCallRequest(id="analysis", name="gupiao_fenxi", arguments={"gupiao": "样本股份"})]),
+            LLMResponse(content="当前收盘价为 81 元，仍需结合完整风险证据。"),
+        ]),
+        max_iterations=3,
+    ).run("诊断样本股份")
+    assert result["status"] == "success"
+    assert result["clarification"] is None
 
 
 def test_unexpected_foreign_script_is_blocked_but_normal_chinese_is_allowed() -> None:

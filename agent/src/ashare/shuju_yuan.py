@@ -4,12 +4,59 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
 import pandas as pd
 
 PRICE_LIMIT_RULE_EFFECTIVE_FROM = "2026-07-06"
+
+
+def heyan_kuaizhao_shidian(
+    snapshot: dict[str, Any], *, expected_trade_date: Any, reference_time: Any = None,
+    require_timestamp: bool = False,
+) -> dict[str, Any]:
+    """核对来源日期和更新时间；取得时间不能代替行情自身的时点。"""
+    def timestamp(value: Any) -> pd.Timestamp | None:
+        if not isinstance(value, (str, date, datetime)):
+            return None
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except (ValueError, TypeError, OverflowError):
+            return None
+        if pd.isna(parsed):
+            return None
+        parsed = pd.Timestamp(parsed)
+        return parsed.tz_convert("Asia/Shanghai").tz_localize(None) if parsed.tzinfo else parsed
+
+    expected = timestamp(expected_trade_date)
+    quote_time = timestamp(snapshot.get("provider_quote_time"))
+    provider_date = timestamp(snapshot.get("provider_trade_date"))
+    observed = quote_time if quote_time is not None else provider_date
+    reference = timestamp(reference_time)
+    captured = timestamp(snapshot.get("captured_at"))
+    checked_at = max(value for value in (reference, captured) if value is not None) if reference is not None or captured is not None else None
+    result = {
+        "status": "unavailable", "verified": False,
+        "expected_trade_date": expected.strftime("%Y-%m-%d") if expected is not None else None,
+        "provider_trade_date": observed.strftime("%Y-%m-%d") if observed is not None else None,
+        "provider_quote_time": quote_time.strftime("%Y-%m-%d %H:%M:%S") if quote_time is not None else None,
+        "quote_age_seconds": (checked_at - quote_time).total_seconds() if checked_at is not None and quote_time is not None else None,
+        "verification_scope": "核对来源日期、更新时间；不保证即时成交，延迟秒数单独披露",
+    }
+    if expected is None or observed is None:
+        result["reason"] = "缺少待核验交易日期或行情来源日期，取得时间不能证明行情日期"
+    elif provider_date is not None and quote_time is not None and provider_date.normalize() != quote_time.normalize():
+        result.update(status="conflict", reason="行情来源日期与更新时间冲突")
+    elif observed.normalize() != expected.normalize():
+        result.update(status="stale" if observed.normalize() < expected.normalize() else "future", reason="行情来源日期与待核验交易日不一致")
+    elif quote_time is not None and checked_at is not None and quote_time > checked_at:
+        result.update(status="future", reason="行情更新时间晚于实际取得和核验时点")
+    elif require_timestamp and (quote_time is None or checked_at is None):
+        result["reason"] = "盘中缺少来源更新时间或核验时点，不能确认当前行情"
+    else:
+        result.update(status="verified", verified=True, reason="来源日期与待核验交易日一致，已保留来源更新时间和延迟信息")
+    return result
 
 
 @dataclass(frozen=True)

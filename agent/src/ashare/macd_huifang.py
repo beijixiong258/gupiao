@@ -1,6 +1,6 @@
 """MACD 结构证据的无未来数据历史回放与基线比较。
 
-本模块只处理调用方放入内存的历史面板，不访问行情源、不落盘，也不修改生产评分。
+本模块只处理调用方放入内存的历史面板，不访问行情源、不落盘，也不修改选股条件。
 信号在收盘后确认，统一尝试下一市场交易日开盘建仓，并对停牌、封板、流动性、
 整手与交易成本逐笔留痕。行业时点、现有排名基线或交易状态缺失时会明确降级，
 不能把不完整回放表述为第五阶段已经通过。
@@ -33,7 +33,7 @@ MACD_HUIFANG_METHOD_VERSION = "macd-structure-validation-v1"
 
 @dataclass(frozen=True)
 class MacdHuifangPeizhi:
-    """固定的研究回放口径，不是生产评分权重。"""
+    """固定的研究回放口径。"""
 
     forward_horizons: tuple[int, ...] = (1, 3, 5, 10, 20)
     decision_horizons: tuple[int, ...] = (5, 10, 20)
@@ -198,9 +198,6 @@ def _prepare_panel(panel: pd.DataFrame, settings: MacdHuifangPeizhi) -> tuple[pd
 
 
 def _market_regime(row: pd.Series) -> str:
-    score = _number(row.get("market_regime_score"))
-    if score is not None:
-        return "weak" if score <= -0.20 else "strong" if score >= 0.20 else "sideways"
     for column, label in (
         ("market_regime_weak", "weak"),
         ("market_regime_strong", "strong"),
@@ -799,7 +796,7 @@ def _stratified_metrics(observations: pd.DataFrame, settings: MacdHuifangPeizhi)
     return records
 
 
-def _score_research_assessment(
+def _signal_research_assessment(
     family_performance: list[dict[str, Any]],
     sensitivity_performance: list[dict[str, Any]],
     settings: MacdHuifangPeizhi,
@@ -836,10 +833,10 @@ def _score_research_assessment(
                 "passed_decision_horizons": passed_horizons,
                 "parameter_horizon_records": int(len(sensitivity)),
                 "parameter_favorable_sign_agreement": _json_value(sensitivity_agreement),
-                "research_status": "eligible_for_manual_weight_design" if eligible else "insufficient_stable_gain",
+                "research_status": "consistent_historical_evidence" if eligible else "insufficient_stable_gain",
                 "production_effect": "none",
                 "reason": (
-                    "多个期限、时间子区间和附近参数方向一致，可进入受限权重的人工设计与独立复核"
+                    "多个期限、时间子区间和附近参数方向一致，可作为历史证据供人工复核，不自动改变选股条件"
                     if eligible
                     else "尚未同时满足样本量、置信区间、时间稳定性和附近参数稳定性"
                 ),
@@ -898,7 +895,7 @@ def _huifang_macd_jiegou_impl(
     validation_config: Mapping[str, Any] | MacdHuifangPeizhi | None = None,
     trading_calendar: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
-    """执行内存历史回放，并返回逐笔证据、分层结果和生产评分保持决定。"""
+    """执行内存历史回放，并返回逐笔证据、分层结果和适用限制。"""
 
     try:
         settings = (
@@ -920,21 +917,21 @@ def _huifang_macd_jiegou_impl(
             "status": "unavailable",
             "outcome": "data_unavailable",
             "reason": str(exc),
-            "production_score_decision": "unchanged",
+            "production_rule_effect": "unchanged",
         }
     except Exception as exc:
         return {
             "status": "error",
             "outcome": "program_error",
             "reason": str(exc),
-            "production_score_decision": "unchanged",
+            "production_rule_effect": "unchanged",
         }
     if not component_events:
         return {
             "status": "insufficient_data",
             "outcome": "information_insufficient",
             "reason": "满足预热期和现有基线范围的历史结构事件为空",
-            "production_score_decision": "unchanged",
+            "production_rule_effect": "unchanged",
             "warnings": list(dict.fromkeys(warnings)),
             "data_coverage": _coverage(features, [], has_baseline),
         }
@@ -980,7 +977,7 @@ def _huifang_macd_jiegou_impl(
         group_columns=["configuration_variant", "signal_family", "horizon_sessions"],
         settings=settings,
     )
-    assessments = _score_research_assessment(
+    assessments = _signal_research_assessment(
         family_performance,
         sensitivity_performance,
         settings,
@@ -1007,7 +1004,7 @@ def _huifang_macd_jiegou_impl(
         readiness_reasons.append(f"股票范围少于 {settings.minimum_sample_scopes} 类")
     if calendar_source != "explicit_market_trading_calendar":
         readiness_reasons.append("未提供经核验的显式市场交易日历")
-    stable_candidates = [item for item in assessments if item["research_status"] == "eligible_for_manual_weight_design"]
+    stable_candidates = [item for item in assessments if item["research_status"] == "consistent_historical_evidence"]
     return {
         "status": "ok",
         "outcome": "analysis_success",
@@ -1032,7 +1029,7 @@ def _huifang_macd_jiegou_impl(
         },
         "data_coverage": coverage,
         "validation_readiness": {
-            "ready_for_score_decision": not readiness_reasons,
+            "ready_for_evidence_review": not readiness_reasons,
             "unmet_requirements": readiness_reasons,
         },
         "event_counts": {
@@ -1050,9 +1047,9 @@ def _huifang_macd_jiegou_impl(
         "stratified_performance": _stratified_metrics(family_frame, settings),
         "parameter_sensitivity": sensitivity_performance,
         "research_assessment": assessments,
-        "production_score_decision": "unchanged",
-        "production_score_reason": (
-            "回放结果只形成后续受限权重设计资格，不能自动改生产评分；"
+        "production_rule_effect": "unchanged",
+        "production_rule_reason": (
+            "回放结果用于复核历史证据，不自动修改选股条件；"
             + ("仍有数据覆盖门槛未满足" if readiness_reasons else "需完成人工复核与独立样本确认")
         ),
         "stable_research_candidates": stable_candidates,
@@ -1083,7 +1080,7 @@ def huifang_macd_jiegou(
             "status": "error",
             "outcome": "program_error",
             "reason": str(exc),
-            "production_score_decision": "unchanged",
+            "production_rule_effect": "unchanged",
         }
 
 

@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.ashare.buchong_zhenduan import goujian_buchong_zhenduan
 from src.ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from src.ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
 from src.ashare.dangu_fenxi import DANGU_ANALYSIS_TYPE, fenxi_dangu
@@ -15,7 +16,7 @@ from src.ashare.fenxi_yinzi import (
     jisuan_hengjiemian_jibenmian,
     zengjia_dangri_guzhi_yinzi,
 )
-from src.ashare.gupiao_yanjiu import huoqu_jibenmian, zongjie_jishu
+from src.ashare.gupiao_yanjiu import zongjie_jishu
 from src.ashare.peizhi import jiazai_lianghua_peizhi
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 from src.ashare.shuju_yuan import biaozhunhua_gupiao_daima
@@ -31,12 +32,12 @@ from src.ashare.xuangu_guize import (
     goujian_houxuan_zhaiyao,
     goujian_kejiaoyixing_zhaiyao,
     goujian_kuaizhao_jilu,
+    goujian_zhen_duan_shixiaoxing,
     guolv_lishi_wanzhengxing,
-    hecheng_hengjiemian_yu_shendu_jibenmian,
-    hecheng_houxuan_fenshu,
+    hebing_jibenmian_zhengju,
     jichu_ying_guolv,
-    jisuan_fengxian_koufen,
-    shibie_yizijia_zhangting,
+    paixu_shangzhang_houxuan,
+    shishi_ying_guolv,
     xuyao_shishi_kuaizhao,
     zhuan_json_zhi,
 )
@@ -56,7 +57,7 @@ def _normalize_requested_count(value: Any) -> int | None:
 
 
 def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[str, Any]:
-    """按用户明确要求的数量裁剪公开候选及预测交接身份。"""
+    """按用户明确要求的数量裁剪公开候选。"""
 
     count = _normalize_requested_count(requested_count)
     if (
@@ -76,22 +77,6 @@ def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[
     limited["alternatives"] = selected[1:]
     limited["requested_candidate_count"] = count
     limited["displayed_candidate_count"] = len(selected)
-    prediction_context = result.get("_prediction_context")
-    if isinstance(prediction_context, dict) and isinstance(prediction_context.get("candidates"), dict):
-        selected_codes = {
-            str(item.get("ts_code"))
-            for item in selected
-            if item.get("ts_code")
-        }
-        limited["_prediction_context"] = {
-            **prediction_context,
-            "primary_code": str(primary.get("ts_code") or prediction_context.get("primary_code") or ""),
-            "candidates": {
-                code: candidate
-                for code, candidate in prediction_context["candidates"].items()
-                if str(code) in selected_codes
-            },
-        }
     return limited
 
 
@@ -256,7 +241,12 @@ class XuanguFenxiFuWu:
                     "persistence": "none",
                 }
             else:
-                realtime_table, realtime_meta = self._context.shishi_kuaizhao()
+                try:
+                    realtime_table, realtime_meta = self._context.shishi_kuaizhao()
+                except Exception as exc:
+                    realtime_table, realtime_meta = pd.DataFrame(), {
+                        "status": "unavailable", "source": "remote_realtime_snapshot", "error": str(exc),
+                    }
             if not realtime_table.empty:
                 realtime_table = realtime_table.set_index("ts_code", drop=False)
         completed_quote_is_current = bool(
@@ -266,11 +256,7 @@ class XuanguFenxiFuWu:
         profiles_by_code = profile_subset.set_index("ts_code", drop=False)
         preliminary: list[dict[str, Any]] = []
         factor_limit = int(settings["factor_candidate_limit"])
-        factor_order = sorted(
-            factor_map,
-            key=lambda code: float(factor_map[code].get("score_0_100") or -1.0),
-            reverse=True,
-        )[:factor_limit]
+        factor_order = sorted(factor_map)
         for code in factor_order:
             if code not in profiles_by_code.index or code not in histories:
                 continue
@@ -278,19 +264,6 @@ class XuanguFenxiFuWu:
             if isinstance(profile_row, pd.DataFrame):
                 profile_row = profile_row.iloc[0]
             name = str(profile_row.get("name") or "")
-            if (
-                realtime_required
-                and realtime_meta.get("status") == "ok"
-                and (realtime_table.empty or code not in realtime_table.index)
-            ):
-                rejected.append(
-                    {
-                        "ts_code": code,
-                        "name": name,
-                        "reasons": ["全市场实时快照缺少该股票，当前可交易状态无法确认"],
-                    }
-                )
-                continue
             if not realtime_table.empty and code in realtime_table.index:
                 realtime_row = realtime_table.loc[code]
                 if isinstance(realtime_row, pd.DataFrame):
@@ -311,21 +284,24 @@ class XuanguFenxiFuWu:
                 }
             else:
                 snapshot = goujian_kuaizhao_jilu(profile_row, pool.metadata)
-            try:
-                realtime_block = shibie_yizijia_zhangting(
-                    snapshot,
-                    code=code,
-                    name=name,
-                    tolerance_yuan=float(self._config["xingtai"]["limit_up_tolerance_yuan"]),
-                )
-            except ValueError:
-                realtime_block = "股票代码不满足程序已有的 A 股市场规则"
-            if realtime_block:
+            quote_check = goujian_kejiaoyixing_zhaiyao(
+                code=code, name=name, snapshot=snapshot, history=histories[code],
+                minimum_amount=float(settings["min_amount_yuan"]),
+                realtime_required=str(clock.get("session_status")) in {"opening_auction", "trading", "midday_break", "close_pending"},
+                reference_time=self._context.reference,
+            )
+            realtime_blocks = shishi_ying_guolv(
+                snapshot if quote_check["current_quote_verified"] else {},
+                code=code,
+                name=name,
+                config=self._config,
+            )
+            if realtime_blocks:
                 rejected.append(
                     {
                         "ts_code": code,
                         "name": name,
-                        "reasons": [f"当前行情为{realtime_block}"],
+                        "reasons": realtime_blocks,
                     }
                 )
                 continue
@@ -334,7 +310,7 @@ class XuanguFenxiFuWu:
                 code=code,
                 name=name,
                 config=self._config["xingtai"],
-                realtime_quote=snapshot if str(clock.get("session_status")) in {"trading", "midday_break"} else None,
+                realtime_quote=snapshot if str(clock.get("session_status")) in {"trading", "midday_break"} and quote_check["current_quote_verified"] else None,
             )
             late = fenxi_weipan(
                 histories[code],
@@ -343,52 +319,35 @@ class XuanguFenxiFuWu:
                 config=self._config["weipan"],
             )
             factor = factor_map[code]
-            fundamental = fundamental_map.get(code, {"status": "unavailable", "score_0_100": None, "confidence": 0.0, "evidence": []})
-            penalties, risks = jisuan_fengxian_koufen(
-                code=code,
-                name=name,
-                snapshot=snapshot,
-                factor=factor,
-                pattern=pattern,
-                late=late,
-                config=self._config,
-            )
-            ranking = hecheng_houxuan_fenshu(
-                factor=factor,
-                fundamental=fundamental,
-                pattern=pattern,
-                late=late,
-                penalties=penalties,
-                config=self._config,
-            )
-            preliminary.append(
-                {
-                    "ts_code": code,
-                    "name": name,
-                    "industry": str(profile_row.get("industry") or ""),
-                    "profile": {key: zhuan_json_zhi(value) for key, value in profile_row.to_dict().items()},
-                    "history": histories[code],
-                    "snapshot": snapshot,
-                    "factor": factor,
-                    "fundamental": fundamental,
-                    "pattern": pattern,
-                    "late": late,
-                    "ranking": ranking,
-                    "technical": {},
-                    "tradability": {"status": "prefiltered", "basic_execution_feasible": True, "hard_blocks": [], "cautions": []},
-                    "risks": risks,
-                    "data_quality": {
-                        "history_source": history_meta.get("source"),
-                        "history_rows": int(len(histories[code])),
-                        "as_of": analysis_date.strftime("%Y-%m-%d"),
-                        "realtime_source": snapshot.get("source"),
-                    },
-                }
-            )
-        preliminary.sort(key=lambda item: float(item["ranking"].get("score_0_100") or -1.0), reverse=True)
+            fundamental = fundamental_map.get(code, {"status": "unavailable", "evidence": []})
+            item = {
+                "ts_code": code,
+                "name": name,
+                "industry": str(profile_row.get("industry") or ""),
+                "profile": {key: zhuan_json_zhi(value) for key, value in profile_row.to_dict().items()},
+                "history": histories[code],
+                "snapshot": snapshot,
+                "factor": factor,
+                "fundamental": fundamental,
+                "pattern": pattern,
+                "late": late,
+                "technical": {},
+                "tradability": quote_check,
+                "data_quality": {
+                    "history_source": history_meta.get("source"),
+                    "history_rows": int(len(histories[code])),
+                    "as_of": analysis_date.strftime("%Y-%m-%d"),
+                    "realtime_source": snapshot.get("source"),
+                },
+            }
+            preliminary.append(item)
+        preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config)[:factor_limit]
         if late_stage is WeipanJieduan.PANZHONG_ZANDING:
             for item in preliminary[: int(self._config["weipan"]["minute_candidate_limit"])]:
-                minute_data, minute_meta = self._context.fenzhong_xingqing(item["ts_code"])
+                try:
+                    minute_data, minute_meta = self._context.fenzhong_xingqing(item["ts_code"])
+                except Exception as exc:
+                    minute_data, minute_meta = pd.DataFrame(), {"status": "unavailable", "error": str(exc)}
                 item["late"] = fenxi_weipan(
                     item["history"],
                     snapshot=item["snapshot"],
@@ -397,29 +356,10 @@ class XuanguFenxiFuWu:
                     minute_data=minute_data,
                 )
                 item["late"]["minute_data"] = minute_meta
-                penalties, extra_risks = jisuan_fengxian_koufen(
-                    code=item["ts_code"],
-                    name=item["name"],
-                    snapshot=item["snapshot"],
-                    factor=item["factor"],
-                    pattern=item["pattern"],
-                    late=item["late"],
-                    config=self._config,
-                )
-                item["risks"] = list(dict.fromkeys(item["risks"] + extra_risks))
-                item["ranking"] = hecheng_houxuan_fenshu(
-                    factor=item["factor"],
-                    fundamental=item["fundamental"],
-                    pattern=item["pattern"],
-                    late=item["late"],
-                    penalties=penalties,
-                    config=self._config,
-                )
-            preliminary.sort(key=lambda item: float(item["ranking"].get("score_0_100") or -1.0), reverse=True)
         deep_candidates = preliminary[: int(settings["deep_analysis_limit"])]
         for item in deep_candidates:
             try:
-                fundamentals = huoqu_jibenmian(
+                fundamentals = self._context.jibenmian(
                     item["ts_code"],
                     trade_date=analysis_date.strftime("%Y-%m-%d"),
                     allow_current_snapshot=bool(
@@ -431,11 +371,7 @@ class XuanguFenxiFuWu:
                 fundamentals = {"profile": item["profile"], "financials": {}, "valuation": {}, "errors": [str(exc)]}
             if not fundamentals.get("profile"):
                 fundamentals["profile"] = item["profile"]
-            item["fundamental"] = hecheng_hengjiemian_yu_shendu_jibenmian(
-                item["fundamental"],
-                fundamentals,
-                deep_weight=float(settings["fundamental_deep_weight"]),
-            )
+            item["fundamental"] = hebing_jibenmian_zhengju(item["fundamental"], fundamentals)
             try:
                 technical = zongjie_jishu(
                     item["history"],
@@ -446,7 +382,9 @@ class XuanguFenxiFuWu:
                         "status": "error",
                         "outcome": "program_error",
                         "error": str(
-                            (technical.get("macd_structure") or {}).get("reason")
+                            technical.get("reason")
+                            or technical.get("error")
+                            or (technical.get("macd_structure") or {}).get("reason")
                             or "技术结构研判发生程序错误"
                         ),
                     }
@@ -458,105 +396,91 @@ class XuanguFenxiFuWu:
                     "outcome": "program_error",
                     "error": str(exc),
                 }
+            item["supplemental_diagnostics"] = goujian_buchong_zhenduan(
+                item["history"],
+                item["fundamental"],
+                as_of_date=analysis_date.strftime("%Y-%m-%d"),
+                minimum_amount_yuan=float(settings["min_amount_yuan"]),
+            )
             item["tradability"] = goujian_kejiaoyixing_zhaiyao(
                 code=item["ts_code"],
                 name=item["name"],
                 snapshot=item["snapshot"],
                 history=item["history"],
                 minimum_amount=float(settings["min_amount_yuan"]),
+                realtime_required=str(clock.get("session_status")) in {
+                    "opening_auction", "trading", "midday_break", "close_pending",
+                },
+                reference_time=self._context.reference,
             )
-            penalties, deep_risks = jisuan_fengxian_koufen(
-                code=item["ts_code"],
-                name=item["name"],
-                snapshot=item["snapshot"],
-                factor=item["factor"],
-                pattern=item["pattern"],
-                late=item["late"],
-                config=self._config,
-                technical=item["technical"],
-            )
-            financials = (item["fundamental"].get("financials") or {}) if isinstance(item["fundamental"], dict) else {}
-            if not financials:
-                deep_risks.append("深度财务指标不可用，基本面证据不完整")
-            item["risks"] = list(dict.fromkeys(item["risks"] + deep_risks))
-            item["ranking"] = hecheng_houxuan_fenshu(
-                factor=item["factor"],
-                fundamental=item["fundamental"],
-                pattern=item["pattern"],
-                late=item["late"],
-                penalties=penalties,
-                config=self._config,
-            )
-        deep_candidates.sort(key=lambda item: float(item["ranking"].get("score_0_100") or -1.0), reverse=True)
-        minimum_score = float(settings["minimum_recommendation_score"])
-        minimum_confidence = float(settings["minimum_confidence"])
+        deep_candidates = paixu_shangzhang_houxuan(deep_candidates, config=self._config, deep_reviewed=True)
         summaries = [
             goujian_houxuan_zhaiyao(
                 item,
                 rank=index,
-                minimum_score=minimum_score,
-                minimum_confidence=minimum_confidence,
             )
             for index, item in enumerate(deep_candidates, start=1)
         ]
-        qualified = [item for item in summaries if item["meets_recommendation_threshold"]]
+        technical_errors = [
+            {
+                "ts_code": item["ts_code"],
+                "reason": item["technical_summary"].get("reason")
+                or item["technical_summary"].get("error")
+                or (item["technical_summary"].get("macd_structure") or {}).get("reason"),
+            }
+            for item in summaries
+            if item["technical_summary"].get("outcome") == "program_error"
+            or item["technical_summary"].get("status") == "error"
+        ]
+        qualified = [] if technical_errors else [item for item in summaries if item["meets_selection_conditions"]]
         primary = qualified[0] if qualified else None
         alternatives = qualified[1 : 1 + int(settings["backup_limit"])]
-        qualified_codes = {str(item["ts_code"]) for item in qualified}
-        prediction_contexts: dict[str, dict[str, Any]] = {}
-        for candidate in deep_candidates:
-            if candidate["ts_code"] not in qualified_codes:
-                continue
-            prediction_contexts[candidate["ts_code"]] = {
-                "code": candidate["ts_code"],
-                "name": candidate["name"],
-                "industry": candidate["industry"],
-                "technical": candidate["technical"],
-                "fundamentals": candidate["fundamental"],
-                "tradability": candidate["tradability"],
-            }
-        prediction_context = (
-            {
-                "primary_code": primary["ts_code"] if primary else None,
-                "source": "auto",
-                "signal_date": analysis_date.strftime("%Y-%m-%d"),
-                "config": self._config,
-                "candidates": prediction_contexts,
-            }
-            if prediction_contexts
-            else None
-        )
         recommendation_available = primary is not None
         result = {
-            "status": "ok",
-            "outcome": "recommendation" if recommendation_available else "no_recommendation",
+            "status": "error" if technical_errors else "ok",
+            "outcome": "program_error" if technical_errors else "recommendation" if recommendation_available else "no_recommendation",
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
             "analysis_type": "unified_stock_selection",
             "scope": pool.metadata,
             "as_of": analysis_date.strftime("%Y-%m-%d"),
             "generated_at": self._context.reference.strftime("%Y-%m-%d %H:%M:%S"),
             "market_clock": clock,
+            "diagnosis_validity": goujian_zhen_duan_shixiaoxing(
+                as_of=analysis_date.strftime("%Y-%m-%d"),
+                generated_at=self._context.reference.strftime("%Y-%m-%d %H:%M:%S"),
+                clock=clock,
+                realtime_status=(
+                    "verified" if summaries and all(
+                        (item.get("tradability") or {}).get("current_quote_verified")
+                        for item in summaries
+                    ) else "unavailable"
+                ),
+                realtime_required=str(clock.get("session_status")) in {
+                    "opening_auction", "trading", "midday_break", "close_pending",
+                },
+            ),
             "result_confirmation": (
                 "intraday_provisional"
-                if late_stage in {WeipanJieduan.CHUSHAI, WeipanJieduan.PANZHONG_ZANDING}
+                if str(clock.get("session_status")) in {"opening_auction", "trading", "midday_break"}
                 else "close_pending"
-                if late_stage is WeipanJieduan.SHOUPAN_DAIDING
+                if str(clock.get("session_status")) == "close_pending"
                 else "completed_daily_close"
             ),
             "recommendation_available": recommendation_available,
             "primary": primary,
             "alternatives": alternatives,
             "reviewed_candidates": summaries,
+            "diagnostic_candidates": [
+                {**summaries[0], "diagnostic_role": "observation_only", "diagnostic_label": "观察对象（未满足选股条件）"}
+            ] if summaries and not recommendation_available and not technical_errors else [],
             "no_recommendation_reason": (
                 None
                 if recommendation_available
-                else f"深度复核后的候选没有同时达到排名分 {minimum_score:.1f} 和可信度 {minimum_confidence:.2f} 门槛"
+                else "技术复核发生程序错误，当前诊断未完整完成"
+                if technical_errors
+                else "当前样本中没有股票同时满足趋势、动量、相对强弱、量能、波动和可交易性条件；具体缺项与反证已保留"
             ),
-            "thresholds": {
-                "minimum_recommendation_score": minimum_score,
-                "minimum_confidence": minimum_confidence,
-                "maximum_alternatives": int(settings["backup_limit"]),
-            },
+            "selection_limits": {"maximum_alternatives": int(settings["backup_limit"])},
             "candidate_counts": {
                 "scope_input": int(len(data)),
                 "after_hard_filter": int(len(filtered)),
@@ -581,16 +505,26 @@ class XuanguFenxiFuWu:
                 "factor_panel": panel_meta,
                 "realtime_snapshot": realtime_meta,
             },
-            "ranking_methodology": {
-                "components": list(settings["component_weights"].keys()),
-                "component_weights": settings["component_weights"],
-                "factor_group_weights": settings["factor_group_weights"],
-                "missing_evidence": "不可用组件不按失败处理；其余有效证据重新归一，同时降低可信度",
-                "llm_boundary": "LLM只能解释程序结果，不得修改数值、条件状态和排序",
+            "selection_methodology": {
+                "method": "explicit_conditions_then_pareto_fronts",
+                "conditions": "价格和短均线高于MA20、5/20日收益为正且MACD柱为正、20日跑赢沪深300、5/20日量比不低于1、波动未超过上限、深度复核与可交易性通过",
+                "comparison_dimensions": ["20日相对沪深300超额", "5日收益", "20日收益", "20日波动（越低越好）", "完整日线真实成交额"],
+                "ranking_basis": "满足条件后按多维不劣且至少一维更优的关系分层；同层按成交额和代码稳定展示，不代表上涨概率高低",
+                "sampling_limit": "只比较本次抽样取得并完成复核的候选，不等于已经遍历全市场所有机会",
+                "missing_evidence": "必需条件缺失不能视为通过，保留原因供复核",
+                "llm_boundary": "解释实际指标与证据冲突，不生成分数、权重或上涨概率，不将候选排序说成经验证的概率排名",
             },
             "research_scope": "公开数据研究排序，不连接证券账户、不提交委托、不自动交易",
-            "_prediction_context": prediction_context,
         }
+        if technical_errors:
+            result.update({
+                "error_code": "candidate_technical_review_error",
+                "stage": "technical_analysis",
+                "error": "技术复核发生程序错误；已保留候选证据供排查，本次不发布筛选候选",
+                "technical_review_errors": technical_errors,
+                "next_action": "修复技术复核错误后重新获取数据并诊断",
+                "retryable": False,
+            })
         return result
 
 

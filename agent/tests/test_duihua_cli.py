@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 import cli
 import src.duihua.huihua as huihua_module
 import src.preflight as preflight_module
@@ -11,15 +13,16 @@ from src.duihua.huihua import DuihuaCunchu
 
 
 class _FakeAgent:
-    def __init__(self) -> None:
+    def __init__(self, status: str = "success") -> None:
         self.calls: list[dict] = []
+        self.status = status
 
     def run(self, user_message, history=None, session_id=""):
         prior = copy.deepcopy(history or [])
         self.calls.append({"prompt": user_message, "history": prior, "session_id": session_id})
         answer = f"回答：{user_message}"
         return {
-            "status": "success",
+            "status": self.status,
             "content": answer,
             "run_id": f"run_{len(self.calls)}",
             "history": prior + [
@@ -29,8 +32,9 @@ class _FakeAgent:
         }
 
 
-def test_chat_reuses_history_and_saves_session(tmp_path, monkeypatch) -> None:
-    fake_agent = _FakeAgent()
+@pytest.mark.parametrize("status", ["success", "reanalysis_required", "information_insufficient"])
+def test_chat_reuses_history_and_saves_session(tmp_path, monkeypatch, status) -> None:
+    fake_agent = _FakeAgent(status)
     prompts = iter(["分析贵州茅台", "那它未来三天呢？", "/exit"])
     monkeypatch.setattr(huihua_module, "DUIHUA_MULU", tmp_path)
     monkeypatch.setattr(preflight_module, "run_preflight", lambda console: [])

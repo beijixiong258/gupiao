@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from enum import Enum
@@ -199,7 +199,7 @@ class DongcaiFanweiShujuYuan:
                     "fs": f"b:{scope.code} f:!50",
                     "fields": (
                         "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,"
-                        "f15,f16,f17,f18,f20,f21,f23"
+                        "f15,f16,f17,f18,f20,f21,f23,f124"
                     ),
                 },
             )
@@ -403,165 +403,106 @@ def faxian_fenxi_fanwei(
 
     def checked(
         items: Iterable[tuple[float, str, ShichangFanwei]],
-    ) -> tuple[list[tuple[float, str, ShichangFanwei, dict[str, Any]]], list[str]]:
-        verified: list[tuple[float, str, ShichangFanwei, dict[str, Any]]] = []
-        errors: list[str] = []
+    ) -> tuple[ShichangFanwei, ...]:
+        """保留所有目录候选；详情失败和核验上限都不构成排除候选的证据。"""
+        candidates: list[ShichangFanwei] = []
         verifier = getattr(source, "hedui_fanwei", None)
-        if not callable(verifier):
-            return [], ["当前范围数据源没有提供详情页核验能力"]
-        for score, basis, scope in items:
+        for index, (score, basis, scope) in enumerate(items):
             try:
-                verification = verifier(scope)
-                if verification.get("verified") is True:
-                    verified.append((score, basis, scope, verification))
+                if index >= 4:
+                    verification = {
+                        "status": "not_checked",
+                        "verified": False,
+                        "error_code": "scope_verification_limit_reached",
+                        "error": "本次详情核验已达到请求上限，候选仍待核验",
+                        "retryable": True,
+                    }
+                elif not callable(verifier):
+                    verification = {
+                        "status": "unavailable",
+                        "verified": False,
+                        "error_code": "scope_verifier_unavailable",
+                        "error": "当前范围数据源没有提供详情页核验能力",
+                        "retryable": False,
+                    }
                 else:
-                    errors.append(
-                        f"{scope.canonical_name} 的目录记录与详情页存在冲突"
-                    )
+                    verification = dict(verifier(scope))
+                    if verification.get("verified") is not True:
+                        verification.setdefault("status", "conflict")
+                        verification["verified"] = False
+                        verification.setdefault("error_code", "scope_detail_conflict")
+                        verification.setdefault("error", "目录记录与详情页存在冲突")
+                        verification.setdefault("retryable", True)
             except Exception as exc:
-                errors.append(
-                    f"{scope.canonical_name} 详情核验失败：{' '.join(str(exc).split())[:120]}"
-                )
-        return verified, errors
-
-    semantic_exact = [item for item in scored if item[0] >= 0.97]
-    if len(semantic_exact) == 1:
-        verified_exact, _ = checked(semantic_exact)
-        if not verified_exact:
-            return FanweiFaxianJieguo(
-                status="unavailable",
-                error_code="scope_verification_unavailable",
-                message="实时目录找到了候选，但详情页二次核验没有通过，不能据此继续分析",
-                retryable=True,
-                next_action="稍后重试关键事实核验；程序不会盲信单次目录响应",
-                **common,
-            )
-        score, basis, scope, verification = verified_exact[0]
-        resolution = "explicit_scope_hint" if hint is not None else "unique_exact_live_catalog_match"
-        return FanweiFaxianJieguo(
-            status="resolved",
-            scope=_with_match(
-                scope,
-                requested_name=original,
-                score=score,
-                basis=basis,
-                resolution=resolution,
-                metadata=metadata,
-                verification=verification,
-            ),
-            **common,
-        )
-    if len(semantic_exact) > 1:
-        verified_exact, _ = checked(semantic_exact[:4])
-        if not verified_exact:
-            return FanweiFaxianJieguo(
-                status="unavailable",
-                error_code="scope_verification_unavailable",
-                message="实时目录返回了多个候选，但详情页二次核验当前不可用",
-                retryable=True,
-                next_action="稍后重试；在关键事实未核验前不生成候选池",
-                **common,
-            )
-        if len(verified_exact) == 1:
-            score, basis, scope, verification = verified_exact[0]
-            return FanweiFaxianJieguo(
-                status="resolved",
-                scope=_with_match(
+                verification = {
+                    "status": "unavailable",
+                    "verified": False,
+                    "source": "eastmoney_board_detail_verification",
+                    "checked_at": _beijing_now_text(),
+                    "error_code": getattr(exc, "error_code", "scope_detail_unavailable"),
+                    "error": " ".join(str(exc).split())[:120],
+                    "retryable": bool(getattr(exc, "retryable", True)),
+                    "attempted_providers": [
+                        item.to_dict() for item in getattr(exc, "attempts", ())
+                    ],
+                }
+            candidates.append(
+                _with_match(
                     scope,
                     requested_name=original,
                     score=score,
                     basis=basis,
-                    resolution="unique_candidate_after_detail_verification",
+                    resolution=(
+                        "user_choice_required"
+                        if verification.get("verified") is True
+                        else "verification_required"
+                    ),
                     metadata=metadata,
                     verification=verification,
-                ),
-                **common,
+                )
             )
-        candidates = tuple(
-            _with_match(
-                scope,
-                requested_name=original,
-                score=score,
-                basis=basis,
-                resolution="user_choice_required",
-                metadata=metadata,
-                verification=verification,
-            )
-            for score, basis, scope, verification in verified_exact
-        )
+        return tuple(candidates)
+
+    semantic_exact = [item for item in scored if item[0] >= 0.97]
+    plausible = [item for item in scored if item[0] >= 0.72]
+    nearest = [item for item in scored[:4] if item[0] >= 0.45]
+    candidates = checked(semantic_exact or plausible or nearest)
+    pending = [candidate for candidate in candidates if candidate.verification.get("verified") is not True]
+    if pending:
         return FanweiFaxianJieguo(
-            status="clarification_required",
+            status="unavailable",
             candidates=candidates,
-            error_code="scope_ambiguous",
-            message="实时数据源里有多个名称相近但成分不同的范围，请选择一个",
-            next_action="只需用通俗名称选择一次，不需要理解内部分类或代码",
+            error_code="scope_verification_unavailable",
+            message="实时目录找到了候选，但部分详情页二次核验没有通过，不能据此自动确定分析范围",
+            retryable=any(candidate.verification.get("retryable") is True for candidate in pending),
+            next_action="请根据候选及核验原因判断是否重试或补充范围；未核验候选不能视为已被排除",
             **common,
         )
-    plausible = [item for item in scored if item[0] >= 0.72]
-    if plausible:
-        verified_plausible, _ = checked(plausible[:4])
-        if not verified_plausible:
-            return FanweiFaxianJieguo(
-                status="unavailable",
-                error_code="scope_verification_unavailable",
-                message="可能的范围未能通过详情页二次核验，当前不适合继续推断",
-                retryable=True,
-                next_action="稍后重试关键事实核验",
-                **common,
-            )
-        top_score, top_basis, top_scope, top_verification = verified_plausible[0]
-        second_score = verified_plausible[1][0] if len(verified_plausible) > 1 else 0.0
-        if top_score >= 0.87 and top_score - second_score >= 0.08:
-            return FanweiFaxianJieguo(
-                status="resolved",
-                scope=_with_match(
-                    top_scope,
-                    requested_name=original,
-                    score=top_score,
-                    basis=top_basis,
-                    resolution="unique_high_confidence_live_catalog_match",
-                    metadata=metadata,
-                    verification=top_verification,
-                ),
-                **common,
-            )
-        candidates = tuple(
-            _with_match(
-                scope,
-                requested_name=original,
-                score=score,
-                basis=basis,
-                resolution="user_choice_required",
-                metadata=metadata,
-                verification=verification,
-            )
-            for score, basis, scope, verification in verified_plausible
+    resolution: str | None = None
+    if len(semantic_exact) == 1 and candidates:
+        resolution = "explicit_scope_hint" if hint is not None else "unique_exact_live_catalog_match"
+    elif not semantic_exact and plausible and candidates:
+        second_score = candidates[1].match_score if len(candidates) > 1 else 0.0
+        if candidates[0].match_score >= 0.87 and candidates[0].match_score - second_score >= 0.08:
+            resolution = "unique_high_confidence_live_catalog_match"
+    if resolution is not None:
+        return FanweiFaxianJieguo(
+            status="resolved",
+            scope=replace(candidates[0], ambiguity_resolution=resolution),
+            **common,
         )
+    if semantic_exact or plausible:
         return FanweiFaxianJieguo(
             status="clarification_required",
             candidates=candidates,
             error_code="scope_ambiguous",
             message="实时数据源里有几个可能的范围，请选择最符合你意思的一个",
-            next_action="只需选择一次；也可以直接输入自己的说法",
+            next_action="只需用通俗名称选择一次，不需要理解内部分类或代码",
             **common,
         )
-    nearest_raw = [item for item in scored[:4] if item[0] >= 0.45]
-    verified_nearest, _ = checked(nearest_raw) if nearest_raw else ([], [])
-    nearest = tuple(
-        _with_match(
-            scope,
-            requested_name=original,
-            score=score,
-            basis=basis,
-            resolution="user_choice_required",
-            metadata=metadata,
-            verification=verification,
-        )
-        for score, basis, scope, verification in verified_nearest
-    )
     return FanweiFaxianJieguo(
         status="clarification_required",
-        candidates=nearest,
+        candidates=candidates,
         error_code="scope_not_found",
         message=f"已取得实时目录，但没有可靠识别“{original}”具体指哪个范围",
         next_action="请换一种日常说法，或从候选中选择；不需要提供专业分类",

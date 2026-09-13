@@ -1,4 +1,4 @@
-"""Leak-aware daily-frequency factors shared by stock and board models."""
+"""Deterministic daily-frequency factors and market context for stock analysis."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pandas as pd
 
 from src.ashare.shichang_shuju import akshare_zhilian
 from src.ashare.shuju_yuan import _tushare_pro
-from src.ashare.yinzi_gongcheng import add_factor_composites
+from src.ashare.yinzi_gongcheng import describe_factor_coverage
 
 
 BENCHMARKS = {
@@ -63,84 +63,12 @@ DAILY_FACTOR_FEATURE_COLUMNS = [
     "size_neutral_volume_ratio_5_20",
     "size_neutral_volatility_20",
     "size_neutral_log_amount_yuan",
-    "market_regime_score",
     "market_regime_weak",
     "market_regime_sideways",
     "market_regime_strong",
     "market_regime_trend_breadth_interaction",
     "market_regime_volatility_stress",
 ] + BENCHMARK_FEATURE_COLUMNS
-
-_DAILY_BASIC_FIELDS = ["turnover_rate", "pe_ttm", "pb", "total_mv", "circ_mv"]
-
-
-def _normalize_daily_basic(frame: pd.DataFrame, code: str) -> pd.DataFrame:
-    if frame is None or frame.empty:
-        return pd.DataFrame(columns=["ts_code", "trade_date"] + _DAILY_BASIC_FIELDS)
-    data = frame.copy()
-    if "ts_code" not in data.columns:
-        data["ts_code"] = code
-    data["ts_code"] = data["ts_code"].astype(str)
-    data["trade_date"] = pd.to_datetime(data.get("trade_date"), errors="coerce").dt.normalize()
-    for column in _DAILY_BASIC_FIELDS:
-        data[column] = pd.to_numeric(data.get(column), errors="coerce")
-    return (
-        data[["ts_code", "trade_date"] + _DAILY_BASIC_FIELDS]
-        .dropna(subset=["trade_date"])
-        .drop_duplicates(["ts_code", "trade_date"], keep="last")
-        .sort_values("trade_date")
-        .reset_index(drop=True)
-    )
-
-
-def _historical_daily_basic(
-    *,
-    codes: list[str],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    warnings: list[str] = []
-    frames: list[pd.DataFrame] = []
-    requests_attempted = 0
-    try:
-        pro = _tushare_pro()
-    except Exception as exc:
-        return pd.DataFrame(), {
-            "status": "unavailable",
-            "source": "tushare_daily_basic",
-            "warnings": warnings + [f"历史日频估值不可用：{exc}"],
-            "merge_rule": "仅按股票代码和同一交易日精确合并，不向前或向后填充",
-        }
-
-    for code in sorted(set(codes)):
-        try:
-            requests_attempted += 1
-            raw = pro.daily_basic(
-                ts_code=code,
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-                fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv,circ_mv",
-            )
-            data = _normalize_daily_basic(raw, code)
-        except Exception as exc:
-            warnings.append(f"{code} 历史日频估值获取失败：{exc}")
-            data = pd.DataFrame()
-        if not data.empty:
-            frames.append(data[(data["trade_date"] >= start) & (data["trade_date"] <= end)])
-
-    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return combined, {
-        "status": "ok" if not combined.empty else "unavailable",
-        "source": "tushare_daily_basic",
-        "stocks_requested": int(len(set(codes))),
-        "stocks_with_rows": int(combined["ts_code"].nunique()) if not combined.empty else 0,
-        "rows": int(len(combined)),
-        "network_requests": requests_attempted,
-        "persistence": "none",
-        "merge_rule": "仅按股票代码和同一交易日精确合并，不向前或向后填充",
-        "warnings": warnings,
-    }
-
 
 def _normalize_index_history(frame: pd.DataFrame, *, tushare: bool) -> pd.DataFrame:
     if frame is None or frame.empty:
@@ -248,54 +176,109 @@ def _benchmark_features(
     }
 
 
-def _group_snapshot(data: pd.DataFrame, mask: pd.Series, prefix: str) -> pd.DataFrame:
+_MINIMUM_INDUSTRY_STOCKS = 5
+
+
+def _group_snapshot(
+    data: pd.DataFrame,
+    mask: pd.Series,
+    prefix: str,
+    *,
+    group_columns: tuple[str, ...] = ("trade_date",),
+    minimum_stocks: int = 2,
+) -> pd.DataFrame:
+    aggregations = {
+        f"{prefix}_mean_ret_1": ("ret_1", "mean"),
+        f"{prefix}_mean_ret_5": ("ret_5", "mean"),
+        f"{prefix}_mean_ret_20": ("ret_20", "mean"),
+        f"{prefix}_dispersion_ret_5": ("ret_5", "std"),
+        f"{prefix}_breadth_above_ma20": (
+            "ma_gap_20", lambda values: values.gt(0).where(values.notna()).mean()
+        ),
+        f"{prefix}_breadth_positive_5d": (
+            "ret_5", lambda values: values.gt(0).where(values.notna()).mean()
+        ),
+    }
     subset = data.loc[mask].copy()
     if subset.empty:
-        return pd.DataFrame(columns=["trade_date"])
-    result = subset.groupby("trade_date", as_index=False).agg(
-        **{
-            f"{prefix}_mean_ret_1": ("ret_1", "mean"),
-            f"{prefix}_mean_ret_5": ("ret_5", "mean"),
-            f"{prefix}_mean_ret_20": ("ret_20", "mean"),
-            f"{prefix}_dispersion_ret_5": ("ret_5", "std"),
-            f"{prefix}_breadth_above_ma20": (
-                "ma_gap_20",
-                lambda values: values.gt(0).where(values.notna()).mean(),
-            ),
-            f"{prefix}_breadth_positive_5d": (
-                "ret_5",
-                lambda values: values.gt(0).where(values.notna()).mean(),
-            ),
-        }
-    )
-    return result
+        return pd.DataFrame(columns=[*group_columns, *aggregations, f"{prefix}_sample_count"])
+    grouped = subset.groupby(list(group_columns), sort=True)
+    result = grouped.agg(**aggregations)
+    stock_counts = grouped["ts_code"].nunique()
+    valid_counts = grouped[list({source for source, _ in aggregations.values()})].count()
+    for output, (source, _) in aggregations.items():
+        result[output] = result[output].where(
+            stock_counts.ge(minimum_stocks) & valid_counts[source].ge(minimum_stocks)
+        )
+    result[f"{prefix}_sample_count"] = stock_counts
+    return result.reset_index()
 
+
+def _add_industry_context(data: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """按真实当前行业标签分组；单股角色只限定参照成员，不代替行业身份。"""
+    result = data.copy()
+    industry = result.get("industry", pd.Series("", index=result.index)).fillna("").astype(str).str.strip()
+    industry = industry.where(~industry.str.lower().isin({"", "nan", "none", "null", "<na>", "未知", "未知行业"}), "")
+    result["industry"] = industry
+    roles = result.get("peer_role", pd.Series("", index=result.index)).fillna("").astype(str)
+    has_roles = roles.ne("").any()
+    target_industry = None
+    mismatch_stocks = 0
+    if has_roles:
+        target_labels = industry[roles.eq("target") & industry.ne("")].drop_duplicates()
+        target_industry = str(target_labels.iloc[0]) if len(target_labels) == 1 else None
+        role_mask = roles.isin(["target", "same_industry"])
+        matching = industry.eq(target_industry) if target_industry else pd.Series(False, index=result.index)
+        mask = role_mask & matching & industry.ne("")
+        mismatch_stocks = int(result.loc[role_mask & ~matching, "ts_code"].nunique())
+        stats = _group_snapshot(result, mask, "industry", minimum_stocks=_MINIMUM_INDUSTRY_STOCKS)
+        result = result.merge(stats, on="trade_date", how="left")
+        method = "目标股票与真实同业标签一致的角色成员，按交易日计算等权参照"
+    else:
+        stats = _group_snapshot(
+            result, industry.ne(""), "industry",
+            group_columns=("trade_date", "industry"), minimum_stocks=_MINIMUM_INDUSTRY_STOCKS,
+        )
+        result = result.merge(stats, on=["trade_date", "industry"], how="left")
+        method = "当前比较池内按交易日与真实行业标签分组的等权参照"
+    result["industry_sample_count"] = pd.to_numeric(result["industry_sample_count"], errors="coerce").fillna(0)
+    context_columns = [column for column in stats.columns if column.startswith("industry_") and column != "industry_sample_count"]
+    available = bool(result[context_columns].notna().any().any()) if context_columns else False
+    missing_labels = int(data.loc[industry.eq(""), "ts_code"].nunique())
+    insufficient_groups = int((pd.to_numeric(stats["industry_sample_count"], errors="coerce") < _MINIMUM_INDUSTRY_STOCKS).sum())
+    warnings: list[str] = []
+    if missing_labels:
+        warnings.append(f"{missing_labels} 只股票缺少真实行业标签，不以整个比较池代替行业")
+    if insufficient_groups:
+        warnings.append(f"{insufficient_groups} 个行业交易日分组不足 {_MINIMUM_INDUSTRY_STOCKS} 只股票，行业证据留空")
+    if mismatch_stocks:
+        warnings.append(f"{mismatch_stocks} 只角色成员缺少或不匹配目标真实行业，未纳入同行统计")
+    return result, {
+        "status": "ok" if available else "unavailable",
+        "method": method,
+        "minimum_stocks": _MINIMUM_INDUSTRY_STOCKS,
+        "minimum_valid_observations_per_field": _MINIMUM_INDUSTRY_STOCKS,
+        "target_industry": target_industry,
+        "missing_industry_stocks": missing_labels,
+        "excluded_role_stocks": mismatch_stocks,
+        "insufficient_group_dates": insufficient_groups,
+        "scope": "当前比较池及本次真实标签，不是历史行业完整成分或全市场统计",
+        "warnings": warnings,
+    }
 
 def _add_market_regime_features(data: pd.DataFrame) -> pd.DataFrame:
-    """Build point-in-time market-state features from fixed, interpretable thresholds."""
+    """市场状态来自明确的方向与广度条件，不合成加权分数。"""
     result = data.copy()
-    trend = (pd.to_numeric(result.get("market_csi300_ret_20"), errors="coerce") / 0.10).clip(-1.0, 1.0)
-    breadth = (
-        (pd.to_numeric(result.get("universe_breadth_above_ma20"), errors="coerce") - 0.50)
-        / 0.30
-    ).clip(-1.0, 1.0)
-    volatility_stress = (
-        (pd.to_numeric(result.get("market_csi300_volatility_20"), errors="coerce") - 0.20)
-        / 0.25
-    ).clip(0.0, 1.0)
-
-    core_weight = 0.55 * trend.notna().astype(float) + 0.35 * breadth.notna().astype(float)
-    core_score = (
-        0.55 * trend.fillna(0.0) + 0.35 * breadth.fillna(0.0)
-    ) / core_weight.replace(0.0, np.nan)
-    score = (core_score - 0.10 * volatility_stress.fillna(0.0)).clip(-1.0, 1.0)
-
-    result["market_regime_score"] = score
-    result["market_regime_weak"] = score.le(-0.20).astype(float).where(score.notna())
-    result["market_regime_sideways"] = score.gt(-0.20).mul(score.lt(0.20)).astype(float).where(score.notna())
-    result["market_regime_strong"] = score.ge(0.20).astype(float).where(score.notna())
+    trend = pd.to_numeric(result.get("market_csi300_ret_20"), errors="coerce")
+    breadth = pd.to_numeric(result.get("universe_breadth_above_ma20"), errors="coerce")
+    valid = trend.notna() & breadth.notna()
+    strong = trend.gt(0) & breadth.gt(0.5)
+    weak = trend.lt(0) & breadth.lt(0.5)
+    result["market_regime_strong"] = strong.astype(float).where(valid)
+    result["market_regime_weak"] = weak.astype(float).where(valid)
+    result["market_regime_sideways"] = (~strong & ~weak).astype(float).where(valid)
     result["market_regime_trend_breadth_interaction"] = trend * breadth
-    result["market_regime_volatility_stress"] = volatility_stress
+    result["market_regime_volatility_stress"] = pd.to_numeric(result.get("market_csi300_volatility_20"), errors="coerce")
     return result
 
 
@@ -319,57 +302,27 @@ def enrich_daily_factor_panel(
     panel: pd.DataFrame,
     *,
     source: str,
-    include_historical_valuation: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Add exact-date valuation, benchmark, group and size-neutral daily factors."""
+    """Add benchmark, group and size-neutral factors from supplied daily evidence."""
     if panel is None or panel.empty:
-        return pd.DataFrame(), {"status": "unavailable", "warnings": ["模型面板为空"]}
+        return pd.DataFrame(), {"status": "unavailable", "warnings": ["分析因子面板为空"]}
     data = panel.copy()
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
     data = data.dropna(subset=["trade_date"]).sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     start = pd.Timestamp(data["trade_date"].min()).normalize()
     end = pd.Timestamp(data["trade_date"].max()).normalize()
-    codes = data["ts_code"].astype(str).drop_duplicates().tolist()
 
     if "amount_yuan" not in data.columns:
         data["amount_yuan"] = np.nan
     data["log_amount_yuan"] = np.log1p(pd.to_numeric(data["amount_yuan"], errors="coerce").clip(lower=0))
 
-    valuation_meta: dict[str, Any]
-    if include_historical_valuation:
-        daily_basic, valuation_meta = _historical_daily_basic(codes=codes, start=start, end=end)
-        if not daily_basic.empty:
-            daily_basic = daily_basic.rename(
-                columns={column: f"daily_basic_{column}" for column in _DAILY_BASIC_FIELDS}
-            )
-            data = data.merge(daily_basic, on=["ts_code", "trade_date"], how="left")
-    else:
-        valuation_meta = {
-            "status": "disabled",
-            "merge_rule": "仅按股票代码和同一交易日精确合并，不向前或向后填充",
-            "warnings": [],
-        }
-    for column in _DAILY_BASIC_FIELDS:
-        exact_column = f"daily_basic_{column}"
-        if exact_column not in data.columns:
-            data[exact_column] = np.nan
+    # 分析只消费调用方已提供的日频证据；缺失估值字段留空，最新横截面
+    # 的换手和市值由分析汇总层补入，不逐股下载历史估值。
+    for column in ("turnover_rate_daily", "log_circ_mv", "earnings_yield_ttm", "book_to_price"):
+        if column not in data.columns:
+            data[column] = np.nan
         else:
-            data[exact_column] = pd.to_numeric(data[exact_column], errors="coerce")
-    data["turnover_rate_daily"] = data["daily_basic_turnover_rate"] / 100.0
-    data["log_circ_mv"] = np.log(pd.to_numeric(data["daily_basic_circ_mv"], errors="coerce") * 10000.0).replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-    data["earnings_yield_ttm"] = (
-        1.0 / data["daily_basic_pe_ttm"].where(data["daily_basic_pe_ttm"] > 0)
-    ).replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-    data["book_to_price"] = (1.0 / data["daily_basic_pb"].where(data["daily_basic_pb"] > 0)).replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
+            data[column] = pd.to_numeric(data[column], errors="coerce")
 
     benchmark, benchmark_meta = _benchmark_features(start=start, end=end, source=source)
     if not benchmark.empty:
@@ -381,18 +334,9 @@ def enrich_daily_factor_panel(
     universe = _group_snapshot(data, pd.Series(True, index=data.index), "universe")
     data = data.merge(universe, on="trade_date", how="left")
     data = _add_market_regime_features(data)
-    if "peer_role" in data.columns and data["peer_role"].notna().any():
-        roles = data["peer_role"].fillna("").astype(str)
-        industry_mask = roles.isin(["target", "same_industry"])
-        market_reference_mask = roles.eq("market_reference")
-        industry_method = "目标股票与当前同行的日频等权截面代理"
-    else:
-        industry_mask = pd.Series(True, index=data.index)
-        market_reference_mask = pd.Series(False, index=data.index)
-        industry_method = "当前板块成分股日频等权截面代理"
-    industry = _group_snapshot(data, industry_mask, "industry")
-    market_reference = _group_snapshot(data, market_reference_mask, "market_reference")
-    data = data.merge(industry, on="trade_date", how="left")
+    data, industry_meta = _add_industry_context(data)
+    roles = data.get("peer_role", pd.Series("", index=data.index)).fillna("").astype(str)
+    market_reference = _group_snapshot(data, roles.eq("market_reference"), "market_reference")
     if not market_reference.empty:
         data = data.merge(market_reference, on="trade_date", how="left")
     for period in [1, 5, 20]:
@@ -430,22 +374,23 @@ def enrich_daily_factor_panel(
             data[output_column] = np.nan
 
     data = data.replace([np.inf, -np.inf], np.nan)
-    data, factor_engineering_meta = add_factor_composites(data)
+    data, factor_engineering_meta = describe_factor_coverage(data)
     feature_coverage = {
         column: round(float(data[column].notna().mean()), 4)
         for column in DAILY_FACTOR_FEATURE_COLUMNS
         if column in data.columns
     }
-    warnings = list(valuation_meta.get("warnings", [])) + list(benchmark_meta.get("warnings", []))
+    warnings = list(benchmark_meta.get("warnings", [])) + list(industry_meta["warnings"])
     return data, {
         "status": "ok",
         "frequency": "daily_k_only",
-        "historical_valuation": valuation_meta,
         "market_benchmarks": benchmark_meta,
-        "industry_factor_method": industry_method,
+        "industry_factor_method": industry_meta["method"],
+        "industry_factor_quality": industry_meta,
+        "universe_factor_scope": "仅本次比较池的日频统计，不代表全市场完整广度",
         "industry_membership_bias": "当前同行或当前板块成分回看历史，不能冒充历史时点成分快照",
-        "size_neutralization": "逐交易日用历史流通市值对指定因子做线性残差化；不足5只有效股票时留空",
-        "market_regime_method": "仅使用当日可见的沪深300近20日收益、市场宽度和20日波动率，按固定阈值生成弱市/震荡市/强市状态",
+        "size_neutralization": "逐交易日用已提供的同日流通市值对指定因子做线性残差化；字段缺失或不足5只有效股票时留空",
+        "market_regime_method": "沪深300近20日收益为正且比较池过半位于MA20之上为偏强；两者反向为偏弱；未同时偏强或偏弱为方向分歧或中性，不代表个股横盘。原始波动率单列，不加权",
         "feature_coverage": feature_coverage,
         "factor_engineering": factor_engineering_meta,
         "warnings": warnings,

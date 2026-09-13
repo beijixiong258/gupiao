@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI for the personal A-share analysis and three-trading-day forecast tool."""
+"""CLI for personal A-share evidence analysis and stock diagnosis."""
 
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
         print(json.dumps(result, ensure_ascii=False))
         return (
             EXIT_SUCCESS
-            if result.get("status") in {"success", "no_recommendation", "clarification_required"}
+            if result.get("status") in {"success", "information_partial", "no_recommendation", "clarification_required"}
             else EXIT_RUN_FAILED
         )
 
@@ -131,10 +131,10 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False) -> int:
     if content := result.get("content"):
         body.append("")
         body.append(_console_safe(content))
-    console.print(Panel(_console_safe("\n".join(body)), title="A股分析与三交易日预测"))
+    console.print(Panel(_console_safe("\n".join(body)), title="A股分析与诊断"))
     return (
         EXIT_SUCCESS
-        if status in {"success", "no_recommendation", "clarification_required"}
+        if status in {"success", "information_partial", "no_recommendation", "clarification_required"}
         else EXIT_RUN_FAILED
     )
 
@@ -199,7 +199,6 @@ def _dayin_dangqian_lishi(huihua: Any) -> None:
 def _chuangjian_jindu_huidiao(status_ref: dict[str, Any]) -> Callable[[str, dict[str, Any]], None]:
     tool_text = {
         "gupiao_fenxi": "正在构建候选池、计算量化因子并整理排序证据...",
-        "gupiao_yuce": "正在按需训练模型并生成未来三个交易日预测...",
         "clarify": "需要你补充一个选择...",
     }
 
@@ -271,7 +270,7 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             "/history        查看当前会话最近内容\n"
             "/help           再次显示命令说明\n"
             "/exit           保存并退出",
-            title="A股分析与三交易日预测 | 连续对话",
+            title="A股分析与诊断 | 连续对话",
         )
     )
 
@@ -389,6 +388,9 @@ def cmd_chat(max_iter: int, *, session_id: str | None = None, new_session: bool 
             "no_recommendation",
             "clarification_required",
             "data_unavailable",
+            "reanalysis_required",
+            "information_insufficient",
+            "information_partial",
         }
         if status in conversation_statuses and content:
             returned_history = result.get("history")
@@ -503,7 +505,7 @@ def cmd_clean_runs(*, confirmed: bool) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="个人 A 股自然语言选股分析与三交易日预测工具")
+    parser = argparse.ArgumentParser(description="个人 A 股自然语言分析与诊断工具")
     sub = parser.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="执行一次自然语言研究")

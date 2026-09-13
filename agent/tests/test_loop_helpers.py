@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from src.agent.context import _ANALYSIS_TOOL_CONTRACT_VERSION
 from src.agent.loop import (
     KEEP_RECENT,
     COLLAPSE_PRESERVE_RECENT,
@@ -271,11 +272,19 @@ class TestAnalysisRunStatus:
         payload = {
             "status": "ok",
             "outcome": "no_recommendation",
-            "tool_contract_version": 7,
+            "tool_contract_version": _ANALYSIS_TOOL_CONTRACT_VERSION,
             "analysis_id": "fx_test",
             "analysis_stage": {"status": "completed"},
         }
         assert _analysis_run_status(payload) == "no_recommendation"
+
+    def test_partial_evidence_stays_partial_without_turning_into_failure(self) -> None:
+        payload = {
+            "status": "partial", "outcome": "information_partial",
+            "tool_contract_version": _ANALYSIS_TOOL_CONTRACT_VERSION,
+            "analysis_id": "fx_partial", "analysis_stage": {"status": "completed"},
+        }
+        assert _analysis_run_status(payload) == "information_partial"
 
 
 # ---------------------------------------------------------------------------

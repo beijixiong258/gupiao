@@ -38,7 +38,6 @@ _STATE_LABELS = {
 class HuimaqiangJieguo:
     state: HuimaqiangZhuangtai
     eligible: bool
-    score: float | None
     baseline_date: str | None
     shrink_date: str | None
     breakout_date: str | None
@@ -54,7 +53,7 @@ class HuimaqiangJieguo:
             "state": self.state.value,
             "state_label": _STATE_LABELS[self.state],
             "eligible": self.eligible,
-            "score_0_100": self.score,
+
             "baseline_date": self.baseline_date,
             "shrink_date": self.shrink_date,
             "breakout_date": self.breakout_date,
@@ -70,7 +69,7 @@ class HuimaqiangJieguo:
             "conditions": self.conditions,
             "evidence": list(self.evidence),
             "failure_reasons": list(self.failure_reasons),
-            "score_definition": "形态阶段强度分，只用于综合排序增强，不是上涨概率",
+
         }
 
 
@@ -118,14 +117,6 @@ def _zhengli_lishi(history: pd.DataFrame) -> pd.DataFrame:
     else:
         data["pre_close"] = data["pre_close"].fillna(data["close"].shift(1))
     return data
-
-
-def _zhuangtai_fenshu(state: HuimaqiangZhuangtai, config: dict[str, Any]) -> float | None:
-    if state is HuimaqiangZhuangtai.WU_XINGTAI:
-        return None
-    value = (config.get("state_scores") or {}).get(state.value)
-    number = _number(value)
-    return round(number, 2) if number is not None else None
 
 
 def _fenxi_jizhunri(
@@ -184,7 +175,7 @@ def _fenxi_jizhunri(
         return HuimaqiangJieguo(
             state=state,
             eligible=True,
-            score=_zhuangtai_fenshu(state, config),
+
             baseline_date=baseline_date,
             shrink_date=None,
             breakout_date=None,
@@ -261,7 +252,7 @@ def _fenxi_jizhunri(
             return HuimaqiangJieguo(
                 state=state,
                 eligible=True,
-                score=_zhuangtai_fenshu(state, config),
+
                 baseline_date=baseline_date,
                 shrink_date=shrink_date,
                 breakout_date=breakout_date,
@@ -275,7 +266,7 @@ def _fenxi_jizhunri(
         return HuimaqiangJieguo(
             state=state,
             eligible=True,
-            score=_zhuangtai_fenshu(state, config),
+
             baseline_date=baseline_date,
             shrink_date=shrink_date,
             breakout_date=breakout_date,
@@ -316,7 +307,7 @@ def _fenxi_jizhunri(
             return HuimaqiangJieguo(
                 state=state,
                 eligible=True,
-                score=_zhuangtai_fenshu(state, config),
+
                 baseline_date=baseline_date,
                 shrink_date=shrink_date,
                 breakout_date=None,
@@ -342,7 +333,7 @@ def _fenxi_jizhunri(
     return HuimaqiangJieguo(
         state=state,
         eligible=True,
-        score=_zhuangtai_fenshu(state, config),
+
         baseline_date=baseline_date,
         shrink_date=shrink_date,
         breakout_date=None,
@@ -368,7 +359,7 @@ def fenxi_zhangting_huimaqiang(
         return HuimaqiangJieguo(
             state=HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=False,
-            score=None,
+
             baseline_date=None,
             shrink_date=None,
             breakout_date=None,
@@ -383,7 +374,7 @@ def fenxi_zhangting_huimaqiang(
         return HuimaqiangJieguo(
             state=HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=True,
-            score=None,
+
             baseline_date=None,
             shrink_date=None,
             breakout_date=None,
@@ -406,7 +397,7 @@ def fenxi_zhangting_huimaqiang(
         return HuimaqiangJieguo(
             state=HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=True,
-            score=None,
+
             baseline_date=None,
             shrink_date=None,
             breakout_date=None,

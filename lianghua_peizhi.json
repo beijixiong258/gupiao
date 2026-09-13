@@ -24,21 +24,7 @@
   "dangu": {
     "history_calendar_days": 1440,
     "max_peer_stocks": 20,
-    "same_industry_stocks": 16,
-    "minimum_peer_stocks": 8,
-    "minimum_history_rows": 180,
-    "min_listing_calendar_days": 180,
-    "min_amount_yuan": 30000000,
-    "request_pause_seconds": 0.08,
-    "walk_forward_folds": 6,
-    "validation_window_days": 45,
-    "minimum_training_dates": 120,
-    "min_fold_training_samples": 500,
-    "min_fold_validation_samples": 80,
-    "min_passed_folds": 4,
-    "min_feature_coverage": 0.2,
-    "assessment_min_net_return": 0.003,
-    "assessment_min_positive_probability": 0.55
+    "same_industry_stocks": 16
   },
   "fenxi": {
     "history_calendar_days": 420,
@@ -50,13 +36,7 @@
     "minimum_history_session_coverage": 0.9,
     "minimum_listing_calendar_days": 180,
     "min_amount_yuan": 50000000,
-    "minimum_recommendation_score": 60,
-    "minimum_confidence": 0.6,
-    "risk_penalty_max": 30,
-    "near_limit_up_penalty": 8,
     "high_volatility_threshold": 0.55,
-    "high_volatility_penalty": 6,
-    "fundamental_deep_weight": 0.65,
     "macd_structure": {
       "zero_near_threshold_pct": 0.005,
       "pivot_left_sessions": 2,
@@ -73,8 +53,18 @@
       "invalidation_price_tolerance_pct": 0.005
     },
     "macd_structure_validation": {
-      "forward_horizons": [1, 3, 5, 10, 20],
-      "decision_horizons": [5, 10, 20],
+      "forward_horizons": [
+        1,
+        3,
+        5,
+        10,
+        20
+      ],
+      "decision_horizons": [
+        5,
+        10,
+        20
+      ],
       "minimum_signal_history_sessions": 80,
       "amount_window_sessions": 20,
       "target_notional_yuan": 20000,
@@ -89,22 +79,6 @@
       "minimum_favorable_sign_agreement": 0.75,
       "confidence_z": 1.96,
       "parameter_sensitivity_enabled": true
-    },
-    "component_weights": {
-      "daily_factors": 0.65,
-      "fundamental": 0.15,
-      "pattern": 0.1,
-      "late_session": 0.1
-    },
-    "factor_group_weights": {
-      "trend_structure": 0.2,
-      "momentum_reversal": 0.12,
-      "candle_pressure": 0.1,
-      "price_volume_confirmation": 0.14,
-      "breakout_pullback_quality": 0.12,
-      "relative_strength": 0.16,
-      "risk_liquidity": 0.1,
-      "market_context": 0.06
     }
   },
   "xingtai": {
@@ -112,16 +86,7 @@
     "shrink_window_sessions": 7,
     "breakout_deadline_sessions": 14,
     "shrink_volume_ratio_max": 0.5,
-    "breakout_volume_median_ratio_min": 1.2,
-    "state_scores": {
-      "adjusting": 40,
-      "extreme_shrink": 55,
-      "waiting_breakout": 65,
-      "intraday_confirmed": 90,
-      "close_confirmed": 100,
-      "invalidated": 0,
-      "expired": 10
-    }
+    "breakout_volume_median_ratio_min": 1.2
   },
   "weipan": {
     "enabled": true,
@@ -130,109 +95,8 @@
     "market_close": "15:00",
     "close_confirmation_time": "15:05",
     "high_time_after": "14:40",
-    "pct_change_high_score_range": [3.0, 5.0],
     "volume_ratio_target_min": 1.0,
-    "turnover_high_score_range": [5.0, 10.0],
-    "circulating_market_value_high_score_range_yuan": [5000000000, 20000000000],
     "max_pullback_from_high_pct": 1.5,
     "minute_candidate_limit": 8
-  },
-  "moxing": {
-    "horizons": [
-      1,
-      2,
-      3
-    ],
-    "validation_ratio": 0.2,
-    "min_training_samples": 500,
-    "min_validation_samples": 100,
-    "min_direction_accuracy": 0.52,
-    "min_mean_daily_rank_ic": 0.03,
-    "min_rank_ic_days": 10,
-    "min_skill_vs_baseline": 0.01,
-    "min_skill_vs_best_naive_baseline": 0.01,
-    "validation_top_n": 3,
-    "min_top_n_days": 10,
-    "validation_subwindows": 6,
-    "min_passed_subwindows": 4,
-    "ranking_enabled": true,
-    "ranking_relevance_grades": 5,
-    "ranking_pair_top_k": 8,
-    "ranking_n_estimators": 180,
-    "ranking_min_ndcg_improvement": 0.0,
-    "return_interval_coverage_range": [
-      0.75,
-      0.85
-    ],
-    "quantile_interval_enabled": true,
-    "quantile_levels": [
-      0.1,
-      0.5,
-      0.9
-    ],
-    "learning_rate": 0.05,
-    "max_iter": 180,
-    "max_leaf_nodes": 15,
-    "max_depth": 4,
-    "min_samples_leaf": 30,
-    "l2_regularization": 1.0,
-    "feature_winsor_quantiles": [
-      0.01,
-      0.99
-    ],
-    "min_feature_coverage": 0.2,
-    "factor_stability_enabled": true,
-    "factor_stability_slices": 6,
-    "factor_min_valid_slices": 4,
-    "factor_min_sign_agreement": 0.67,
-    "factor_min_abs_mean_rank_ic": 0.005,
-    "factor_min_features": 15,
-    "factor_max_features": 20,
-    "factor_max_per_group": 3,
-    "factor_dedup_abs_spearman": 0.8,
-    "direction_logistic_c": 0.5,
-    "direction_logistic_max_iter": 500,
-    "probability_calibration_min_samples": 120,
-    "probability_calibration_evaluation_ratio": 0.3,
-    "probability_calibration_min_brier_improvement": 0.0005,
-    "conformal_coverage": 0.8,
-    "conformal_min_samples": 80,
-    "ensemble_enabled": true,
-    "ridge_alpha": 10.0,
-    "ensemble_default_tree_weight": 0.75,
-    "ensemble_tree_weight_grid": [
-      0.0,
-      0.25,
-      0.5,
-      0.75,
-      1.0
-    ],
-    "ensemble_min_calibration_samples": 80,
-    "ensemble_calibration_ratio": 0.15,
-    "ensemble_min_calibration_dates": 20,
-    "time_decay_enabled": true,
-    "time_decay_half_life_candidates": [
-      0,
-      252,
-      504
-    ],
-    "time_decay_calibration_ratio": 0.15,
-    "time_decay_min_calibration_dates": 20,
-    "time_decay_min_calibration_samples": 80,
-    "time_decay_min_relative_improvement": 0.002,
-    "time_decay_min_weight": 0.1,
-    "random_state": 42,
-    "prediction_clip_quantiles": [
-      0.01,
-      0.99
-    ],
-    "horizon_weights": {
-      "1": 0.5,
-      "2": 0.3,
-      "3": 0.2
-    },
-    "abstain_min_net_return": 0.003,
-    "abstain_min_positive_probability": 0.55,
-    "abstain_min_quality_score": 0.4
   }
 }

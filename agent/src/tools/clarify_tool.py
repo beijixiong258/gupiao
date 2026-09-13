@@ -21,8 +21,7 @@ class ClarifyTool(BaseTool):
     description = (
         "Ask the user one necessary clarification before continuing. Use it when an industry, board, concept, "
         "or another material choice remains genuinely ambiguous. Offer two to four short plain-language choices "
-        "when possible; the UI also accepts a custom answer. Do not use this tool for the post-analysis prediction "
-        "opt-in because the interactive client presents that prompt after the complete analysis answer."
+        "when possible; the UI also accepts a custom answer. "
     )
     parameters = {
         "type": "object",

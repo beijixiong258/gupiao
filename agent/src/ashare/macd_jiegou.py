@@ -1,6 +1,6 @@
 """MACD 结构研判的纯计算模块。
 
-本模块只接收统一日线特征，不访问数据源、不修改评分，也不产生买卖结论。
+本模块只接收统一日线特征，不访问数据源，也不产生买卖结论。
 所有拐点都在右侧确认窗口结束后才可见，避免把未来数据回填到拐点日期。
 """
 
@@ -210,7 +210,7 @@ def _base_result(
         "risk_warnings": [],
         "invalidation_conditions": [],
         "warnings": list(warnings),
-        "score_effect": "仅作为解释性证据，不进入候选排名或预测模型",
+        "selection_use": "结构研判用于解释具体信号及其限制",
         "purpose_statement": "该结果描述指标结构，不是上涨概率、买卖指令或收益承诺",
         "method": {"version": MACD_JIEGOU_METHOD_VERSION, "future_data_used": False},
     }
@@ -946,20 +946,22 @@ def yanpan_macd_jiegou(
     for signal in _active_divergences(divergences, "top"):
         text = f"{signal.confirmation_date} 确认{signal.indicator_label}顶部背离，存在动能衰减风险"
         counter.append(text)
-        risks.append(text + "；该证据当前只提示风险、不扣排名分")
+        risks.append(text + "；需结合价格和成交量复核")
     code, label = _classification(zero_axis, cross, momentum, divergences)
     reliability = (
-        {"code": "high", "label": "有效历史较完整，结构证据可靠性较高"}
+        {"code": "high", "label": "有效历史较完整，结构计算的数据条件较充分"}
         if valid_count >= 80 and not warnings
-        else {"code": "medium", "label": "结构证据可用，但历史长度或数据完整性一般"}
+        else {"code": "medium", "label": "结构计算可用，但历史长度或数据完整性受限"}
         if valid_count >= 40
-        else {"code": "limited", "label": "结构证据可用范围有限，解释时应降低权重"}
+        else {"code": "limited", "label": "结构证据可用范围有限，需补充历史数据后复核"}
     )
+    reliability["meaning"] = "仅描述历史数据与结构识别条件，不表示上涨概率、收益可靠性或已验证胜率"
     invalidation_conditions = list(
         dict.fromkeys(
             condition
             for kind_values in divergences.values()
             for signal in kind_values.values()
+            if signal.status == "confirmed"
             for condition in signal.invalidation_conditions
         )
     )

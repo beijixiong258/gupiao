@@ -11,7 +11,7 @@ import pytest
 from src.ashare import peizhi
 from src.ashare.gupiao_yanjiu import FEATURE_COLUMNS, jisuan_tezheng_biao, zongjie_jishu
 from src.ashare.macd_jiegou import MacdJiegouPeizhi, yanpan_macd_jiegou
-from src.ashare.xuangu_guize import goujian_houxuan_zhaiyao, jisuan_fengxian_koufen
+from src.ashare.xuangu_guize import goujian_houxuan_zhaiyao
 from src.ashare.yinzi_gongcheng import FACTOR_GROUPS, factor_group
 
 
@@ -158,6 +158,8 @@ def test_top_divergence_is_separate_for_dif_and_histogram_and_can_invalidate() -
     signal = invalidated["divergences"]["top"]["dif"]
     assert signal["status"] == "invalidated"
     assert signal["invalidation_reason"] == "价格突破背离高点"
+    assert invalidated["invalidation_conditions"] == []
+    assert signal["invalidation_conditions"]  # 历史状态仍保留各自原始条件供查阅。
 
 
 def test_small_change_and_close_pivots_do_not_create_divergence() -> None:
@@ -218,6 +220,8 @@ def test_flat_zero_volume_session_history_does_not_create_false_signal() -> None
     assert structure["latest_cross"]["status"] == "no_signal"
     assert structure["divergences"]["bottom"]["dif"]["status"] == "no_signal"
     assert structure["divergences"]["top"]["dif"]["status"] == "no_signal"
+    assert structure["invalidation_conditions"] == []
+    assert "不表示上涨概率" in structure["evidence_reliability"]["meaning"]
 
 
 def test_missing_high_low_makes_structure_unavailable_without_creating_risk() -> None:
@@ -228,30 +232,6 @@ def test_missing_high_low_makes_structure_unavailable_without_creating_risk() ->
     assert result["risk_warnings"] == []
 
 
-def test_structure_evidence_does_not_expand_factor_budget_or_add_risk_penalty() -> None:
-    momentum_members = FACTOR_GROUPS["momentum_reversal"]
-    assert "macd_dif_pct" in momentum_members
-    assert "macd_hist_pct" in momentum_members
-    assert not any("divergence" in feature or "cross" in feature for feature in momentum_members)
-    assert not any("cross" in feature or "divergence" in feature for feature in FEATURE_COLUMNS)
-    technical = {
-        "macd_structure": {
-            "status": "ok",
-            "risk_warnings": ["已确认顶部背离，仅作风险提示"],
-        }
-    }
-    penalties, risks = jisuan_fengxian_koufen(
-        code="600000.SH",
-        name="样本",
-        snapshot={},
-        factor={"confidence": 1.0},
-        pattern={},
-        late={},
-        config={"fenxi": {"risk_penalty_max": 30}},
-        technical=technical,
-    )
-    assert penalties == []
-    assert risks == ["已确认顶部背离，仅作风险提示"]
 
 
 def test_moving_average_gap_factor_has_an_accurate_name_and_legacy_alias() -> None:
@@ -276,22 +256,20 @@ def test_candidate_summary_exposes_structure_support_counterevidence_and_risk() 
             "ts_code": "600000.SH",
             "name": "样本",
             "industry": "样本行业",
-            "ranking": {"score_0_100": 70.0, "confidence": 0.8, "definition": "研究排序"},
+            "selection": {"eligible": True, "conditions": [], "unmet_conditions": [], "missing_conditions": []},
             "factor": {"groups": {}},
             "fundamental": {"evidence": []},
             "pattern": {},
             "late": {},
-            "technical": {"macd_structure": structure},
+            "technical": {"status": "ok", "outcome": "analysis_success", "reason": "", "macd_structure": structure},
             "tradability": {"basic_execution_feasible": True},
             "data_quality": {},
             "risks": ["已有风险"],
         },
         rank=1,
-        minimum_score=60.0,
-        minimum_confidence=0.6,
     )
     assert summary["positive_evidence"][0] == "零轴上方趋势背景"
-    assert summary["unmet_conditions"][0] == "正柱连续收窄"
+    assert summary["technical_summary"]["macd_structure"]["counter_evidence"] == ["正柱连续收窄"]
     assert summary["risks"][0] == "快线顶部背离仅作风险提示"
     assert summary["technical_summary"]["status"] == "ok"
     assert summary["technical_summary"]["outcome"] == "analysis_success"

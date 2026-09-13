@@ -114,76 +114,6 @@ class ClarificationAnswer:
 ClarificationHandler = Callable[[ClarificationRequest], ClarificationAnswer]
 
 
-def _candidate_identity(candidate: Any) -> tuple[str, str, str] | None:
-    if not isinstance(candidate, dict):
-        return None
-    name = " ".join(str(candidate.get("name") or "").split())
-    code = " ".join(str(candidate.get("ts_code") or candidate.get("code") or "").split())
-    if not name and not code:
-        return None
-    display = f"{name}（{code}）" if name and code else name or code
-    identity = code.upper() or name
-    return identity, display, name or code
-
-
-def build_prediction_clarification(content: Any) -> ClarificationRequest | None:
-    """Build the post-analysis prediction prompt from a public analysis result."""
-    try:
-        payload = json.loads(content) if isinstance(content, str) else content
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("status") != "ok":
-        return None
-    stage = payload.get("analysis_stage")
-    if not (
-        payload.get("recommendation_available")
-        and isinstance(stage, dict)
-        and stage.get("prediction_confirmation_required") is True
-    ):
-        return None
-
-    raw_candidates = [payload.get("primary")]
-    alternatives = payload.get("alternatives")
-    if isinstance(alternatives, list):
-        raw_candidates.extend(alternatives)
-
-    candidate_choices: list[ClarificationChoice] = []
-    seen: set[str] = set()
-    # Reserve one of the four predefined slots for the explicit no-prediction choice.
-    for index, raw_candidate in enumerate(raw_candidates):
-        identity = _candidate_identity(raw_candidate)
-        if identity is None or identity[0] in seen:
-            continue
-        seen.add(identity[0])
-        role = "首选" if index == 0 else f"备选 {index}"
-        candidate_choices.append(
-            ClarificationChoice(
-                label=f"预测{role}：{identity[1]}",
-                response=f"确认预测{role}：{identity[2]}",
-            )
-        )
-        if len(candidate_choices) == MAX_PREDEFINED_CHOICES - 1:
-            break
-
-    if not candidate_choices:
-        return None
-    choices = tuple(
-        [*candidate_choices, ClarificationChoice(label="暂不预测", response="暂不进行预测")]
-    )
-    return ClarificationRequest(
-        kind="prediction_confirmation",
-        title="是否继续预测",
-        question=(
-            "量化分析已经完成。预测会重新下载远端数据并训练 T+1、T+2、T+3 模型，"
-            "耗时会明显更长。请选择下一步："
-        ),
-        choices=choices,
-        allow_custom=True,
-        custom_label="其他合格备选（输入名称或代码）",
-        custom_response_prefix="确认预测合格备选：",
-    )
-
-
 def build_scope_clarification(content: Any) -> ClarificationRequest | None:
     """Build one plain-language choice from live, fact-checked scope candidates."""
     try:
@@ -235,6 +165,5 @@ __all__ = [
     "ClarificationChoice",
     "ClarificationHandler",
     "ClarificationRequest",
-    "build_prediction_clarification",
     "build_scope_clarification",
 ]

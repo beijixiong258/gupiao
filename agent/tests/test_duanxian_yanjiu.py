@@ -1,4 +1,4 @@
-"""Daily-K contract tests for the two supported A-share workflows."""
+"""Daily-K contracts for stock analysis and diagnosis."""
 
 from __future__ import annotations
 
@@ -9,17 +9,14 @@ import pandas as pd
 import pytest
 import requests
 
-from src.ashare.dangu_yuce import _future_schedule_unavailable_reason
 from src.ashare.gupiao_yanjiu import (
     FEATURE_COLUMNS,
     biaozhunhua_daima,
     jisuan_tezheng_biao,
     zongjie_jishu,
 )
-from src.ashare.moxing_gongju import goujian_moxing_shuju
 from src.ashare.peizhi import jiazai_lianghua_peizhi
 from src.ashare.shichang_shuju import akshare_zhilian
-from src.ashare.yuce_xunlian import xunlian_chiyouqi_yuce_moxing
 from src.tools import build_registry
 
 
@@ -74,14 +71,15 @@ def test_technical_features_use_only_current_and_past_rows() -> None:
         check_names=False,
     )
     summary = zongjie_jishu(original)
-    assert 0 <= summary["score_0_100"] <= 100
+    assert "score_0_100" not in summary
+    assert summary["evidence"]
     assert summary["trade_date"] == original["trade_date"].iloc[-1].strftime("%Y-%m-%d")
 
 
-def test_internal_config_hard_caps_horizons_at_t3() -> None:
+def test_internal_config_contains_analysis_settings_only() -> None:
     config, path = jiazai_lianghua_peizhi()
     assert path.endswith("lianghua_peizhi.json")
-    assert config["moxing"]["horizons"] == [1, 2, 3]
+    assert "moxing" not in config
     assert config["wangluo"]["domestic_connection_mode"] == "direct"
     assert "akshare_bypass_proxy" not in config["shuju"]
     assert "jiaoyi" not in config
@@ -111,84 +109,49 @@ def test_akshare_direct_context_restores_proxy_environment(monkeypatch) -> None:
 
 
 def test_agent_exposes_research_tools_only() -> None:
-    assert build_registry().tool_names == ["gupiao_fenxi", "gupiao_yuce"]
+    assert build_registry().tool_names == ["gupiao_fenxi"]
 
-
-def test_model_panel_builds_literal_next_three_session_close_labels() -> None:
-    history = _history(9, rows=100)
-    panel = goujian_moxing_shuju(
-        {"600519.SH": history},
-        {"600519.SH": "贵州茅台"},
-        [1, 2, 3],
+def test_analysis_factor_pipeline_survives_without_training_or_historical_valuation(monkeypatch) -> None:
+    from src.ashare import riping_yinzi
+    from src.ashare.fenxi_yinzi import (
+        goujian_fenxi_yinzi_mianban,
+        huizong_houxuan_yinzi,
+        zengjia_dangri_guzhi_yinzi,
     )
-    signal_index = len(history) - 4
-    signal_date = pd.Timestamp(history.iloc[signal_index]["trade_date"]).normalize()
-    row = panel.loc[panel["trade_date"] == signal_date].iloc[0]
-    signal_close = float(history.iloc[signal_index]["close"])
+    from src.ashare.yinzi_gongcheng import FACTOR_GROUPS
 
-    for horizon in [1, 2, 3]:
-        expected = history.iloc[signal_index + horizon]
-        assert row[f"future_date_t{horizon}"] == pd.Timestamp(expected["trade_date"]).normalize()
-        assert row[f"future_close_t{horizon}"] == pytest.approx(float(expected["close"]))
-        assert row[f"future_return_t{horizon}"] == pytest.approx(float(expected["close"]) / signal_close - 1.0)
+    monkeypatch.setattr(
+        riping_yinzi,
+        "_benchmark_features",
+        lambda **kwargs: (pd.DataFrame(), {"status": "unavailable", "warnings": ["离线样本"]}),
+    )
 
+    def reject_remote_valuation():
+        raise AssertionError("分析因子不应逐股请求历史估值")
 
-def test_future_forecast_rejects_first_target_that_already_closed() -> None:
-    schedule = {"future_session_dates": {"T+1": "2026-07-20"}}
-    post_close = {
-        "market_clock": {
-            "captured_at": "2026-07-20 15:52:00",
-            "session_status": "post_close",
+    monkeypatch.setattr(riping_yinzi, "_tushare_pro", reject_remote_valuation)
+    codes = [f"60000{index}.SH" for index in range(1, 7)]
+    histories = {code: _history(index, rows=100) for index, code in enumerate(codes)}
+    profiles = pd.DataFrame(
+        {
+            "ts_code": codes,
+            "name": [f"样本{index}" for index in range(len(codes))],
+            "industry": ["样本行业"] * len(codes),
+            "turnover_rate": np.arange(1.0, len(codes) + 1),
+            "circulating_market_value_yuan": np.arange(1, len(codes) + 1) * 1e9,
         }
-    }
-    during_session = {
-        "market_clock": {
-            "captured_at": "2026-07-20 10:00:00",
-            "session_status": "trading",
-        }
-    }
-
-    assert "已经结束" in _future_schedule_unavailable_reason(schedule, post_close)
-    assert _future_schedule_unavailable_reason(schedule, during_session) == ""
-
-
-def test_models_train_with_purged_time_split_and_only_t3_outputs() -> None:
-    codes = ["600001.SH", "600002.SH", "600003.SH", "600004.SH", "600005.SH"]
-    histories = {code: _history(index + 10) for index, code in enumerate(codes)}
-    names = {code: f"样本{index}" for index, code in enumerate(codes)}
+    )
+    panel, metadata = goujian_fenxi_yinzi_mianban(histories, profiles, source="auto")
+    latest = panel[panel["trade_date"].eq(panel["trade_date"].max())]
+    latest = zengjia_dangri_guzhi_yinzi(latest, profiles)
     config, _ = jiazai_lianghua_peizhi()
-    # This contract test covers the purged split and fixed T+1/T+2/T+3
-    # outputs.  Five random synthetic stocks are not a meaningful universe
-    # for the production Rank-IC stability gate, which has dedicated tests.
-    config["moxing"]["factor_stability_enabled"] = False
-    panel = goujian_moxing_shuju(histories, names, [1, 2, 3])
-    latest = (
-        panel.sort_values("trade_date")
-        .groupby("ts_code", as_index=False)
-        .tail(1)
-        .dropna(subset=FEATURE_COLUMNS)
-        .reset_index(drop=True)
-    )
+    results = huizong_houxuan_yinzi(latest, config=config["fenxi"])
 
-    predictions, validation = xunlian_chiyouqi_yuce_moxing(
-        panel=panel,
-        latest=latest,
-        config=config,
-        budget_yuan=100_000.0,
-    )
-
-    assert {"pred_t1", "pred_t2", "pred_t3"}.issubset(predictions.columns)
-    assert "pred_t5" not in predictions.columns
-    assert set(validation["horizons"]) == {"T+1", "T+2", "T+3"}
-    for horizon in [1, 2, 3]:
-        metrics = validation["horizons"][f"T+{horizon}"]
-        target_date = pd.to_datetime(panel[f"target_date_t{horizon}"])
-        trade_date = pd.to_datetime(panel["trade_date"])
-        assert metrics["folds"]
-        for fold in metrics["folds"]:
-            validation_start = pd.Timestamp(fold["validation_start"])
-            train_mask = (trade_date < validation_start) & (target_date < validation_start)
-            assert not (target_date[train_mask] >= validation_start).any()
-            if fold["status"] == "ok":
-                assert fold["train_samples"] >= config["dangu"]["min_fold_training_samples"]
-                assert fold["validation_samples"] >= config["dangu"]["min_fold_validation_samples"]
+    assert metadata["status"] == "ok"
+    assert set(results) == set(codes)
+    for result in results.values():
+        assert result["status"] == "partial"  # 离线指数缺失，保留其余实际指标。
+        assert set(result["groups"]) == set(FACTOR_GROUPS)
+        assert "score_0_100" not in result
+        assert "confidence" not in result
+        assert result["available_factor_count"] > 0

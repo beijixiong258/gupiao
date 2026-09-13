@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 import pandas as pd
 
-from src.ashare.fanwei_faxian import ShichangFanwei
+from src.ashare.fanwei_faxian import BankuaiLeixing, ShichangFanwei
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 
 
@@ -143,13 +143,17 @@ class MingmingFanweiHouXuanChi:
         # 当前股票资料字段而下载全市场横截面；上市时间由随后取得的真实日线跨度
         # 复核，深度基本面只对最终少量候选按需读取。
         data = members.copy()
-        if "industry" not in data.columns:
-            data["industry"] = scope.canonical_name
-        else:
-            data["industry"] = data["industry"].fillna(scope.canonical_name)
+        industry = data.get("industry", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
+        missing_industry = industry.str.lower().isin({"", "unknown", "nan", "none", "未知", "未分类"})
+        # 只有已经核验的行业范围能补充行业；概念成员不必属于同一行业。
+        verified_industry = scope.kind is BankuaiLeixing.HANGYE and scope.verification.get("verified") is True
+        data["industry"] = industry.mask(missing_industry, scope.canonical_name if verified_industry else "")
+        missing_count = int(data["industry"].eq("").sum())
         cross_meta: dict[str, Any] = {
             "cross_section_enrichment_status": "not_requested",
-            "warnings": [],
+            "industry_missing_rows": missing_count,
+            "industry_basis": "verified_industry_scope_or_member_profile" if verified_industry else "member_profile_only",
+            "warnings": [f"{missing_count} 只成分缺少真实行业，保留范围比较，不以概念名称冒充同行"] if missing_count else [],
             "cross_section_enrichment_reason": "命名范围使用实时成分横截面，避免无关的全市场重复请求",
         }
         return HouXuanChiJieguo(

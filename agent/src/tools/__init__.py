@@ -6,9 +6,8 @@ from src.agent.clarification import ClarificationHandler
 from src.agent.tools import ToolRegistry
 from src.tools.clarify_tool import ClarifyTool
 from src.tools.gupiao_fenxi_tool import GupiaoFenxiTool
-from src.tools.gupiao_yuce_tool import GupiaoYuceTool
 
-_BUSINESS_TOOLS = (GupiaoFenxiTool, GupiaoYuceTool)
+_BUSINESS_TOOLS = (GupiaoFenxiTool,)
 
 
 def build_registry(

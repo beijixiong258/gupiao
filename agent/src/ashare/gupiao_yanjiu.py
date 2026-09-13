@@ -6,7 +6,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -46,9 +46,7 @@ FEATURE_COLUMNS = [
     "volume_ratio_5_20",
     "amplitude_1",
 ]
-# ``FEATURE_COLUMNS`` remains the compact, backwards-compatible technical
-# contract used by the analysis layer.  The model layer additionally consumes
-# the registered continuous price/volume factors below.
+# 分析层使用紧凑技术字段与统一登记的连续价量因子。
 RAW_PRICE_VOLUME_FEATURE_COLUMNS = list(ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS)
 FINANCIAL_CRITICAL_FIELDS = ("roe_pct", "net_profit_yoy_pct", "debt_to_assets_pct")
 
@@ -140,12 +138,22 @@ def _match_stock_basic(table: pd.DataFrame, query: str) -> dict[str, Any] | None
     return {str(key): _json_value(value) for key, value in row.items()}
 
 
-def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, Any], list[str]]:
+def jiexi_gupiao(
+    gupiao: str,
+    *,
+    source: str = "auto",
+    stock_basic_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
+) -> tuple[str, dict[str, Any], list[str]]:
     """Resolve either a stock code or a Chinese stock name."""
     source = source.strip().lower()
     if source not in {"auto", "tushare", "akshare"}:
         raise ValueError("source 必须是 auto、tushare 或 akshare")
     warnings: list[str] = []
+    def load_stock_basic() -> pd.DataFrame:
+        if stock_basic_loader is not None:
+            return stock_basic_loader()[0]
+        return huoqu_gupiao_jichu_ziliao(_tushare_pro(), {})
+
     raw = str(gupiao).strip()
     code_query = raw if shi_a_gu(raw) else ""
     if not code_query:
@@ -160,7 +168,7 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
         if source in {"auto", "tushare"}:
             try:
                 resolved = _match_stock_basic(
-                    huoqu_gupiao_jichu_ziliao(_tushare_pro(), {}),
+                    load_stock_basic(),
                     code,
                 ) or resolved
             except Exception as exc:
@@ -177,8 +185,7 @@ def jiexi_gupiao(gupiao: str, *, source: str = "auto") -> tuple[str, dict[str, A
     errors: list[str] = []
     if source in {"auto", "tushare"}:
         try:
-            pro = _tushare_pro()
-            table = huoqu_gupiao_jichu_ziliao(pro, {})
+            table = load_stock_basic()
             match = _match_stock_basic(table, raw)
             if match and match.get("ts_code"):
                 return biaozhunhua_daima(str(match["ts_code"])), match, warnings
@@ -471,9 +478,7 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     volume_20 = volume.rolling(20, min_periods=20).mean()
     data["volume_ratio_5_20"] = volume_5 / volume_20.replace(0, np.nan)
     data["amplitude_1"] = (high - low) / previous_close.replace(0, np.nan)
-    # Keep all newly introduced factors in the same leak-free daily pipeline.
-    # The helper is independent of model labels and works for both standalone
-    # technical analysis and the stock/board training panels.
+    # 统一计算单股及比较池日线的确定性价量因子。
     data = add_price_volume_factors(data)
     return data.replace([np.inf, -np.inf], np.nan)
 
@@ -505,62 +510,46 @@ def _json_value(value: Any) -> Any:
     return str(value) if not isinstance(value, (str, int, bool)) else value
 
 
-def _technical_score(latest: pd.Series) -> tuple[int, list[str]]:
-    score = 50.0
+def _technical_evidence(latest: pd.Series) -> list[str]:
+
     reasons: list[str] = []
     close = _round_optional(latest.get("close"))
     ma_5 = _round_optional(latest.get("ma_5"))
     ma_20 = _round_optional(latest.get("ma_20"))
     if close is not None and ma_20 is not None:
         if ma_5 is not None and close > ma_5 > ma_20:
-            score += 14
+
             reasons.append("收盘价、MA5、MA20 呈多头顺序")
         elif close > ma_20:
-            score += 7
+
             reasons.append("价格位于 MA20 上方")
         else:
-            score -= 8
+
             reasons.append("价格未站上 MA20")
 
     ret_5 = _round_optional(latest.get("ret_5"))
     if ret_5 is not None:
-        if 0.01 <= ret_5 <= 0.12:
-            score += 10
-            reasons.append("5 日动量为正且未进入极端区")
-        elif ret_5 < -0.05:
-            score -= 10
-            reasons.append("5 日动量明显偏弱")
-        elif ret_5 > 0.18:
-            score -= 5
-            reasons.append("5 日涨幅过快，短线回撤风险增大")
+        reasons.append(f"近5个交易日收益 {ret_5:.2%}，需结合波动尺度与成交量理解")
 
     rsi = _round_optional(latest.get("rsi_14"))
     if rsi is not None:
-        if 45 <= rsi <= 70:
-            score += 8
-            reasons.append("RSI 位于相对健康区间")
-        elif rsi >= 80:
-            score -= 9
-            reasons.append("RSI 进入高位过热区")
-        elif rsi <= 30:
-            score -= 5
-            reasons.append("RSI 显示弱势超卖，不等于已经反转")
+        reasons.append(f"14日RSI为 {rsi:.2f}，仅描述近期涨跌强弱，不能单独确认反转或买卖时点")
 
     macd_hist = _round_optional(latest.get("macd_hist"))
     if macd_hist is not None:
         if macd_hist > 0:
-            score += 7
-            reasons.append("MACD 柱为正（既有状态分，不代表刚发生金叉）")
+
+            reasons.append("MACD 柱为正（不代表刚发生金叉）")
         elif macd_hist < 0:
-            score -= 4
-            reasons.append("MACD 柱为负（既有状态分，不代表刚发生死叉）")
+
+            reasons.append("MACD 柱为负（不代表刚发生死叉）")
         else:
-            reasons.append("MACD 柱接近零，本项不加减分")
+            reasons.append("MACD 柱接近零")
     volatility = _round_optional(latest.get("volatility_20"))
     if volatility is not None and volatility > 0.55:
-        score -= 10
+
         reasons.append("20 日年化波动率偏高")
-    return int(round(max(0, min(100, score)))), reasons
+    return reasons
 
 
 def zongjie_jishu(
@@ -569,16 +558,16 @@ def zongjie_jishu(
     macd_structure_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     features = jisuan_tezheng_biao(history)
-    usable = features.dropna(subset=["ma_20", "rsi_14", "atr_14_pct", "volatility_20"])
-    if usable.empty:
-        raise RuntimeError("有效日线不足，至少需要约 21 个交易日")
-    latest = usable.iloc[-1]
-    score, reasons = _technical_score(latest)
+    if features.empty:
+        return {"status": "unavailable", "outcome": "data_unavailable", "reason": "没有有效日线", "missing_indicators": [], "evidence": []}
+    latest = features.iloc[-1]
+    reasons = _technical_evidence(latest)
+    missing = [key for key in ("ma_5", "ma_10", "ma_20", "ma_60", "rsi_14", "macd_hist", "atr_14_pct", "volatility_20") if _round_optional(latest.get(key)) is None]
     indicator_warnings: list[str] = []
     if _round_optional(latest.get("ma_60")) is None:
-        indicator_warnings.append("历史不足 60 个交易日，MA60 暂不可用且未参与评分")
+        indicator_warnings.append("历史不足 60 个交易日，MA60 暂不可用")
     if _round_optional(latest.get("macd_hist")) is None:
-        indicator_warnings.append("历史不足以形成完整 MACD，MACD 暂不可用且未参与评分")
+        indicator_warnings.append("历史不足以形成完整 MACD，MACD 暂不可用")
     macd_structure = yanpan_macd_jiegou(features, macd_structure_config)
     if macd_structure.get("status") != "ok":
         reason = str(macd_structure.get("reason") or "MACD 结构研判暂不可用")
@@ -586,10 +575,8 @@ def zongjie_jishu(
     structure_status = str(macd_structure.get("status") or "error")
     if structure_status == "error":
         summary_status, summary_outcome = "error", "program_error"
-    elif structure_status == "unavailable":
-        summary_status, summary_outcome = "unavailable", "data_unavailable"
-    elif structure_status == "insufficient_data":
-        summary_status, summary_outcome = "insufficient_data", "information_insufficient"
+    elif structure_status in {"unavailable", "insufficient_data"} or missing:
+        summary_status, summary_outcome = "partial", "information_partial"
     else:
         summary_status, summary_outcome = "ok", "analysis_success"
     return {
@@ -617,10 +604,9 @@ def zongjie_jishu(
         "volume_ratio_5_to_20": _round_optional(latest["volume_ratio_5_20"], 4),
         "support_20": _round_optional(latest["support_20"], 3),
         "resistance_20": _round_optional(latest["resistance_20"], 3),
-        "score_0_100": score,
-        "score_interpretation": (
-            "启发式技术状态分，只表示当前指标组合，不是上涨概率、收益预测或精确目标分"
-        ),
+        "missing_indicators": missing,
+        "history_rows": int(len(features)),
+        "interpretation": "逐项解释最新日线的实际指标，不计算综合分或强制买卖结论",
         "evidence": reasons,
         "indicator_warnings": indicator_warnings,
     }
@@ -639,7 +625,11 @@ def _first_number(row: pd.Series | dict[str, Any], aliases: Iterable[str]) -> fl
     return None
 
 
-def _akshare_info(code: str) -> tuple[dict[str, Any], list[str]]:
+def _akshare_info(
+    code: str,
+    *,
+    realtime_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     import akshare as ak
 
     errors: list[str] = []
@@ -654,8 +644,19 @@ def _akshare_info(code: str) -> tuple[dict[str, Any], list[str]]:
         errors.append(f"AKShare 个股资料失败：{exc}")
 
     try:
-        with akshare_zhilian():
-            spot = ak.stock_zh_a_spot_em()
+        if realtime_loader is None:
+            with akshare_zhilian():
+                spot = ak.stock_zh_a_spot_em()
+        else:
+            shared_spot, metadata = realtime_loader()
+            if shared_spot.empty:
+                raise RuntimeError(str(metadata.get("error") or "本次实时快照不可用"))
+            spot = shared_spot.rename(columns={
+                "ts_code": "代码", "name": "名称", "pe_dynamic": "市盈率-动态", "pb": "市净率",
+                "total_market_value_yuan": "总市值", "circulating_market_value_yuan": "流通市值",
+                "turnover_rate": "换手率",
+            }).copy()
+            spot["代码"] = spot["代码"].astype(str).str.split(".", regex=False).str[0]
         hit = spot[spot["代码"].astype(str).str.zfill(6) == digits]
         if not hit.empty:
             row = hit.iloc[0]
@@ -727,6 +728,8 @@ def huoqu_jibenmian(
     *,
     trade_date: str,
     allow_current_snapshot: bool = False,
+    stock_basic_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
+    realtime_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Fetch profile, valuation, and financial indicators with explicit provenance."""
     as_of_date = pd.to_datetime(trade_date, errors="coerce")
@@ -743,9 +746,11 @@ def huoqu_jibenmian(
     data_quality: dict[str, Any] = {}
 
     try:
-        pro = _tushare_pro()
         basic_quality: dict[str, Any] = {}
-        basic_all = huoqu_gupiao_jichu_ziliao(pro, basic_quality)
+        if stock_basic_loader is None:
+            basic_all = huoqu_gupiao_jichu_ziliao(_tushare_pro(), basic_quality)
+        else:
+            basic_all, basic_quality = stock_basic_loader()
         data_quality["stock_basic"] = basic_quality.get("stock_basic", {})
         warnings.extend(str(item) for item in basic_quality.get("warnings", []))
         basic = basic_all[basic_all["ts_code"].astype(str) == code]
@@ -780,7 +785,8 @@ def huoqu_jibenmian(
                 if valuation_date == as_of_text:
                     valuation = {
                         "as_of": valuation_date,
-                        "pe_dynamic": _round_optional(row.get("pe")),
+                        "pe": _round_optional(row.get("pe")),
+                        "pe_definition": "来源定义为总市值/净利润，保留原始口径，不改称动态或滚动市盈率",
                         "pe_ttm": _round_optional(row.get("pe_ttm")),
                         "pb": _round_optional(row.get("pb")),
                         "total_market_value_yuan": _round_optional(float(row.get("total_mv")) * 10000 if pd.notna(row.get("total_mv")) else None, 2),
@@ -857,10 +863,14 @@ def huoqu_jibenmian(
     except Exception as exc:
         errors.append(f"Tushare 财务指标失败：{exc}")
 
-    need_ak_info = not profile or not valuation
+    need_ak_info = not profile or (not valuation and allow_current_snapshot)
     if need_ak_info:
         try:
-            ak_info, ak_errors = _akshare_info(code)
+            ak_info, ak_errors = (
+                _akshare_info(code)
+                if realtime_loader is None
+                else _akshare_info(code, realtime_loader=realtime_loader)
+            )
             errors.extend(ak_errors)
             if not profile and ak_info:
                 profile = {

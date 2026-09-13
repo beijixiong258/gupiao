@@ -1,15 +1,8 @@
-"""Shared, leak-aware daily factor engineering for stock and board models.
+"""Deterministic daily factor engineering for stock analysis.
 
-The module deliberately separates three concerns:
-
-* raw price/volume measurements are calculated per security from data available
-  on or before the signal close;
-* named economic groups expose a small, traceable production representation;
-* the model layer can select and combine factors inside each training window.
-
-No target, future label, intraday bar, or current-day information from another
-date is used here.  Cross-sectional ranks are only used on the supplied
-``trade_date`` and therefore remain reproducible at a historical signal time.
+Price and volume measurements use only data available on or before the signal
+close. Economic groups expose a traceable representation. Cross-sectional ranks
+use the supplied trade_date and do not create future labels or train models.
 """
 
 from __future__ import annotations
@@ -20,14 +13,13 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 
 FACTOR_ENGINEERING_VERSION = "daily-factor-engineering-v2"
 
 
 # The registry is intentionally data rather than executable logic.  It is
-# returned in diagnostics so a prediction can be traced back to its economic
+# returned in diagnostics so an analysis can be traced back to its economic
 # interpretation and availability requirements.
 FACTOR_GROUPS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
     [
@@ -143,7 +135,6 @@ FACTOR_GROUPS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
                 "market_reference_mean_ret_1",
                 "market_reference_mean_ret_5",
                 "market_reference_mean_ret_20",
-                "market_regime_score",
                 "market_regime_weak",
                 "market_regime_sideways",
                 "market_regime_strong",
@@ -183,9 +174,115 @@ RAW_PRICE_VOLUME_FEATURE_COLUMNS: tuple[str, ...] = (
 )
 
 
-COMPOSITE_FACTOR_COLUMNS: tuple[str, ...] = tuple(
-    f"factor_{group}_composite" for group in FACTOR_GROUPS
-)
+# 保留同义字段的来源映射，便于解释原值与同日排名。
+# 不按相关性删除不同经济含义的因子。
+FACTOR_ALIASES: dict[str, str] = {
+    "rank_ret_5": "ret_5",
+    "rank_ma_gap_20": "ma_gap_20",
+    "rank_volume_ratio_5_20": "volume_ratio_5_20",
+    "rank_volatility_20": "volatility_20",
+    "rank_log_amount": "log_amount_yuan",
+    "rank_turnover_rate_daily": "turnover_rate_daily",
+    "rank_log_circ_mv": "log_circ_mv",
+    "peer_dispersion_ret_5": "universe_dispersion_ret_5",
+    **{f"peer_mean_ret_{period}": f"universe_mean_ret_{period}" for period in (1, 5, 20)},
+    **{f"excess_ret_{period}": f"excess_vs_universe_ret_{period}" for period in (1, 5, 20)},
+}
+FACTOR_DIAGNOSTIC_ONLY = frozenset({"wvma_20", "overnight_intraday_corr_20", "market_regime_sideways"})
+FACTOR_INPUT_REQUIREMENTS: dict[str, str] = {
+    "price_turnover_corr_20": (
+        "真实逐日 turnover_rate 百分数（5 表示 5%），先除以 100；"
+        "计算日收益与换手率日变化的 20 日相关，至少 10 对有效观测；缺失不使用成交额代理"
+    ),
+    "wvma_20": "成交额加权日收益均方根，衡量无方向波动，仅供诊断",
+}
+
+
+def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
+    """返回非别名指标；所有字段仅用于证据展示，不产生分数。"""
+    return tuple(
+        feature for feature in members
+        if feature not in FACTOR_ALIASES and feature not in FACTOR_DIAGNOSTIC_ONLY
+    )
+
+def factor_definition(feature: str) -> dict[str, Any]:
+    """指标名称和单位的唯一说明，数值仍完全由量化程序计算。"""
+    fixed = {
+        "ma_trend_5_20": ("MA5相对MA20偏离", "%", 100, "短均线相对中期均线的距离"),
+        "ma_5_20_gap_change": ("价格对MA5与MA20偏离差的变化", "百分点", 100, "价格相对MA5偏离减相对MA20偏离，再取日变化"),
+        "trend_slope_20": ("20日对数价格日均变化", "%", 100, "20日对数收盘价变化除以20，不是回归预测斜率"),
+        "trend_fit_quality_20": ("20日趋势变化与波动比", "倍", 1, "绝对价格变化相对波动的比值，不是回归拟合优度，也不表示上涨方向"),
+        "rsi_14": ("14日相对强弱指标RSI", "", 1, "上涨与下跌幅度的相对强弱，范围0至100，不是股票评分"),
+        "macd_dif_pct": ("MACD快线相对价格", "%", 100, "DIF除以当前收盘价"),
+        "macd_hist_pct": ("MACD柱相对价格", "%", 100, "MACD柱除以当前收盘价"),
+        "gap_open": ("开盘跳空", "%", 100, "开盘价相对前收盘价的变化"),
+        "intraday_return": ("日内涨跌幅", "%", 100, "收盘价相对开盘价的变化"),
+        "close_location": ("收盘在日内区间的位置", "%", 100, "最低价为0%，最高价为100%"),
+        "body_pct": ("K线有方向实体幅度", "%", 100, "收盘减开盘再除以前收盘价，保留涨跌方向"),
+        "upper_shadow_pct": ("上影线幅度", "%", 100, "最高价超出开收盘较高者的幅度，相对前收盘价"),
+        "lower_shadow_pct": ("下影线幅度", "%", 100, "开收盘较低者超出最低价的幅度，相对前收盘价"),
+        "signed_close_pressure": ("收盘位置与日内涨跌压力", "", 1, "收盘位置与日内涨跌方向共同描述的价量代理"),
+        "shadow_imbalance": ("下影与上影差", "%", 100, "下影线幅度减上影线幅度"),
+        "volume_ratio_5_20": ("5日与20日均量比", "倍", 1, "近5日平均成交量除以近20日平均成交量"),
+        "amount_ratio_5_20": ("5日与20日均额比", "倍", 1, "近5日平均成交额除以近20日平均成交额"),
+        "amount_anomaly_20": ("20日成交额异常程度", "标准差", 1, "成交额对数相对20日均值偏离多少个标准差"),
+        "signed_amount_shock": ("带涨跌方向的成交额变化", "", 1, "收益方向与成交额异常的组合观测，不代表账户资金流向"),
+        "return_amount_corr_20": ("20日收益与成交额变化相关", "", 1, "相关系数，描述统计关系，不代表因果"),
+        "price_turnover_corr_20": ("20日收益与换手变化相关", "", 1, "使用真实历史换手率变化，缺失时不由成交额代替"),
+        "wvma_20": ("成交额加权收益波幅", "%", 100, "成交额加权收益均方根，只描述无方向波动"),
+        "volume_price_residual_20": ("20日量价残差", "", 1, "收益与成交额变化关系的偏离观测"),
+        "overnight_intraday_corr_20": ("20日隔夜与日内收益相关", "", 1, "隔夜跳空与日内收益之间的相关系数"),
+        "breakout_distance_20": ("相对前20日高点距离", "%", 100, "当前收盘价相对此前窗口高点的位置"),
+        "breakout_volume_confirmation": ("突破距离与量能确认", "", 1, "历史高点距离与量能变化的组合观测"),
+        "pullback_quality_20": ("20日回撤量价特征", "", 1, "回撤位置与量能组合，仅作为形态证据"),
+        "stalling_pressure_20": ("放量滞涨压力", "", 1, "成交额变化与有限价格推进的组合观测"),
+        "low_volume_long_lower_shadow": ("低量长下影特征", "", 1, "低成交量与下影线形态共同出现的程度"),
+        "atr_14_pct": ("14日平均真实波幅占价格", "%", 100, "ATR除以收盘价，包含跳空影响"),
+        "volatility_20": ("20日年化波动率", "%", 100, "日收益标准差乘以根号252"),
+        "amplitude_1": ("当日振幅", "%", 100, "日内最高最低价差相对前收盘价"),
+        "drawdown_20": ("距20日高点的当前回撤", "%", 100, "当前价相对20日最高价的变化，不是窗口最大回撤"),
+        "peer_dispersion_ret_5": ("比较池5日收益离散度", "%", 100, "本次比较池股票5日收益的标准差"),
+        "log_amount_yuan": ("成交额对数", "", 1, "ln(1+成交额元)，用于跨股票比较尺度"),
+        "turnover_rate_daily": ("当日换手率", "%", 100, "已归一为小数的真实换手率"),
+        "log_circ_mv": ("流通市值对数", "", 1, "ln(流通市值元)，仅使用正数市值"),
+        "market_regime_weak": ("市场方向偏弱条件", "", 1, "沪深300近20日收益为负且比较池不到半数位于MA20上方；1成立、0不成立"),
+        "market_regime_strong": ("市场方向偏强条件", "", 1, "沪深300近20日收益为正且比较池过半位于MA20上方；1成立、0不成立"),
+        "market_regime_sideways": ("市场方向分歧条件", "", 1, "市场收益与比较池广度未同时偏强或偏弱；1成立、0不成立"),
+        "market_regime_trend_breadth_interaction": ("市场收益与比较池广度乘积", "", 1, "沪深30020日收益乘以比较池MA20上方比例，无权重合成"),
+        "market_regime_volatility_stress": ("沪深30020日年化波动", "%", 100, "直接展示指数实际波动率，不合成风险分"),
+    }
+    if feature in fixed:
+        label, unit, scale, meaning = fixed[feature]
+    elif feature.startswith("ma_gap_"):
+        period = feature.removeprefix("ma_gap_")
+        label, unit, scale, meaning = f"价格相对MA{period}偏离", "%", 100, f"收盘价相对{period}日均线的距离"
+    elif feature.startswith("ret_"):
+        period = feature.removeprefix("ret_")
+        label, unit, scale, meaning = f"近{period}日收益", "%", 100, f"最新收盘价相对{period}个交易日前的变化"
+    elif feature.startswith("rank_"):
+        originals = {"rank_log_amount": "log_amount_yuan", "rank_log_circ_mv": "log_circ_mv"}
+        original = factor_definition(originals.get(feature, feature.removeprefix("rank_")))
+        label, unit, scale, meaning = original["label"] + "同日分位", "分位%", 100, "在本次有效比较池中的相对位置，不是评分或上涨概率"
+    elif feature.startswith("excess_"):
+        parts = feature.rsplit("_ret_", 1)
+        prefix = parts[0]
+        period = parts[-1] if len(parts) > 1 else feature.rsplit("_", 1)[-1]
+        basis = {"excess": "比较池", "excess_vs_universe": "比较池", "excess_vs_industry": "真实同行分组", "excess_vs_csi300": "沪深300"}.get(prefix, "比较池")
+        label, unit, scale, meaning = f"近{period}日相对{basis}超额", "百分点", 100, "本股区间收益减去参照收益，不是未来超额预测"
+    else:
+        prefix = next((key for key in ("market_reference", "universe", "industry", "peer") if feature.startswith(key + "_")), None)
+        basis = {"market_reference": "市场参照子池", "universe": "本次比较池", "industry": "真实同行分组", "peer": "本次比较池"}.get(prefix, "")
+        suffix = feature[len(prefix) + 1:] if prefix else feature
+        if suffix.startswith("mean_ret_"):
+            label, unit, scale, meaning = basis + suffix.removeprefix("mean_ret_") + "日平均收益", "%", 100, "同日参照样本的等权平均收益，不是综合打分"
+        elif suffix == "dispersion_ret_5":
+            label, unit, scale, meaning = basis + "5日收益离散度", "%", 100, "样本收益标准差"
+        elif suffix in {"breadth_above_ma20", "breadth_positive_5d"}:
+            condition = "位于MA20上方" if suffix == "breadth_above_ma20" else "5日收益为正"
+            label, unit, scale, meaning = basis + condition + "比例", "%", 100, "满足条件的有效股票比例，仅代表当前样本"
+        else:
+            label, unit, scale, meaning = feature, "", 1, "程序已计算的原始观测"
+    return {"label": label, "unit": unit, "display_scale": scale, "meaning": meaning}
 
 
 def _registry_rows() -> list[dict[str, Any]]:
@@ -196,23 +293,16 @@ def _registry_rows() -> list[dict[str, Any]]:
             rows.append(
                 {
                     "feature": feature,
+                    **factor_definition(feature),
                     "group": group,
                     "role": role,
-                    "direction": "diagnostic_only" if role != "alpha" else "learned_in_fold",
+                    "use": "observed_evidence",
+                    "canonical_source": FACTOR_ALIASES.get(feature, feature),
+                    "input_requirement": FACTOR_INPUT_REQUIREMENTS.get(feature),
                     "frequency": "daily_k",
                     "availability": "signal_close_or_earlier",
                 }
             )
-        rows.append(
-            {
-                "feature": f"factor_{group}_composite",
-                "group": group,
-                "role": role,
-                "direction": "group_rank_equal_weight",
-                "frequency": "daily_k",
-                "availability": "signal_close_or_earlier",
-            }
-        )
     return rows
 
 
@@ -220,7 +310,6 @@ FACTOR_REGISTRY: tuple[dict[str, Any], ...] = tuple(_registry_rows())
 _FEATURE_TO_GROUP = {
     feature: group for group, members in FACTOR_GROUPS.items() for feature in members
 }
-_FEATURE_TO_GROUP.update({f"factor_{group}_composite": group for group in FACTOR_GROUPS})
 # 旧字段实际描述 MA5 与 MA20 相对间距的日变化，并非 MACD 金叉。
 # 仅保留查询兼容，不再把旧名放入生产因子列表，避免同一证据重复计权。
 _FEATURE_TO_GROUP["golden_cross_speed"] = "trend_structure"
@@ -239,7 +328,7 @@ def factor_group(feature: str) -> str:
 
 
 def factor_role(feature: str) -> str:
-    """Return the registry role used by the selector and output explainers."""
+    """Return the registry role used by analysis output explainers."""
     group = factor_group(feature)
     if group == "risk_liquidity":
         return "risk"
@@ -293,7 +382,7 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
     # fabricated valuation field, and is marked by the same daily availability.
     amount = amount.where(amount.notna(), (volume * close).where(volume.notna() & close.notna()))
 
-    # These fields are useful outside the model too (for technical diagnosis),
+    # These fields expose the measured trend structure for technical diagnosis,
     # so calculate them even when an older caller did not request the new set.
     groups = list(_group_indices(data))
     for indices in groups:
@@ -323,9 +412,11 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         rolling_std = amount_log.rolling(20, min_periods=10).std().replace(0, np.nan)
         anomaly = _safe_div(amount_log - rolling_mean, rolling_std)
         ret_amount_corr = ret1.rolling(20, min_periods=10).corr(amount_change)
-        # Turnover is unavailable in price-only mode; amount change is the
-        # explicitly disclosed proxy and keeps the feature missing-safe.
-        price_turnover_corr = ret_amount_corr.copy()
+        # 历史 turnover_rate 使用百分数（5 表示 5%），不读取当前快照回填。
+        # 成交额变化不等于换手率；缺失、常量或有效配对不足时相关性留空。
+        turnover = _numeric(local, "turnover_rate") / 100.0
+        turnover = turnover.where(turnover.ge(0.0))
+        price_turnover_corr = ret1.rolling(20, min_periods=10).corr(turnover.diff())
         weight = _safe_div(a, a.rolling(20, min_periods=10).median()).clip(lower=0.25, upper=4.0)
         wvma = np.sqrt(_safe_div((ret1.pow(2) * weight).rolling(20, min_periods=10).sum(), weight.rolling(20, min_periods=10).sum()))
         cov = ret1.rolling(20, min_periods=10).cov(amount_change)
@@ -380,350 +471,36 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
     return data.replace([np.inf, -np.inf], np.nan)
 
 
-def add_factor_composites(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Create deterministic equal-weight group scores from same-date ranks."""
+def describe_factor_coverage(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """保留原始因子并记录覆盖，不生成组均分或加权合成列。"""
     if frame is None or frame.empty:
         return (pd.DataFrame() if frame is None else frame.copy(), {"status": "unavailable"})
-    data = frame.copy()
-    if "trade_date" not in data.columns:
-        return data, {"status": "unavailable", "reason": "缺少 trade_date"}
-    data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
-    group_meta: dict[str, Any] = {}
-    for group, members in FACTOR_GROUPS.items():
-        available = [column for column in members if column in data.columns]
-        composite = f"factor_{group}_composite"
-        if not available:
-            data[composite] = np.nan
-            group_meta[group] = {"available_components": [], "status": "unavailable"}
-            continue
-        numeric = data[available].apply(pd.to_numeric, errors="coerce")
-        if group == "market_context":
-            # Context variables are often identical for every stock on a
-            # date.  Cross-sectional ranking would turn them into a useless
-            # constant (and can accidentally imply an alpha direction), so
-            # they remain raw controls and are selected separately by the
-            # temporal context branch below.
-            data[composite] = np.nan
-            group_meta[group] = {
-                "available_components": available,
-                "component_count": int(len(available)),
-                "method": "raw_context_controls_no_cross_sectional_rank",
-                "status": "context_raw_only",
-            }
-            continue
-        ranks = numeric.groupby(data["trade_date"]).rank(pct=True)
-        data[composite] = ranks.mean(axis=1, skipna=True, numeric_only=True)
-        data[composite] = data[composite].where(ranks.notna().any(axis=1))
-        group_meta[group] = {
-            "available_components": available,
-            "component_count": int(len(available)),
-            "method": "same_trade_date_percentile_rank_equal_weight",
-            "status": "ok",
-        }
-    return data.replace([np.inf, -np.inf], np.nan), {
-        "status": "ok",
-        "version": FACTOR_ENGINEERING_VERSION,
-        "groups": group_meta,
-        "composite_columns": list(COMPOSITE_FACTOR_COLUMNS),
-        "daily_k_only": True,
+    data = frame.replace([np.inf, -np.inf], np.nan).copy()
+    groups = {
+        group: {"available_components": [column for column in members if column in data and data[column].notna().any()], "expected_components": list(members)}
+        for group, members in FACTOR_GROUPS.items()
     }
+    return data, {"status": "ok", "version": FACTOR_ENGINEERING_VERSION, "groups": groups, "daily_k_only": True, "method": "raw_evidence_only"}
 
 
-def engineered_factor_columns(*, include_composites: bool = True) -> list[str]:
-    """Return de-duplicated raw/composite columns in registry order."""
-    columns: list[str] = []
-    for members in FACTOR_GROUPS.values():
-        for column in members:
-            if column not in columns:
-                columns.append(column)
-    if include_composites:
-        columns.extend(column for column in COMPOSITE_FACTOR_COLUMNS if column not in columns)
-    return columns
-
-
-def _daily_rank_ic_values(frame: pd.DataFrame, feature: str, target_column: str) -> list[float]:
-    """Return one cross-sectional Rank IC per usable signal date."""
-    if feature not in frame.columns or target_column not in frame.columns or "trade_date" not in frame.columns:
-        return []
-    dates = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
-    values: list[float] = []
-    for _, group in frame.loc[dates.notna()].groupby(dates[dates.notna()]):
-        x = pd.to_numeric(group[feature], errors="coerce")
-        y = pd.to_numeric(group[target_column], errors="coerce")
-        valid = x.notna() & y.notna()
-        if int(valid.sum()) < 5 or int(x[valid].nunique()) < 2 or int(y[valid].nunique()) < 2:
-            continue
-        value = spearmanr(x[valid], y[valid]).statistic
-        if value is not None and math.isfinite(float(value)):
-            values.append(float(value))
-    return values
-
-
-def _context_rank_ic_values(frame: pd.DataFrame, feature: str, target_column: str) -> list[float]:
-    """Measure a context control against date-level mean target, leak-free."""
-    if feature not in frame.columns or target_column not in frame.columns or "trade_date" not in frame.columns:
-        return []
-    work = frame[["trade_date", feature, target_column]].copy()
-    work["trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce").dt.normalize()
-    work[feature] = pd.to_numeric(work[feature], errors="coerce")
-    work[target_column] = pd.to_numeric(work[target_column], errors="coerce")
-    date_level = (
-        work.dropna(subset=["trade_date"])
-        .groupby("trade_date", as_index=False)
-        .agg({feature: "median", target_column: "mean"})
-        .dropna()
-        .sort_values("trade_date")
-    )
-    if len(date_level) < 20 or date_level[feature].nunique() < 2 or date_level[target_column].nunique() < 2:
-        return []
-    dates = date_level["trade_date"].tolist()
-    slices = [list(values) for values in np.array_split(np.asarray(dates, dtype=object), 6) if len(values)]
-    values: list[float] = []
-    for date_slice in slices:
-        part = date_level[date_level["trade_date"].isin(date_slice)]
-        if len(part) < 5 or part[feature].nunique() < 2 or part[target_column].nunique() < 2:
-            continue
-        value = spearmanr(part[feature], part[target_column]).statistic
-        if value is not None and math.isfinite(float(value)):
-            values.append(float(value))
-    return values
-
-
-def select_fold_factor_features(
-    frame: pd.DataFrame,
-    candidate_features: list[str],
-    target_column: str,
-    model_config: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    """Select compact, group-aware factors using only one training window.
-
-    The selector intentionally does not back-fill unstable columns to reach a
-    requested count.  It first removes exact/near-duplicate candidates inside
-    each economic group, then keeps only factors with adequate daily Rank IC
-    coverage and sign stability.  Composite columns are preferred over their
-    components, while the latter remain available for diagnostics.
-    """
-    if frame is None or frame.empty:
-        return [], {"status": "empty_training_window", "selection_scope": "training_window_only"}
-    enabled = bool(model_config.get("factor_stability_enabled", True))
-    coverage_threshold = float(model_config.get("min_feature_coverage", 0.20))
-    slices = max(2, int(model_config.get("factor_stability_slices", 6)))
-    minimum_valid_slices = max(1, int(model_config.get("factor_min_valid_slices", 4)))
-    minimum_sign_agreement = float(model_config.get("factor_min_sign_agreement", 0.67))
-    minimum_abs_ic = float(model_config.get("factor_min_abs_mean_rank_ic", 0.005))
-    minimum_features = max(1, int(model_config.get("factor_min_features", 15)))
-    maximum_features = max(minimum_features, int(model_config.get("factor_max_features", 20)))
-    maximum_per_group = max(1, int(model_config.get("factor_max_per_group", 3)))
-    correlation_threshold = float(model_config.get("factor_dedup_abs_spearman", 0.80))
-    ordered_candidates: list[str] = []
-    for feature in candidate_features:
-        name = str(feature)
-        if name in frame.columns and name not in ordered_candidates:
-            ordered_candidates.append(name)
-    if not ordered_candidates:
-        return [], {"status": "no_candidate_feature", "selection_scope": "training_window_only"}
-    # Deterministic exact duplicate removal is performed before stability
-    # scoring, including across groups (e.g. peer/universe aliases).
-    coverage = frame[ordered_candidates].notna().mean()
-    deduplicated: list[str] = []
-    exact_duplicate_dropped: list[dict[str, Any]] = []
-    for feature in ordered_candidates:
-        duplicate_of: str | None = None
-        for prior in deduplicated:
-            pair = frame[[feature, prior]].apply(pd.to_numeric, errors="coerce")
-            valid = pair.notna().all(axis=1)
-            if int(valid.sum()) < 20:
-                continue
-            if not pair[feature].isna().equals(pair[prior].isna()):
-                continue
-            if np.allclose(
-                pair.loc[valid, feature].to_numpy(),
-                pair.loc[valid, prior].to_numpy(),
-                rtol=1e-10,
-                atol=1e-12,
-            ):
-                duplicate_of = prior
-        if duplicate_of:
-            exact_duplicate_dropped.append(
-                {"feature": feature, "duplicate_of": duplicate_of, "reason": "exact_same_panel_values"}
-            )
-        else:
-            deduplicated.append(feature)
-    eligible = [feature for feature in deduplicated if float(coverage.get(feature, 0.0)) >= coverage_threshold]
-    if not enabled:
-        return eligible[:maximum_features], {
-            "status": "disabled",
-            "selection_scope": "training_window_only",
-            "selected_features": eligible[:maximum_features],
-            "candidate_count": len(ordered_candidates),
-            "coverage_eligible_count": len(eligible),
-            "minimum_features": minimum_features,
-            "maximum_features": maximum_features,
-            "fallback_to_unstable_features": False,
-        }
-
-    all_dates = sorted(pd.to_datetime(frame["trade_date"], errors="coerce").dropna().dt.normalize().unique())
-    date_slices = [list(values) for values in np.array_split(np.asarray(all_dates, dtype=object), slices) if len(values)]
-    diagnostics: dict[str, Any] = {}
-    ranking: dict[str, tuple[float, float, float, float, int]] = {}
-    context_candidates = [feature for feature in eligible if factor_role(feature) == "context"]
-    context_limit = max(1, int(model_config.get("factor_max_context_features", 4)))
-    context_ranking: list[tuple[tuple[float, float, float], str]] = []
-    selected_context: list[str] = []
-    for feature in context_candidates:
-        values = _context_rank_ic_values(frame, feature, target_column)
-        mean_ic = float(np.mean(values)) if values else 0.0
-        context_ranking.append(((abs(mean_ic), float(coverage.get(feature, 0.0)), float(len(values))), feature))
-        diagnostics[feature] = {
-            "group": factor_group(feature),
-            "role": "context",
-            "coverage": round(float(coverage.get(feature, 0.0)), 4),
-            "temporal_rank_ic": [round(value, 6) for value in values],
-            "temporal_rank_ic_mean": round(mean_ic, 6),
-            "selected_as_context_control": False,
-            "stability_method": "date_level_context_rank_ic",
-        }
-    for _, feature in sorted(context_ranking, reverse=True)[:context_limit]:
-        selected_context.append(feature)
-        diagnostics[feature]["selected_as_context_control"] = True
-    for feature in eligible:
-        if factor_role(feature) == "context":
-            continue
-        daily_values = _daily_rank_ic_values(frame, feature, target_column)
-        slice_values: list[float] = []
-        dates = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
-        for date_slice in date_slices:
-            mask = dates.isin(date_slice)
-            part = frame.loc[mask, [feature, target_column]]
-            x = pd.to_numeric(part[feature], errors="coerce")
-            y = pd.to_numeric(part[target_column], errors="coerce")
-            valid = x.notna() & y.notna()
-            if int(valid.sum()) < 10 or int(x[valid].nunique()) < 2 or int(y[valid].nunique()) < 2:
-                continue
-            value = spearmanr(x[valid], y[valid]).statistic
-            if value is not None and math.isfinite(float(value)):
-                slice_values.append(float(value))
-        mean_ic = float(np.mean(daily_values)) if daily_values else 0.0
-        sign_agreement = (
-            max(sum(value > 0 for value in daily_values), sum(value < 0 for value in daily_values)) / len(daily_values)
-            if daily_values
-            else 0.0
-        )
-        slice_sign_agreement = (
-            max(sum(value > 0 for value in slice_values), sum(value < 0 for value in slice_values)) / len(slice_values)
-            if slice_values
-            else 0.0
-        )
-        stable = bool(
-            len(slice_values) >= minimum_valid_slices
-            and abs(mean_ic) >= minimum_abs_ic
-            and sign_agreement >= minimum_sign_agreement
-        )
-        is_composite = feature.startswith("factor_") and feature.endswith("_composite")
-        diagnostics[feature] = {
-            "group": factor_group(feature),
-            "role": factor_role(feature),
-            "coverage": round(float(coverage.get(feature, 0.0)), 4),
-            "daily_rank_ic_count": int(len(daily_values)),
-            "daily_rank_ic_mean": round(mean_ic, 6),
-            "daily_rank_ic_median": round(float(np.median(daily_values)), 6) if daily_values else 0.0,
-            "slice_rank_ic": [round(value, 6) for value in slice_values],
-            "slice_sign_agreement": round(float(slice_sign_agreement), 4),
-            "sign_agreement": round(float(sign_agreement), 4),
-            "stable": stable,
-            "composite_preferred": is_composite,
-        }
-        # Composite factors win ties; the remaining terms keep the selection
-        # deterministic while preferring stronger and better-covered signals.
-        ranking[feature] = (
-            float(stable),
-            float(is_composite),
-            abs(mean_ic),
-            float(coverage.get(feature, 0.0)),
-            len(daily_values),
-        )
-
-    stable_candidates = [feature for feature in eligible if feature not in context_candidates and diagnostics[feature]["stable"]]
-    stable_candidates.sort(key=lambda feature: ranking[feature], reverse=True)
-    selected: list[str] = []
-    selected_by_group: dict[str, list[str]] = {}
-    duplicate_dropped: list[dict[str, Any]] = []
-    # Reserve a small, explicit slice of the production input for context
-    # controls.  They are not ranked as same-day alpha signals.
-    selected.extend(selected_context[:maximum_features])
-    for feature in stable_candidates:
-        if len(selected) >= maximum_features:
-            break
-        group = factor_group(feature)
-        group_selected = selected_by_group.setdefault(group, [])
-        if len(group_selected) >= maximum_per_group:
-            continue
-        # Only compare candidates that belong to the same economic group; this
-        # avoids suppressing a useful market context factor merely because it
-        # correlates with a price trend factor.
-        duplicate_of: str | None = None
-        for prior in group_selected:
-            pair = frame[[feature, prior]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 20 or pair[feature].nunique() < 2 or pair[prior].nunique() < 2:
-                continue
-            corr = pair[feature].corr(pair[prior], method="spearman")
-            if corr is not None and math.isfinite(float(corr)) and abs(float(corr)) >= correlation_threshold:
-                duplicate_of = prior
-                break
-        if duplicate_of:
-            duplicate_dropped.append(
-                {"feature": feature, "duplicate_of": duplicate_of, "group": group, "abs_spearman": correlation_threshold}
-            )
-            continue
-        selected.append(feature)
-        group_selected.append(feature)
-
-    return selected, {
-        "status": "ok" if selected else "no_stable_feature",
-        "selection_scope": "training_window_only",
-        "engineering_version": FACTOR_ENGINEERING_VERSION,
-        "candidate_count": int(len(ordered_candidates)),
-        "coverage_eligible_count": int(len(eligible)),
-        "stable_candidate_count": int(len(stable_candidates)),
-        "selected_count": int(len(selected)),
-        "selected_features": selected,
-        "selected_by_group": selected_by_group,
-        "duplicate_dropped": duplicate_dropped,
-        "exact_duplicate_dropped": exact_duplicate_dropped,
-        "selected_context_controls": selected_context[:maximum_features],
-        "fallback_to_strongest_factors": False,
-        "stability": "daily_cross_sectional_rank_ic_with_six_date_slices",
-        "thresholds": {
-            "minimum_coverage": coverage_threshold,
-            "minimum_valid_slices": minimum_valid_slices,
-            "minimum_sign_agreement": minimum_sign_agreement,
-            "minimum_abs_mean_rank_ic": minimum_abs_ic,
-            "minimum_features_target": minimum_features,
-            "maximum_features": maximum_features,
-            "maximum_per_group": maximum_per_group,
-            "dedup_abs_spearman": correlation_threshold,
-        },
-        "factor_diagnostics": diagnostics,
-        "registry": factor_registry_rows(),
-        "warning": (
-            f"稳定因子只有 {len(selected)} 个，低于目标 {minimum_features} 个；未强行补入不稳定因子"
-            if len(selected) < minimum_features
-            else None
-        ),
-    }
+def engineered_factor_columns() -> list[str]:
+    """按注册顺序返回原始因子字段。"""
+    return list(dict.fromkeys(column for members in FACTOR_GROUPS.values() for column in members))
 
 
 __all__ = [
-    "COMPOSITE_FACTOR_COLUMNS",
     "FACTOR_ENGINEERING_VERSION",
     "FACTOR_GROUPS",
+    "FACTOR_ALIASES",
+    "FACTOR_DIAGNOSTIC_ONLY",
+    "FACTOR_INPUT_REQUIREMENTS",
+    "independent_factor_features",
     "FACTOR_REGISTRY",
     "RAW_PRICE_VOLUME_FEATURE_COLUMNS",
-    "add_factor_composites",
+    "describe_factor_coverage",
     "add_price_volume_factors",
     "engineered_factor_columns",
     "factor_group",
     "factor_role",
     "factor_registry_rows",
-    "select_fold_factor_features",
 ]

@@ -88,7 +88,7 @@ def test_deepseek_reasoning_replay_uses_canonical_field() -> None:
 
 def test_openai_provider_metadata_survives_langchain_conversion() -> None:
     replay = ContextBuilder.format_assistant_tool_calls(
-        [ToolCallRequest(id="call_2", name="gupiao_yuce", arguments={"analysis_id": "fx_sample"})],
+        [ToolCallRequest(id="call_2", name="gupiao_fenxi", arguments={"fanwei": "all_market"})],
         provider_data={
             "raw_content": [{"type": "output_text", "text": ""}],
             "additional_kwargs": {"reasoning": {"encrypted_content": "encrypted"}},
@@ -101,7 +101,7 @@ def test_openai_provider_metadata_survives_langchain_conversion() -> None:
     assert converted.id == "response_1"
     assert converted.additional_kwargs["reasoning"]["encrypted_content"] == "encrypted"
     assert converted.response_metadata["model_name"] == "gpt-5.6"
-    assert converted.tool_calls[0]["name"] == "gupiao_yuce"
+    assert converted.tool_calls[0]["name"] == "gupiao_fenxi"
 
 
 def test_reasoning_alias_is_normalized() -> None:

@@ -1,9 +1,4 @@
-"""单只 A 股量化分析编排。
-
-单股路径保留独立的证券身份和数据边界，但复用统一选股的八组因子、基本面、
-形态、尾盘、风险扣分、综合评分与推荐门槛，最终明确回答是否建议买入。
-它仍不产生预测资格。
-"""
+"""单股分析：尽可能保留已取得的证据，独立披露缺口，不作自动买入决策。"""
 
 from __future__ import annotations
 
@@ -15,16 +10,10 @@ import numpy as np
 import pandas as pd
 
 from src.ashare.dangu_lianghua import yunxing_dangu_tongyi_lianghua
-from src.ashare.gupiao_yanjiu import (
-    huoqu_jibenmian,
-    jiexi_gupiao,
-    zongjie_jishu,
-)
+from src.ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
+from src.ashare.gupiao_yanjiu import zongjie_jishu
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
-from src.ashare.xuangu_guize import (
-    goujian_kejiaoyixing_zhaiyao,
-    zhuan_you_xian_shuzhi,
-)
+from src.ashare.xuangu_guize import goujian_kejiaoyixing_zhaiyao
 
 
 DANGU_ANALYSIS_TYPE = "single_stock_analysis"
@@ -32,12 +21,10 @@ DANGU_TOOL_CONTRACT_VERSION = 9
 
 
 def _json_safe(value: Any) -> Any:
-    """递归转换第三方数据，确保结果不携带 NaN、Timestamp 或 numpy 标量。"""
-
-    if value is None or value is pd.NA:
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
     if isinstance(value, (pd.Timestamp, datetime)):
-        return value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(value, datetime) else value.strftime("%Y-%m-%d")
+        return value.isoformat(sep=" ")
     if isinstance(value, np.generic):
         return _json_safe(value.item())
     if isinstance(value, float):
@@ -46,565 +33,242 @@ def _json_safe(value: Any) -> Any:
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
     return value
 
 
-def _dedupe(values: Any) -> list[str]:
-    if not isinstance(values, (list, tuple, set)):
+def _texts(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
         return []
-    result: list[str] = []
-    for value in values:
-        text = " ".join(str(value or "").split())
-        if text and text not in result:
-            result.append(text)
-    return result
+    return list(dict.fromkeys(" ".join(str(value).split()) for value in values if value))
 
 
-def _identity(
-    code: str,
-    resolved_profile: dict[str, Any] | None,
-    fundamental_profile: dict[str, Any] | None,
-    snapshot: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """按远端来源优先级合并股票身份，绝不从用户文字猜行业。"""
+def _gap(code: str, component: str, reason: Any) -> dict[str, str]:
+    return {
+        "code": code, "component": component, "reason": " ".join(str(reason).split()),
+        "impact": "该部分信息不足，不能据此断言有利或不利；其他已取得证据仍然有效",
+        "reassessment_condition": f"补齐并核验{component}所需信息后重新分析",
+    }
 
+
+def _identity(code: str, *profiles: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"ts_code": code}
-
-    def has_value(value: Any) -> bool:
-        if value is None or value is pd.NA:
-            return False
-        if isinstance(value, str):
-            return bool(value.strip())
-        try:
-            return not bool(pd.isna(value))
-        except (TypeError, ValueError):
-            return True
-
-    for profile in (resolved_profile, fundamental_profile, snapshot):
+    for profile in profiles:
         if not isinstance(profile, dict):
             continue
         for key in ("name", "industry", "market", "list_date"):
             value = profile.get(key)
-            if has_value(value) and not has_value(result.get(key)):
+            if value is not None and not pd.isna(value) and str(value).strip() and not result.get(key):
                 result[key] = value
     return _json_safe(result)
 
 
-def _result_confirmation(clock: dict[str, Any]) -> str:
-    status = str(clock.get("session_status") or "")
-    if status in {"trading", "midday_break", "opening_auction"}:
-        return "intraday_provisional"
-    if status == "close_pending":
-        return "close_pending"
-    return "completed_daily_close"
-
-
-def _source_error_result(
-    *,
-    query: str,
-    status: str,
-    outcome: str,
-    error_code: str,
-    error: str,
-    next_action: str,
-    stage: str,
-    stock: dict[str, Any] | None = None,
-    data_provenance: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def _failure(query: str, *, status: str, outcome: str, code: str, stage: str, error: Any, stock=None, provenance=None) -> dict[str, Any]:
     return {
-        "status": status,
-        "outcome": outcome,
-        "tool_contract_version": DANGU_TOOL_CONTRACT_VERSION,
-        "analysis_type": DANGU_ANALYSIS_TYPE,
-        "query": query,
-        "error_code": error_code,
-        "stage": stage,
-        "source": "remote_market_data",
+        "status": status, "outcome": outcome, "analysis_type": DANGU_ANALYSIS_TYPE,
+        "tool_contract_version": DANGU_TOOL_CONTRACT_VERSION, "query": query,
+        "error_code": code, "stage": stage, "error": " ".join(str(error).split())[:500],
+        "stock": stock, "selected_stock": stock, "recommendation_available": False,
+        "primary": None, "alternatives": [], "data_provenance": provenance or {},
         "retryable": status == "unavailable",
-        "error": " ".join(str(error).split())[:320],
-        "next_action": next_action,
-        "stock": _json_safe(stock),
-        "selected_stock": _json_safe(stock),
-        "recommendation_available": False,
-        "primary": None,
-        "alternatives": [],
-        "data_provenance": _json_safe(data_provenance or {}),
-        "research_scope": "公开数据单股量化研究，不连接证券账户、不提交委托、不自动交易",
+        "next_action": "补充明确的股票身份后重试" if status == "clarification_required" else "待数据恢复或错误修复后重新分析",
+        "research_scope": "公开数据单股分析，不连接证券账户或执行交易",
     }
 
 
-def _is_resolution_unavailable(error: str) -> bool:
-    text = str(error).lower()
-    return any(
-        marker in text
-        for marker in (
-            "超时",
-            "timeout",
-            "connection",
-            "连接",
-            "限频",
-            "频率",
-            "权限",
-            "permission",
-            "不可用",
-            "失败",
-        )
-    )
-
-
-def _fundamental_block(raw: dict[str, Any], *, as_of: str) -> dict[str, Any]:
-    profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
-    valuation = raw.get("valuation") if isinstance(raw.get("valuation"), dict) else {}
-    financials = raw.get("financials") if isinstance(raw.get("financials"), dict) else {}
-    errors = _dedupe(raw.get("errors"))
-    warnings = _dedupe(raw.get("warnings"))
-    if financials or valuation:
+def _fundamental_block(raw: dict[str, Any], as_of: str) -> dict[str, Any]:
+    financials, valuation = raw.get("financials") or {}, raw.get("valuation") or {}
+    if financials and valuation:
         status = "ok"
-        outcome = "analysis_success"
+    elif financials or valuation:
+        status = "partial"
     else:
         status = "unavailable"
-        outcome = "data_unavailable"
-    available_fields = {
-        "profile": bool(profile),
-        "valuation": bool(valuation),
-        "financials": bool(financials),
-    }
     return {
-        "status": status,
-        "outcome": outcome,
-        "as_of": as_of,
-        "profile": _json_safe(profile),
-        "valuation": _json_safe(valuation),
-        "financials": _json_safe(financials),
-        "available_fields": available_fields,
-        "sources": _json_safe(raw.get("sources") or {}),
-        "data_quality": _json_safe(raw.get("data_quality") or {}),
-        "warnings": warnings,
-        "errors": errors,
-        "interpretation": (
-            "基本面证据来自截至分析日已知的数据；缺失字段会降低完整度。"
-            if status == "ok"
-            else "基本面数据当前不可用，不能据此断言基本面好坏。"
-        ),
+        **raw, "status": status, "as_of": as_of,
+        "profile": raw.get("profile") or {}, "financials": financials, "valuation": valuation,
+        "sources": raw.get("sources") or {}, "errors": _texts(raw.get("errors")),
+        "warnings": _texts(raw.get("warnings")),
+        "available_fields": {"profile": bool(raw.get("profile")), "financials": bool(financials), "valuation": bool(valuation)},
+        "interpretation": "逐项保留本次已取得的估值与财务数据；缺失字段不代表基本面差",
     }
 
 
-def _technical_risks(technical: dict[str, Any]) -> list[str]:
-    risks: list[str] = []
-    structure = technical.get("macd_structure") if isinstance(technical, dict) else {}
-    if isinstance(structure, dict):
-        risks.extend(_dedupe(structure.get("risk_warnings")))
-        risks.extend(_dedupe(structure.get("counter_evidence")))
-        classification = structure.get("structure_classification")
-        if isinstance(classification, dict) and classification.get("code") in {
-            "momentum_weakening",
-            "top_risk",
-        }:
-            label = str(classification.get("label") or "结构动能偏弱")
-            risks.append(label)
-    volatility = zhuan_you_xian_shuzhi(technical.get("annualized_volatility_20"))
-    if volatility is not None and volatility > 0.55:
-        risks.append(f"20 日年化波动率约 {volatility * 100:.1f}%，短线波动风险较高")
-    drawdown = zhuan_you_xian_shuzhi(technical.get("drawdown_from_20d_high"))
-    if drawdown is not None and drawdown < -0.1:
-        risks.append(f"较近 20 日高点回撤约 {abs(drawdown) * 100:.1f}%")
-    return list(dict.fromkeys(risks))
+def _collect_gaps(technical, fundamentals, snapshot, unified) -> list[dict[str, str]]:
+    gaps = list(unified.get("evidence_gaps") or [])
+    for warning in technical.get("indicator_warnings") or []:
+        gaps.append(_gap("technical_indicator_missing", "技术指标", warning))
+    if technical.get("status") in {"partial", "unavailable", "insufficient_data", "error"}:
+        reason = technical.get("reason") or technical.get("error") or (technical.get("macd_structure") or {}).get("reason") or "部分技术结构或长窗口指标尚不可用"
+        gaps.append(_gap("technical_partial", "技术结构", reason))
+    if fundamentals.get("status") != "ok":
+        gaps.append(_gap("fundamental_partial", "基本面", "；".join(fundamentals.get("errors") or []) or "财务或估值字段尚未完整取得"))
+    if snapshot.get("status") != "ok":
+        gaps.append(_gap("snapshot_unavailable", "当前行情", snapshot.get("error") or "实时行情尚未取得"))
+    factor = unified.get("factor_analysis") or {}
+    if factor.get("status") in {"unavailable", "error"}:
+        gaps.append(_gap("factor_unavailable", "八组日线指标", factor.get("reason") or "日线指标暂未形成"))
+    for key, group in (factor.get("groups") or {}).items():
+        if isinstance(group, dict) and group.get("missing_fields"):
+            labels = group.get("metric_definitions") or group.get("field_metadata") or {}
+            missing = [str((labels.get(field) or {}).get("label") or field) for field in group["missing_fields"]]
+            gaps.append(_gap("factor_group_" + key, str(group.get("label") or key), "缺少：" + "、".join(missing)))
+    for block in (unified.get("supplemental_diagnostics") or {}).get("blocks") or []:
+        if block.get("status") != "ok":
+            gaps.append(_gap("supplemental_" + str(block.get("key")), str(block.get("label") or "补充指标"), block.get("missing_reason") or block.get("summary")))
+    seen = set()
+    result = []
+    for gap in gaps:
+        identity = (gap.get("code"), gap.get("reason"))
+        if identity not in seen:
+            seen.add(identity)
+            result.append(gap)
+    return result
 
 
-def fenxi_dangu(
-    *,
-    gupiao: str,
-    config: dict[str, Any],
-    context: FenxiShujuShangxiawen,
-) -> dict[str, Any]:
-    """分析一只股票；所有行情只在 ``context`` 生命周期内复用。"""
-
+def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShangxiawen) -> dict[str, Any]:
     query = " ".join(str(gupiao or "").split())
     if not query:
-        return _source_error_result(
-            query=query,
-            status="clarification_required",
-            outcome="clarification_required",
-            error_code="stock_query_missing",
-            error="请提供要分析的股票名称或 6 位股票代码",
-            next_action="补充完整股票名称或代码",
-            stage="request_validation",
-        )
-
+        return _failure(query, status="clarification_required", outcome="clarification_required", code="stock_query_missing", stage="request_validation", error="请提供股票名称或代码")
     try:
-        code, resolved_profile, resolution_warnings = jiexi_gupiao(query, source="auto")
+        code, resolved_profile, resolution_warnings = context.jiexi_gupiao(query)
     except ValueError as exc:
-        return _source_error_result(
-            query=query,
-            status="clarification_required",
-            outcome="clarification_required",
-            error_code="stock_query_ambiguous",
-            error=str(exc),
-            next_action="请使用完整股票名称或 6 位股票代码",
-            stage="stock_resolution",
-        )
+        return _failure(query, status="clarification_required", outcome="clarification_required", code="stock_query_ambiguous", stage="stock_resolution", error=exc)
     except RuntimeError as exc:
-        error = str(exc)
-        if _is_resolution_unavailable(error):
-            return _source_error_result(
-                query=query,
-                status="unavailable",
-                outcome="data_unavailable",
-                error_code="stock_resolution_unavailable",
-                error=error,
-                next_action="稍后重试；程序不会使用旧本地股票资料代替当前结果",
-                stage="stock_resolution",
-            )
-        return _source_error_result(
-            query=query,
-            status="clarification_required",
-            outcome="clarification_required",
-            error_code="stock_not_found",
-            error=error,
-            next_action="请检查股票名称或代码后重试",
-            stage="stock_resolution",
+        message = str(exc).lower()
+        source_failed = any(marker in message for marker in ("超时", "timeout", "connection", "连接", "限频", "频率", "权限", "permission", "不可用", "失败"))
+        return _failure(
+            query, status="unavailable" if source_failed else "clarification_required",
+            outcome="data_unavailable" if source_failed else "clarification_required",
+            code="stock_resolution_unavailable" if source_failed else "stock_not_found",
+            stage="stock_resolution", error=exc,
         )
-
-    settings = config.get("dangu") if isinstance(config.get("dangu"), dict) else {}
+    stock = _identity(code, resolved_profile or {})
     try:
         clock = context.shichang_shizhong()
-        calendar = context.jiaoyi_rili()
-        requested_date = context.zuixin_wanzheng_jiaoyiri()
+        requested_date = pd.Timestamp(context.zuixin_wanzheng_jiaoyiri()).normalize()
+        if pd.isna(requested_date):
+            raise RuntimeError("最近完整交易日期无效")
     except Exception as exc:
-        return _source_error_result(
-            query=query,
-            status="unavailable",
-            outcome="data_unavailable",
-            error_code="calendar_unavailable",
-            error=f"无法确认最近完整交易日：{exc}",
-            next_action="稍后重试；没有可靠交易日历时不继续技术分析",
-            stage="calendar",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-        )
-
-    history_days = int(settings.get("history_calendar_days", 1440))
-    minimum_rows = int(settings.get("minimum_history_rows", 180))
-    start_date = (requested_date - pd.Timedelta(days=history_days)).strftime("%Y%m%d")
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="calendar_unavailable", stage="calendar", error=exc, stock=stock)
+    start_date = (requested_date - pd.Timedelta(days=int((config.get("dangu") or {}).get("history_calendar_days", 1440)))).strftime("%Y%m%d")
     end_date = requested_date.strftime("%Y%m%d")
     try:
-        histories, history_meta = context.piliang_lishi(
-            [code],
-            start_date=start_date,
-            end_date=end_date,
-            minimum_rows=minimum_rows,
-        )
+        histories, history_meta = context.piliang_lishi([code], start_date=start_date, end_date=end_date, minimum_rows=1)
     except Exception as exc:
-        return _source_error_result(
-            query=query,
-            status="unavailable",
-            outcome="data_unavailable",
-            error_code="single_stock_history_request_failed",
-            error=f"单股历史行情获取失败：{exc}",
-            next_action="稍后重新获取远端完整日线",
-            stage="history_data",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta if "history_meta" in locals() else {}},
-        )
-
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_request_failed", stage="history_data", error=exc, stock=stock)
     history = histories.get(code)
     if history is None or history.empty:
-        incomplete = history_meta.get("incomplete_examples") or []
-        known_incomplete = any(str(item.get("ts_code")) == code for item in incomplete if isinstance(item, dict))
-        if known_incomplete:
-            return _source_error_result(
-                query=query,
-                status="insufficient_data",
-                outcome="information_insufficient",
-                error_code="single_stock_history_insufficient",
-                error=f"{code} 的完整日线少于 {minimum_rows} 个交易日或覆盖率不足",
-                next_action="当前只能说明信息不足，不能把短历史当成可靠结构结论",
-                stage="history_data",
-                stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-                data_provenance={"history": history_meta},
-            )
-        return _source_error_result(
-            query=query,
-            status="unavailable",
-            outcome="data_unavailable",
-            error_code="single_stock_history_unavailable",
-            error=str(history_meta.get("error") or "没有取得该股票的完整远端日线"),
-            next_action="稍后重新获取远端完整日线；不使用本地旧行情代替",
-            stage="history_data",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
-
-    history = history.copy()
-    history["trade_date"] = pd.to_datetime(history.get("trade_date"), errors="coerce").dt.normalize()
-    history = (
-        history.dropna(subset=["trade_date"])
-        .sort_values("trade_date")
-        .drop_duplicates("trade_date", keep="last")
-        .reset_index(drop=True)
-    )
-    history = history[history["trade_date"] <= requested_date.normalize()].reset_index(drop=True)
-    if len(history) < minimum_rows:
-        return _source_error_result(
-            query=query,
-            status="insufficient_data",
-            outcome="information_insufficient",
-            error_code="single_stock_history_insufficient",
-            error=f"有效完整日线只有 {len(history)} 个交易日，低于要求的 {minimum_rows} 个",
-            next_action="当前只能说明信息不足，不能据此给出稳定结构判断",
-            stage="history_data",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
-
-    as_of = pd.Timestamp(history.iloc[-1]["trade_date"]).strftime("%Y-%m-%d")
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_unavailable", stage="history_data", error=history_meta.get("error") or "没有取得目标股票的可用完整日线", stock=stock, provenance={"history": history_meta})
+    if "trade_date" not in history:
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_invalid", stage="history_data", error="目标日线缺少交易日期", stock=stock, provenance={"history": history_meta})
+    dates = pd.to_datetime(history["trade_date"], errors="coerce").dt.normalize()
+    if dates.isna().any() or dates.duplicated().any():
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_invalid", stage="history_data", error="目标日线日期无效或重复，不能任意跳过坏行分析", stock=stock, provenance={"history": history_meta})
+    history = history.assign(trade_date=dates).loc[dates.le(requested_date)].sort_values("trade_date").reset_index(drop=True)
+    if history.empty:
+        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_unavailable", stage="history_data", error="分析日及之前没有可用日线", stock=stock, provenance={"history": history_meta})
+    as_of = history.iloc[-1]["trade_date"].strftime("%Y-%m-%d")
+    extra_gaps: list[dict[str, Any]] = []
     if as_of != requested_date.strftime("%Y-%m-%d"):
-        history_meta = {
-            **history_meta,
-            "analysis_date_adjustment": f"交易日线实际截至 {as_of}，未沿用缺失的请求日期 {requested_date:%Y-%m-%d}",
-        }
-
+        extra_gaps.append(_gap("latest_daily_missing", "最新完整日线", f"实际日线停留在 {as_of}，没有取得请求日期 {requested_date:%Y-%m-%d} 的日线"))
     try:
-        technical = zongjie_jishu(
-            history,
-            macd_structure_config=(config.get("fenxi") or {}).get("macd_structure"),
-        )
+        technical = zongjie_jishu(history, macd_structure_config=(config.get("fenxi") or {}).get("macd_structure"))
     except RuntimeError as exc:
-        return _source_error_result(
-            query=query,
-            status="insufficient_data",
-            outcome="information_insufficient",
-            error_code="single_stock_technical_insufficient",
-            error=f"技术指标有效历史不足：{exc}",
-            next_action="补齐更长的完整日线后再分析",
-            stage="technical_analysis",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
+        technical = {"status": "partial", "reason": str(exc), "trade_date": as_of, "close": history.iloc[-1].get("close")}
     except Exception as exc:
-        return _source_error_result(
-            query=query,
-            status="error",
-            outcome="program_error",
-            error_code="single_stock_technical_error",
-            error=f"单股技术分析程序错误：{exc}",
-            next_action="请记录运行编号并检查程序日志",
-            stage="technical_analysis",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
-
-    technical_status = str(technical.get("status") or "")
-    if technical_status == "error":
-        return _source_error_result(
-            query=query,
-            status="error",
-            outcome="program_error",
-            error_code="single_stock_technical_error",
-            error=str(technical.get("error") or technical.get("macd_structure", {}).get("reason") or "技术结构研判发生程序错误"),
-            next_action="请记录运行编号并检查程序日志",
-            stage="technical_analysis",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
-    if technical_status in {"unavailable", "insufficient_data"}:
-        return _source_error_result(
-            query=query,
-            status="insufficient_data",
-            outcome="information_insufficient",
-            error_code="single_stock_technical_insufficient",
-            error=str(technical.get("reason") or "最新日线缺少完整技术指标，不能沿用旧状态"),
-            next_action="补齐完整日线或等待数据源确认后再分析",
-            stage="technical_analysis",
-            stock={"ts_code": code, "name": resolved_profile.get("name") if isinstance(resolved_profile, dict) else None},
-            data_provenance={"history": history_meta},
-        )
-
-    # 单股请求至多读取一次实时全市场快照；它只是当前可交易性参考，不能回填历史收盘。
+        technical = {"status": "error", "outcome": "program_error", "error": str(exc), "trade_date": as_of}
     try:
         snapshot = context.dangu_kuaizhao(code)
     except Exception as exc:
-        snapshot = {
-            "status": "unavailable",
-            "error": f"实时快照请求失败：{exc}",
-            "source": "remote_live_snapshot",
-        }
-    name_hint = str((resolved_profile or {}).get("name") or snapshot.get("name") or code)
+        snapshot = {"status": "unavailable", "source": "remote_live_snapshot", "error": str(exc)}
+    allow_current = bool(clock.get("session_status") == "post_close" and pd.Timestamp(context.reference.date()).normalize() == pd.Timestamp(as_of))
+    try:
+        fundamentals = _fundamental_block(context.jibenmian(code, trade_date=as_of, allow_current_snapshot=allow_current), as_of)
+    except Exception as exc:
+        fundamentals = _fundamental_block({"errors": [str(exc)]}, as_of)
+    stock = _identity(code, resolved_profile or {}, fundamentals.get("profile") or {}, snapshot)
+    name = str(stock.get("name") or code)
+    realtime_required = clock.get("session_status") in {"opening_auction", "trading", "midday_break", "close_pending"}
     try:
         tradability = goujian_kejiaoyixing_zhaiyao(
-            code=code,
-            name=name_hint,
-            snapshot=snapshot,
-            history=history,
+            code=code, name=name, snapshot=snapshot, history=history,
             minimum_amount=float((config.get("fenxi") or {}).get("min_amount_yuan", 50_000_000)),
+            realtime_required=realtime_required,
+            reference_time=context.reference,
         )
     except Exception as exc:
-        tradability = {
-            "status": "unavailable",
-            "basic_execution_feasible": False,
-            "hard_blocks": [],
-            "cautions": [f"可交易性检查失败：{exc}"],
-        }
-
-    reference = context.reference
-    allow_current_snapshot = (
-        str(clock.get("session_status")) == "post_close"
-        and pd.Timestamp(reference.date()).normalize() == pd.Timestamp(as_of).normalize()
+        tradability = {"status": "unavailable", "cautions": [str(exc)]}
+        extra_gaps.append(_gap("tradability_unavailable", "成交条件", exc))
+    if realtime_required and not tradability.get("current_quote_verified"):
+        extra_gaps.append(_gap("current_quote_unverified", "当前行情时点与成交条件",
+                               tradability.get("current_quote_reason") or "实时行情未通过核验"))
+    unified = yunxing_dangu_tongyi_lianghua(
+        code=code, name=name, industry=str(stock.get("industry") or ""), history=history,
+        analysis_date=pd.Timestamp(as_of), snapshot=snapshot, clock=clock,
+        technical=technical, fundamentals=fundamentals, tradability=tradability,
+        config=config, context=context,
     )
-    try:
-        raw_fundamentals = huoqu_jibenmian(
-            code,
-            trade_date=as_of,
-            allow_current_snapshot=allow_current_snapshot,
-        )
-    except Exception as exc:
-        raw_fundamentals = {
-            "profile": {},
-            "valuation": {},
-            "financials": {},
-            "sources": {},
-            "data_quality": {},
-            "warnings": [],
-            "errors": [f"基本面请求失败：{exc}"],
-        }
-    fundamentals = _fundamental_block(raw_fundamentals, as_of=as_of)
-    stock = _identity(
-        code,
-        resolved_profile,
-        fundamentals.get("profile"),
-        snapshot,
+    stock = _identity(code, stock, unified.get("stock_identity") or {})
+    name = str(stock.get("name") or name)
+    fundamentals = unified.get("fundamental_analysis") or fundamentals
+    gaps = [*extra_gaps, *_collect_gaps(technical, fundamentals, snapshot, unified)]
+    risks = _texts([
+        *((technical.get("macd_structure") or {}).get("risk_warnings") or []),
+        *(tradability.get("hard_blocks") or []), *(tradability.get("cautions") or []),
+    ])
+    if "ST" in name.upper():
+        risks.append("股票简称含ST风险标记，需结合风险警示说明理解；本次仍保留完整分析")
+    if "退" in name:
+        risks.append("股票简称含退市风险标记，需核对退市安排")
+    summary = goujian_dangu_zhaiyao(
+        technical=technical, fundamentals=fundamentals, risks=risks, evidence_gaps=gaps, as_of=as_of,
+        factor_analysis=unified.get("factor_analysis"), pattern=unified.get("limit_up_pullback_pattern"),
+        late=unified.get("late_session_analysis"), supplemental=unified.get("supplemental_diagnostics"),
     )
-    if stock.get("name") in (None, ""):
-        stock["name"] = name_hint
-
-    try:
-        unified = yunxing_dangu_tongyi_lianghua(
-            code=code,
-            name=str(stock.get("name") or name_hint),
-            industry=str(stock.get("industry") or ""),
-            history=history,
-            analysis_date=pd.Timestamp(as_of),
-            snapshot=snapshot,
-            clock=clock,
-            technical=technical,
-            fundamentals=fundamentals,
-            tradability=tradability,
-            config=config,
-            context=context,
-        )
-    except RuntimeError as exc:
-        return _source_error_result(
-            query=query,
-            status="unavailable",
-            outcome="data_unavailable",
-            error_code="single_stock_unified_quantitative_unavailable",
-            error=f"单股统一量化分析未完成：{exc}",
-            next_action="稍后重新获取横截面和比较池日线；不使用旧市场数据降级",
-            stage="unified_quantitative_analysis",
-            stock=stock,
-            data_provenance={"history": history_meta},
-        )
-    fundamentals = unified["fundamental_analysis"]
-    tradability = unified["tradability"]
-    buy_decision = unified["buy_decision"]
-    unified_identity = unified.get("stock_identity")
-    if isinstance(unified_identity, dict):
-        for key in ("name", "industry", "market", "list_date"):
-            value = unified_identity.get(key)
-            current = stock.get(key)
-            if value not in (None, "") and (
-                current in (None, "") or (key == "name" and str(current) == code)
-            ):
-                stock[key] = value
-    recommended = bool(buy_decision.get("meets_recommendation_threshold"))
-
-    warnings = _dedupe(
-        [
-            *(resolution_warnings or []),
-            *(history_meta.get("warnings") or []),
-            *(fundamentals.get("warnings") or []),
-        ]
-    )
-    risks = _technical_risks(technical)
-    risks.extend(_dedupe(unified.get("risks")))
-    risks.extend(_dedupe(tradability.get("hard_blocks")))
-    risks.extend(_dedupe(tradability.get("cautions")))
-    if fundamentals.get("status") != "ok":
-        risks.append("基本面数据不可用或不完整，不能据此断言基本面差")
-    if snapshot.get("status") != "ok":
-        risks.append("实时快照不可用，当前价格和可交易性只能按最近完整日线参考")
-    risks = list(dict.fromkeys(risks))
-
+    status = "error" if technical.get("status") == "error" else "partial" if gaps else "ok"
+    confirmation = "intraday_provisional" if clock.get("session_status") in {"opening_auction", "trading", "midday_break"} else "close_pending" if clock.get("session_status") == "close_pending" else "completed_daily_close"
+    generated_at = context.reference.strftime("%Y-%m-%d %H:%M:%S")
     result = {
-        "status": "ok",
-        "outcome": "recommendation" if recommended else "no_recommendation",
-        "tool_contract_version": DANGU_TOOL_CONTRACT_VERSION,
-        "analysis_type": DANGU_ANALYSIS_TYPE,
-        "query": query,
-        "stock": stock,
-        "selected_stock": stock,
-        "as_of": as_of,
-        "generated_at": context.reference.strftime("%Y-%m-%d %H:%M:%S"),
-        "market_clock": _json_safe(clock),
-        "result_confirmation": _result_confirmation(clock),
-        "recommendation_available": recommended,
-        "primary": None,
-        "alternatives": [],
-        "buy_decision": _json_safe(buy_decision),
-        "daily_factor_analysis": _json_safe(unified.get("factor_analysis")),
-        "limit_up_pullback_pattern": _json_safe(unified.get("limit_up_pullback_pattern")),
-        "late_session_analysis": _json_safe(unified.get("late_session_analysis")),
-        "ranking_details": _json_safe(unified.get("ranking_details")),
-        "technical_summary": _json_safe(technical),
+        "status": status, "outcome": "program_error" if status == "error" else "information_partial" if status == "partial" else "analysis_success",
+        "analysis_type": DANGU_ANALYSIS_TYPE, "tool_contract_version": DANGU_TOOL_CONTRACT_VERSION,
+        "query": query, "stock": stock, "selected_stock": stock,
+        "as_of": as_of, "generated_at": generated_at, "market_clock": clock,
+        "result_confirmation": confirmation, "recommendation_available": False,
+        "primary": None, "alternatives": [],
+        "diagnosis_summary": summary, "plain_language_summary": summary["summary"],
+        "reassessment_conditions": summary["reassessment_conditions"],
+        "technical_summary": technical, "daily_factor_analysis": unified.get("factor_analysis"),
         "fundamental_analysis": fundamentals,
-        "tradability": _json_safe(tradability),
-        "risks": risks,
-        "warnings": warnings,
+        "limit_up_pullback_pattern": unified.get("limit_up_pullback_pattern"),
+        "late_session_analysis": unified.get("late_session_analysis"),
+        "supplemental_diagnostics": unified.get("supplemental_diagnostics"),
+        "realtime_snapshot": snapshot, "tradability": tradability, "evidence_gaps": gaps,
+        "risks": risks, "warnings": _texts([*(resolution_warnings or []), *(history_meta.get("warnings") or []), *(fundamentals.get("warnings") or [])]),
+        "diagnosis_validity": {
+            "daily_data_as_of": as_of, "generated_at": generated_at,
+            "session_status": clock.get("session_status"), "result_confirmation": confirmation,
+            "realtime_required": realtime_required,
+            "realtime_status": tradability.get("current_quote_status") or snapshot.get("status"),
+            "explanation": f"日线证据截至 {as_of}，生成于 {generated_at}。盘中行情会变化，缺失来源已单独列明；新日线或财报发布后需重新分析。",
+            "reassess_when": summary["reassessment_conditions"],
+        },
+        "data_analysis": {
+            "latest_daily_bar": history.iloc[-1].to_dict(), "resolved_profile": resolved_profile,
+            "comparison_profile": unified.get("comparison_profile"),
+            "history_summary": {"rows": len(history), "first_trade_date": history.iloc[0]["trade_date"].strftime("%Y-%m-%d"), "last_trade_date": as_of, "requested_start_date": start_date, "requested_end_date": end_date},
+        },
         "data_provenance": {
-            "stock_resolution": {
-                "source": "remote_stock_basic_or_akshare",
-                "warnings": list(resolution_warnings or []),
-                "persistence": "none",
-            },
-            "history": _json_safe(history_meta),
-            "realtime_snapshot": _json_safe(
-                {
-                    key: snapshot.get(key)
-                    for key in (
-                        "status",
-                        "source",
-                        "captured_at",
-                        "provider_trade_date",
-                        "timeliness",
-                        "error",
-                    )
-                    if key in snapshot
-                }
-            ),
-            "fundamentals": {
-                "sources": fundamentals.get("sources", {}),
-                "as_of": as_of,
-                "persistence": "none",
-            },
-            **_json_safe(unified.get("data_provenance") or {}),
+            "stock_resolution": {"persistence": "none", "warnings": resolution_warnings},
+            "history": history_meta,
+            "realtime_snapshot": {key: snapshot.get(key) for key in ("status", "source", "captured_at", "provider_trade_date", "timeliness", "error") if key in snapshot},
+            "fundamentals": {"sources": fundamentals.get("sources") or {}, "as_of": as_of, "persistence": "none"},
+            **(unified.get("data_provenance") or {}),
         },
-        "analysis_stage": {
-            "status": "completed",
-            "scope": "单股身份、八组日K因子、基本面、形态、尾盘、风险扣分、综合评分和买入门槛复核已完成",
-            "prediction_status": "not_available",
-            "prediction_confirmation_required": False,
-            "confirmation_timing": "not_applicable",
-            "initial_preapproval_counts": False,
-            "affirmative_reply_defaults_to": None,
-            "prediction_data_policy": "fresh_remote_download_without_local_market_cache",
-            "next_step": "当前结果已明确是否建议买入；单股结论不产生自动预测资格",
-        },
-        "research_scope": "公开数据单股量化研究建议，不连接证券账户、不提交委托、不自动交易",
+        "analysis_stage": {"status": status, "scope": "股票已有行情、指标、财务、形态、尾盘及来源证据的完整呈现"},
+        "research_scope": "公开数据单股分析，不连接证券账户或执行交易",
     }
+    if status == "error":
+        result.update(error_code="single_stock_technical_error", error=technical.get("error") or technical.get("reason") or "技术分析程序错误", stage="technical_analysis")
     return _json_safe(result)
 
 

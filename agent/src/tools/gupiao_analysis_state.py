@@ -1,4 +1,4 @@
-"""分析与按需预测之间的进程内会话状态，不保存任何市场时间序列。"""
+"""仅供本进程解释已有分析的会话状态，不保存任何市场时间序列。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from uuid import uuid4
 
 
 def _contains_tabular_market_data(value: Any, seen: set[int] | None = None) -> bool:
-    """阻止 DataFrame/Series 越过分析与预测的会话边界。"""
+    """阻止 DataFrame/Series 进入分析会话。"""
     value_type = type(value)
     if value_type.__module__.startswith("pandas") and value_type.__name__ in {
         "DataFrame",
@@ -35,7 +35,6 @@ class AnalysisSession:
     """一次量化分析的会话交接信息；进程退出后自然失效。"""
 
     result: dict[str, Any]
-    prediction_context: dict[str, Any] | None
     created_at: datetime
 
 
@@ -52,17 +51,13 @@ class AnalysisSessionStore:
     def save(
         self,
         result: dict[str, Any],
-        prediction_context: dict[str, Any] | None = None,
     ) -> str:
         """保存分析结果和候选身份；禁止放入行情 DataFrame。"""
-        if _contains_tabular_market_data(result) or _contains_tabular_market_data(
-            prediction_context
-        ):
+        if _contains_tabular_market_data(result):
             raise ValueError("分析会话状态禁止保存 DataFrame 或 Series")
         analysis_id = f"fx_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
         session = AnalysisSession(
             result=copy.deepcopy(result),
-            prediction_context=copy.deepcopy(prediction_context),
             created_at=datetime.now(),
         )
         with self._lock:

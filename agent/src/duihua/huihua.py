@@ -66,6 +66,8 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
             ensure_ascii=False,
         )
         return copied
+    if payload.get("status") == "reanalysis_required":
+        return copied
     scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
     requested_name = str(
         scope.get("requested_name") or scope.get("canonical_name") or ""
@@ -98,7 +100,7 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
             "stock_reference": minimal_stock,
             "scope_request": scope_request,
             "message": (
-                "会话只保留范围和股票指代，不保存行情、板块成分、因子或预测输入；"
+                "会话只保留范围和股票指代，不保存行情、板块成分或因子；"
                 "恢复会话后必须重新获取远端数据并分析。"
             ),
             "market_data_persistence": "none",
@@ -111,9 +113,25 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
 def zhengli_chijiuhua_xiaoxi(messages: Iterable[Any]) -> list[dict[str, Any]]:
     """保存会话时移除可被误作本地行情缓存的完整量化工具结果。"""
     persistent: list[dict[str, Any]] = []
+    retired_forecast_active = False
     for message in zhengli_xiaoxi(messages):
         if message.get("role") == "tool" and message.get("name") == "gupiao_fenxi":
+            retired_forecast_active = False
             persistent.append(_chijiuhua_fenxi_biaoji(message))
+        elif message.get("role") == "tool" and message.get("name") == "gupiao_yuce":
+            retired_forecast_active = True
+            message["content"] = json.dumps(
+                {
+                    "status": "obsolete_history_result",
+                    "outcome": "feature_removed",
+                    "message": "历史预测已过期，当前仅提供股票分析与诊断。",
+                    "market_data_persistence": "none",
+                },
+                ensure_ascii=False,
+            )
+            persistent.append(message)
+        elif retired_forecast_active and message.get("role") == "assistant" and not message.get("tool_calls"):
+            persistent.append({"role": "assistant", "content": "[历史预测已过期；当前只提供股票分析与诊断。]"})
         else:
             persistent.append(message)
     return persistent
@@ -208,7 +226,7 @@ class DuihuaCunchu:
             chuangjian_shijian=str(data.get("chuangjian_shijian") or _xianzai()),
             gengxin_shijian=str(data.get("gengxin_shijian") or _xianzai()),
             lunshu=lunshu,
-            xiaoxi=zhengli_xiaoxi(data.get("xiaoxi") or []),
+            xiaoxi=zhengli_chijiuhua_xiaoxi(data.get("xiaoxi") or []),
         )
 
     def liechu(self, shuliang: int = 10) -> list[DuihuaHuihua]:

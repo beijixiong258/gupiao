@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ast
+import copy
 import importlib.util
 import time
 from collections import Counter
@@ -106,10 +107,60 @@ class FenxiShujuShangxiawen:
     source: str = "auto"
     _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
-    def jiaoyi_rili(self) -> JiaoyiRili:
+    def jiaoyi_rili(self, *, start_date: str | None = None, end_date: str | None = None) -> JiaoyiRili:
         if "jiaoyi_rili" not in self._memo:
-            self._memo["jiaoyi_rili"] = huoqu_jiaoyi_rili(self.reference)
+            config, _ = jiazai_lianghua_peizhi()
+            history_days = max(
+                int(config.get("dangu", {}).get("history_calendar_days", 1440)),
+                int(config.get("fenxi", {}).get("history_calendar_days", 420)),
+            )
+            # 完整收盘日可能早于今天；覆盖节假日差值，后续历史请求仍检查边界。
+            initial_start = (pd.Timestamp(self.reference.date()) - pd.Timedelta(days=history_days + 45)).strftime("%Y-%m-%d")
+            self._memo["jiaoyi_rili"] = huoqu_jiaoyi_rili(self.reference, start_date=initial_start)
+        calendar = self._memo["jiaoyi_rili"]
+        required_start = pd.Timestamp(start_date or calendar.start_date).normalize()
+        required_end = pd.Timestamp(end_date or calendar.end_date).normalize()
+        if required_start < pd.Timestamp(calendar.start_date) or required_end > pd.Timestamp(calendar.end_date):
+            self._memo["jiaoyi_rili"] = huoqu_jiaoyi_rili(
+                self.reference,
+                start_date=min(required_start, pd.Timestamp(calendar.start_date)).strftime("%Y-%m-%d"),
+                end_date=max(required_end, pd.Timestamp(calendar.end_date)).strftime("%Y-%m-%d"),
+            )
         return self._memo["jiaoyi_rili"]
+
+    def gupiao_ziliao(self) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """股票身份、候选横截面和深度基本面共用本次资料表，包括失败结果。"""
+        if "gupiao_ziliao" not in self._memo:
+            quality: dict[str, Any] = {}
+            try:
+                frame = huoqu_gupiao_jichu_ziliao(_tushare_pro(), quality)
+                self._memo["gupiao_ziliao"] = (frame, quality, None)
+            except Exception as exc:
+                self._memo["gupiao_ziliao"] = (pd.DataFrame(), quality, str(exc))
+        frame, quality, error = self._memo["gupiao_ziliao"]
+        if error is not None:
+            raise RuntimeError(error)
+        return frame.copy(), copy.deepcopy(quality)
+
+    def jiexi_gupiao(self, query: str) -> tuple[str, dict[str, Any], list[str]]:
+        from src.ashare.gupiao_yanjiu import jiexi_gupiao
+
+        return jiexi_gupiao(query, source=self.source, stock_basic_loader=self.gupiao_ziliao)
+
+    def jibenmian(self, code: str, *, trade_date: str, allow_current_snapshot: bool = False) -> dict[str, Any]:
+        from src.ashare.gupiao_yanjiu import huoqu_jibenmian
+
+        normalized = _normalize_code(code)
+        key = f"jibenmian:{normalized}:{trade_date}:{allow_current_snapshot}"
+        if key not in self._memo:
+            self._memo[key] = huoqu_jibenmian(
+                normalized,
+                trade_date=trade_date,
+                allow_current_snapshot=allow_current_snapshot,
+                stock_basic_loader=self.gupiao_ziliao,
+                realtime_loader=self.shishi_kuaizhao,
+            )
+        return copy.deepcopy(self._memo[key])
 
     def shichang_shizhong(self) -> dict[str, Any]:
         if "shichang_shizhong" not in self._memo:
@@ -146,13 +197,14 @@ class FenxiShujuShangxiawen:
                 "captured_at": meta.get("captured_at"),
                 "error": f"实时快照未找到 {normalized}",
             }
-        return {"status": "ok", **_json_safe_record(hit.iloc[0].to_dict()), **meta}
+        return {**meta, **_json_safe_record(hit.iloc[0].to_dict()), "status": "ok"}
 
     def zuixin_hengjiemian(self) -> tuple[pd.DataFrame, dict[str, Any]]:
         if "zuixin_hengjiemian" not in self._memo:
             self._memo["zuixin_hengjiemian"] = huoqu_zuixin_hengjiemian(
                 self.zuixin_wanzheng_jiaoyiri(),
                 realtime_loader=self.shishi_kuaizhao,
+                stock_basic_loader=self.gupiao_ziliao,
             )
         frame, meta = self._memo["zuixin_hengjiemian"]
         return frame.copy(), dict(meta)
@@ -193,7 +245,7 @@ class FenxiShujuShangxiawen:
                 start_date=start_date,
                 end_date=end_date,
                 minimum_rows=minimum_rows,
-                calendar=self.jiaoyi_rili(),
+                calendar=self.jiaoyi_rili(start_date=start_date, end_date=end_date),
             )
         histories, meta = self._memo[memo_key]
         return {code: frame.copy() for code, frame in histories.items()}, dict(meta)
@@ -369,6 +421,8 @@ def _huoqu_xinlang_jiaoyi_rili(
     if values.empty:
         raise ValueError("新浪交易日历解码后为空")
     normalized = values.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None).dt.normalize()
+    if normalized.min() > start or normalized.max() < end:
+        raise ValueError("新浪交易日历未覆盖请求区间，不能据此截短历史行情")
     dates = frozenset(pd.Timestamp(value) for value in normalized if start <= value <= end)
     if not dates:
         raise ValueError("新浪交易日历不覆盖所需日期范围")
@@ -382,20 +436,27 @@ def _huoqu_xinlang_jiaoyi_rili(
     }
 
 
-def huoqu_jiaoyi_rili(reference: datetime | None = None) -> JiaoyiRili:
+def huoqu_jiaoyi_rili(
+    reference: datetime | None = None,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> JiaoyiRili:
     """读取远端交易日历；Tushare 受限时降级新浪，不用星期数冒充。"""
     current = reference or _beijing_now()
-    start = pd.Timestamp(current.date()) - pd.Timedelta(days=550)
-    end = pd.Timestamp(current.date()) + pd.Timedelta(days=45)
+    start = pd.Timestamp(start_date).normalize() if start_date else pd.Timestamp(current.date()) - pd.Timedelta(days=550)
+    end = pd.Timestamp(end_date).normalize() if end_date else pd.Timestamp(current.date())
+    if pd.isna(start) or pd.isna(end) or start > end:
+        raise ValueError("交易日历日期范围无效")
     warnings: list[str] = []
     attempted: list[dict[str, Any]] = []
     config, _ = jiazai_lianghua_peizhi()
     network_settings = config.get("wangluo", {}) if isinstance(config.get("wangluo"), dict) else {}
     maximum_attempts = int(network_settings.get("tushare_max_attempts", 2))
     backoff = float(network_settings.get("retry_backoff_seconds", 0.35))
-    pro = _tushare_pro()
     for attempt in range(1, maximum_attempts + 1):
         try:
+            pro = _tushare_pro()
             frame = pro.trade_cal(
                 exchange="",
                 start_date=start.strftime("%Y%m%d"),
@@ -403,10 +464,15 @@ def huoqu_jiaoyi_rili(reference: datetime | None = None) -> JiaoyiRili:
             )
             if frame is None or frame.empty or not {"cal_date", "is_open"}.issubset(frame.columns):
                 raise RuntimeError("Tushare 交易日历为空或字段不完整")
+            calendar_dates = pd.to_datetime(frame["cal_date"], errors="coerce").dropna().dt.normalize()
+            if calendar_dates.empty or calendar_dates.min() > start or calendar_dates.max() < end:
+                raise RuntimeError("Tushare 交易日历未覆盖请求区间")
             dates = pd.to_datetime(
                 frame.loc[pd.to_numeric(frame["is_open"], errors="coerce").eq(1), "cal_date"],
                 errors="coerce",
             ).dropna()
+            if dates.empty:
+                raise RuntimeError("Tushare 交易日历没有可核验的开市日期")
             attempted.append(
                 {"provider": "tushare_trade_cal", "attempt": attempt, "outcome": "ok"}
             )
@@ -540,6 +606,16 @@ def zuixin_wanzheng_jiaoyiri(
     return latest
 
 
+def _add_quote_timestamps(data: pd.DataFrame) -> pd.DataFrame:
+    if "f124" in data.columns:
+        # 东方财富逐只股票更新时间为 Unix 秒；无效值留空，不用请求时间补齐。
+        seconds = pd.to_numeric(data["f124"], errors="coerce")
+        times = pd.to_datetime(seconds.where(seconds.gt(0)), unit="s", utc=True, errors="coerce").dt.tz_convert("Asia/Shanghai")
+        data["provider_quote_time"] = times.dt.strftime("%Y-%m-%d %H:%M:%S").where(times.notna(), None)
+        data["provider_trade_date"] = times.dt.strftime("%Y-%m-%d").where(times.notna(), None)
+    return data
+
+
 def _normalize_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
     rename = {
         "代码": "ts_code",
@@ -554,7 +630,7 @@ def _normalize_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
         "成交额": "amount_yuan",
         "换手率": "turnover_rate",
         "量比": "volume_ratio",
-        "市盈率-动态": "pe_ttm",
+        "市盈率-动态": "pe_dynamic",
         "市净率": "pb",
         "总市值": "total_market_value_yuan",
         "流通市值": "circulating_market_value_yuan",
@@ -580,6 +656,7 @@ def _normalize_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
         "turnover_rate",
         "volume_ratio",
         "pe_ttm",
+        "pe_dynamic",
         "pb",
         "total_market_value_yuan",
         "circulating_market_value_yuan",
@@ -590,7 +667,7 @@ def _normalize_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
     if "volume" in data.columns:
         # 东方财富现货接口以“手”为单位；统一转换为股，与日线口径一致。
         data["volume"] = data["volume"] * 100.0
-    return data.drop_duplicates("ts_code", keep="first").reset_index(drop=True)
+    return _add_quote_timestamps(data).drop_duplicates("ts_code", keep="first").reset_index(drop=True)
 
 
 def _huoqu_dongcai_shishi_kuaizhao(
@@ -610,7 +687,7 @@ def _huoqu_dongcai_shishi_kuaizhao(
                 "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
                 "fields": (
                     "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,"
-                    "f20,f21,f23"
+                    "f20,f21,f23,f124"
                 ),
             },
         )
@@ -647,7 +724,7 @@ def _huoqu_dongcai_shishi_kuaizhao(
     return data, {
         "status": "ok",
         "source": "eastmoney_live_a_share_snapshot",
-        "captured_at": captured.strftime("%Y-%m-%d %H:%M:%S"),
+        "captured_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
         "rows": int(len(data)),
         "reported_rows": int(reported_total),
         "endpoint_host": urlsplit(endpoint).hostname,
@@ -655,7 +732,7 @@ def _huoqu_dongcai_shishi_kuaizhao(
         "failed_attempt_count": len(failures),
         "failed_attempt_examples": failures[:5],
         "provider_trade_date": None,
-        "timeliness": "接口不返回逐行交易日期，盘中证据均标记为暂定",
+        "timeliness": "逐只保留来源更新时间；按待核验交易日检查，盘中证据仍为暂定",
         "persistence": "none",
     }
 
@@ -679,7 +756,7 @@ def huoqu_shishi_kuaizhao(reference: datetime | None = None) -> tuple[pd.DataFra
         return data, {
             "status": "ok",
             "source": "akshare_eastmoney_spot",
-            "captured_at": captured.strftime("%Y-%m-%d %H:%M:%S"),
+            "captured_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "rows": int(len(data)),
             "provider_trade_date": None,
             "timeliness": "接口不返回逐行交易日期，盘中证据均标记为暂定",
@@ -690,7 +767,7 @@ def huoqu_shishi_kuaizhao(reference: datetime | None = None) -> tuple[pd.DataFra
         return pd.DataFrame(), {
             "status": "unavailable",
             "source": "eastmoney_snapshot_and_akshare_fallback",
-            "captured_at": captured.strftime("%Y-%m-%d %H:%M:%S"),
+            "captured_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "error_code": "live_snapshot_unavailable",
             "retryable": True,
             "error": (
@@ -718,7 +795,8 @@ def huoqu_dangqian_kuaizhao(code: str, reference: datetime | None = None) -> dic
         "status": "ok",
         "source": meta.get("source"),
         "captured_at": meta.get("captured_at"),
-        "provider_trade_date": meta.get("provider_trade_date"),
+        "provider_trade_date": row.get("provider_trade_date", meta.get("provider_trade_date")),
+        "provider_quote_time": row.get("provider_quote_time"),
         "timeliness": meta.get("timeliness"),
         "name": row.get("name"),
         "last_price": _number(row.get("latest_price")),
@@ -731,7 +809,8 @@ def huoqu_dangqian_kuaizhao(code: str, reference: datetime | None = None) -> dic
         "amount_yuan": _number(row.get("amount_yuan")),
         "turnover_rate_pct": _number(row.get("turnover_rate")),
         "volume_ratio": _number(row.get("volume_ratio")),
-        "pe_dynamic": _number(row.get("pe_ttm")),
+        "pe_dynamic": _number(row.get("pe_dynamic")),
+        "pe_ttm": _number(row.get("pe_ttm")),
         "pb": _number(row.get("pb")),
         "circulating_market_value_yuan": _number(row.get("circulating_market_value_yuan")),
     }
@@ -741,6 +820,7 @@ def huoqu_zuixin_hengjiemian(
     trade_date: pd.Timestamp,
     *,
     realtime_loader: Any | None = None,
+    stock_basic_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """读取一个完整交易日的全市场行情、估值和股票资料横截面。"""
     warnings: list[str] = []
@@ -759,7 +839,10 @@ def huoqu_zuixin_hengjiemian(
         daily["volume"] = pd.to_numeric(daily.get("vol"), errors="coerce") * 100.0
         daily["amount_yuan"] = pd.to_numeric(daily.get("amount"), errors="coerce") * 1000.0
         basic_quality: dict[str, Any] = {}
-        basic = huoqu_gupiao_jichu_ziliao(pro, basic_quality)
+        if stock_basic_loader is None:
+            basic = huoqu_gupiao_jichu_ziliao(pro, basic_quality)
+        else:
+            basic, basic_quality = stock_basic_loader()
         warnings.extend(str(value) for value in basic_quality.get("warnings", []))
         basic = basic.copy()
         basic["ts_code"] = basic["ts_code"].map(_normalize_code)
@@ -834,106 +917,10 @@ def huoqu_zuixin_hengjiemian(
         }
 
 
-def _normalise_universe_codes(frame: pd.DataFrame) -> pd.DataFrame:
-    """同行和统一选股共用的横截面代码归一化。"""
-    if frame is None or frame.empty or "ts_code" not in frame.columns:
-        return pd.DataFrame()
-    data = frame.copy()
-    data["ts_code"] = data["ts_code"].astype(str)
-    data = data[data["ts_code"].map(_shi_a_gu)].copy()
-    data["ts_code"] = data["ts_code"].map(_normalize_code)
-    return data.drop_duplicates("ts_code", keep="first").reset_index(drop=True)
 
 
-def huoqu_tushare_hengjiemian(
-    signal_date: pd.Timestamp,
-) -> tuple[pd.DataFrame, str, list[str], dict[str, Any]]:
-    """单股同行选择使用的 Tushare 时点横截面。"""
-    pro = _tushare_pro()
-    warnings: list[str] = []
-    quality: dict[str, Any] = {}
-    basic = huoqu_gupiao_jichu_ziliao(pro, quality)
-    warnings.extend(str(value) for value in quality.get("warnings", []))
-    stock_master_meta: dict[str, Any] = {
-        "status": "live_current_snapshot",
-        "source": str((quality.get("stock_basic") or {}).get("source") or "tushare_live"),
-        "persistence": "none",
-        "known_bias": "股票资料和行业标签来自当前接口；分析历史日期时可能存在行业分类时点偏差",
-    }
-    daily = pd.DataFrame()
-    daily_date = ""
-    for offset in range(12):
-        candidate = signal_date - timedelta(days=offset)
-        candidate_text = candidate.strftime("%Y%m%d")
-        raw = pro.daily(trade_date=candidate_text)
-        if raw is not None and not raw.empty:
-            daily = raw.copy()
-            daily_date = candidate_text
-            break
-    if daily.empty:
-        raise RuntimeError("Tushare 未返回信号日前的全市场日行情")
-    daily["amount_yuan"] = pd.to_numeric(daily.get("amount"), errors="coerce") * 1000.0
-    daily["latest_price"] = pd.to_numeric(daily.get("close"), errors="coerce")
-    daily["pct_chg"] = pd.to_numeric(daily.get("pct_chg"), errors="coerce")
-    daily = daily[[column for column in ("ts_code", "latest_price", "pct_chg", "amount_yuan") if column in daily.columns]]
-    try:
-        daily_basic = pro.daily_basic(
-            trade_date=daily_date,
-            fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv,circ_mv",
-        )
-        if daily_basic is not None and not daily_basic.empty:
-            for column in ("turnover_rate", "pe_ttm", "pb", "total_mv", "circ_mv"):
-                daily_basic[column] = pd.to_numeric(daily_basic.get(column), errors="coerce")
-            daily_basic["total_market_value_yuan"] = daily_basic["total_mv"] * 10_000.0
-            daily_basic["circulating_market_value_yuan"] = daily_basic["circ_mv"] * 10_000.0
-            keep = [
-                "ts_code",
-                "turnover_rate",
-                "pe_ttm",
-                "pb",
-                "total_market_value_yuan",
-                "circulating_market_value_yuan",
-            ]
-            daily = daily.merge(daily_basic[keep], on="ts_code", how="left")
-    except Exception as exc:
-        warnings.append(f"同行估值横截面不可用：{exc}")
-    basic = _normalise_universe_codes(basic)
-    daily = _normalise_universe_codes(daily)
-    data = basic.merge(daily, on="ts_code", how="left")
-    return data, pd.Timestamp(daily_date).strftime("%Y-%m-%d"), warnings, stock_master_meta
 
 
-def huoqu_akshare_hengjiemian(
-    signal_date: pd.Timestamp,
-) -> tuple[pd.DataFrame, str, list[str], dict[str, Any]]:
-    """单股同行选择使用的 AKShare 降级横截面。"""
-    data, snapshot_meta = huoqu_shishi_kuaizhao()
-    if data.empty:
-        raise RuntimeError(str(snapshot_meta.get("error") or "AKShare 全市场快照为空"))
-    warnings = ["同行池降级为 AKShare 当前快照，横截面日期由分析信号日近似"]
-    try:
-        quality: dict[str, Any] = {}
-        basic = huoqu_gupiao_jichu_ziliao(_tushare_pro(), quality)
-        if not basic.empty:
-            basic = _normalise_universe_codes(basic)
-            supplement = [column for column in ("ts_code", "name", "industry", "market", "list_date") if column in basic.columns]
-            data = data.merge(basic[supplement], on="ts_code", how="left", suffixes=("", "_basic"))
-            if "name_basic" in data.columns:
-                data["name"] = data["name"].fillna(data["name_basic"])
-                data = data.drop(columns=["name_basic"])
-    except Exception as exc:
-        warnings.append(f"Tushare 实时股票资料补充失败：{exc}")
-    return (
-        data,
-        signal_date.strftime("%Y-%m-%d"),
-        warnings,
-        {
-            "status": "live_current_snapshot",
-            "source": "akshare_current_snapshot",
-            "persistence": "none",
-            "known_bias": "AKShare 快照没有历史行业成员时点，不能用于回填过去行业标签",
-        },
-    )
 
 
 def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
@@ -950,7 +937,7 @@ def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
         "成交额": "amount_yuan",
         "换手率": "turnover_rate",
         "量比": "volume_ratio",
-        "市盈率-动态": "pe_ttm",
+        "市盈率-动态": "pe_dynamic",
         "市净率": "pb",
         "总市值": "total_market_value_yuan",
         "流通市值": "circulating_market_value_yuan",
@@ -961,7 +948,7 @@ def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
         "volume": "volume",
         "amount": "amount_yuan",
         "turnoverratio": "turnover_rate",
-        "per": "pe_ttm",
+        "per": "pe_unspecified",
     }
     data = frame.rename(columns={key: value for key, value in rename.items() if key in frame.columns}).copy()
     if not {"ts_code", "name"}.issubset(data.columns):
@@ -982,6 +969,8 @@ def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
         "turnover_rate",
         "volume_ratio",
         "pe_ttm",
+        "pe_dynamic",
+        "pe_unspecified",
         "pb",
         "total_market_value_yuan",
         "circulating_market_value_yuan",
@@ -990,7 +979,7 @@ def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
             data[column] = pd.to_numeric(data[column], errors="coerce")
     if "volume" in data.columns:
         data["volume"] = data["volume"] * 100.0
-    return data.drop_duplicates("ts_code", keep="first").reset_index(drop=True)
+    return _add_quote_timestamps(data).drop_duplicates("ts_code", keep="first").reset_index(drop=True)
 
 
 def huoqu_bankuai_chengfen(
@@ -1353,6 +1342,49 @@ def _qfq_history_from_tushare(
     return histories, warnings
 
 
+def _jiancha_qfq_lishi_zhiliang(
+    frame: pd.DataFrame,
+    *,
+    expected_dates: frozenset[pd.Timestamp],
+    minimum_rows: int,
+    minimum_coverage: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """各来源共用交易日、样本数量和末日检查；不混合不同源的复权价格。"""
+    data = frame.copy()
+    dates = pd.to_datetime(
+        data.get("trade_date", pd.Series(index=data.index, dtype="datetime64[ns]")),
+        errors="coerce",
+    ).dt.normalize()
+    data["trade_date"] = dates
+    data = (
+        data.loc[dates.isin(expected_dates)]
+        .drop_duplicates("trade_date", keep="last")
+        .sort_values("trade_date")
+        .reset_index(drop=True)
+    )
+    actual_dates = set(data["trade_date"])
+    first = min(actual_dates, default=None)
+    relevant = {day for day in expected_dates if first is not None and first <= day}
+    coverage = len(actual_dates & relevant) / len(relevant) if relevant else 0.0
+    latest = max(actual_dates, default=None)
+    required_latest = max(expected_dates, default=None)
+    reasons: list[str] = []
+    if len(data) < minimum_rows:
+        reasons.append("insufficient_rows")
+    if coverage < minimum_coverage:
+        reasons.append("insufficient_session_coverage")
+    if required_latest is None or latest != required_latest:
+        reasons.append("latest_session_missing")
+    return data, {
+        "accepted": not reasons,
+        "rows": int(len(data)),
+        "session_coverage": round(float(coverage), 4),
+        "latest_date": latest.strftime("%Y-%m-%d") if latest is not None else None,
+        "required_latest_date": required_latest.strftime("%Y-%m-%d") if required_latest is not None else None,
+        "reasons": reasons,
+    }
+
+
 def huoqu_piliang_qfq_lishi(
     codes: Iterable[str],
     *,
@@ -1366,9 +1398,22 @@ def huoqu_piliang_qfq_lishi(
     if not normalized:
         return {}, {"status": "unavailable", "error": "候选代码为空"}
     warnings: list[str] = []
-    resolved_calendar = calendar or huoqu_jiaoyi_rili(pd.Timestamp(end_date).to_pydatetime())
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
+    if pd.isna(start) or pd.isna(end) or start > end:
+        raise ValueError("历史日线日期范围无效")
+    resolved_calendar = calendar or huoqu_jiaoyi_rili(
+        end.to_pydatetime(), start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d")
+    )
+    if pd.Timestamp(resolved_calendar.start_date) > start or pd.Timestamp(resolved_calendar.end_date) < end:
+        return {}, {
+            "status": "unavailable",
+            "error_code": "calendar_coverage_insufficient",
+            "error": "交易日历没有覆盖请求的完整历史区间，不能截短日线后声称分析完整",
+            "requested_range": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")],
+            "calendar_range": [resolved_calendar.start_date, resolved_calendar.end_date],
+            "persistence": "none",
+        }
     config, _ = jiazai_lianghua_peizhi()
     pause = float(config.get("shuju", {}).get("request_pause_seconds", 0.15))
     network_settings = (
@@ -1376,6 +1421,30 @@ def huoqu_piliang_qfq_lishi(
         if isinstance(config.get("wangluo"), dict)
         else {}
     )
+    expected_dates = frozenset(day for day in resolved_calendar.open_dates if start <= day <= end)
+    minimum_coverage = float(config.get("fenxi", {}).get("minimum_history_session_coverage", 0.9))
+    ready: dict[str, pd.DataFrame] = {}
+    source_by_code: dict[str, str] = {}
+    quality_by_code: dict[str, dict[str, Any]] = {}
+    quality_failures: list[dict[str, Any]] = []
+
+    def accept_histories(histories: dict[str, pd.DataFrame], source: str) -> None:
+        for code, frame in histories.items():
+            if code not in normalized or code in ready:
+                continue
+            data, quality = _jiancha_qfq_lishi_zhiliang(
+                frame,
+                expected_dates=expected_dates,
+                minimum_rows=minimum_rows,
+                minimum_coverage=minimum_coverage,
+            )
+            quality_by_code[code] = {"ts_code": code, "source": source, **quality}
+            if quality["accepted"]:
+                ready[code] = data
+                source_by_code[code] = source
+            else:
+                quality_failures.append(quality_by_code[code])
+
     try:
         fetched_histories, primary_meta = _qfq_history_from_tencent(
             normalized,
@@ -1392,8 +1461,9 @@ def huoqu_piliang_qfq_lishi(
             "warnings": warnings,
             "error": str(exc),
         }
-    missing = tuple(code for code in normalized if code not in fetched_histories)
-    fallback_limit = int(network_settings.get("history_fallback_max_stocks", 16))
+    accept_histories(fetched_histories, "tencent_qfq_daily")
+    missing = tuple(code for code in normalized if code not in ready)
+    fallback_limit = max(0, int(network_settings.get("history_fallback_max_stocks", 16)))
     secondary_codes = missing[:fallback_limit]
     secondary_histories: dict[str, pd.DataFrame] = {}
     secondary_meta: dict[str, Any] = {
@@ -1410,10 +1480,10 @@ def huoqu_piliang_qfq_lishi(
                 end_date=end.strftime("%Y%m%d"),
                 settings=network_settings,
             )
-            fetched_histories.update(secondary_histories)
+            accept_histories(secondary_histories, "eastmoney_qfq_fallback")
         except Exception as exc:
             warnings.append(f"东方财富前复权备用源不可用：{' '.join(str(exc).split())[:180]}")
-    remaining = tuple(code for code in secondary_codes if code not in fetched_histories)
+    remaining = tuple(code for code in secondary_codes if code not in ready)
     tushare_histories: dict[str, pd.DataFrame] = {}
     if remaining:
         try:
@@ -1424,39 +1494,17 @@ def huoqu_piliang_qfq_lishi(
                 pause_seconds=pause,
             )
             warnings.extend(fallback_warnings)
-            fetched_histories.update(tushare_histories)
+            accept_histories(tushare_histories, "tushare_qfq_fallback")
         except Exception as exc:
             warnings.append(f"Tushare 前复权备用源不可用：{' '.join(str(exc).split())[:180]}")
     if len(missing) > len(secondary_codes):
         warnings.append(
-            f"主源失败股票共 {len(missing)} 只；备用源按上限只尝试 {len(secondary_codes)} 只，避免失控请求"
+            f"主源缺失或质量不足股票共 {len(missing)} 只；备用源按上限只尝试 {len(secondary_codes)} 只，避免失控请求"
         )
-    expected_dates = sorted(day for day in resolved_calendar.open_dates if start <= day <= end)
-    expected_set = set(expected_dates)
-    minimum_coverage = float(config.get("fenxi", {}).get("minimum_history_session_coverage", 0.9))
-    coverage_by_code: dict[str, float] = {}
-    incomplete: list[dict[str, Any]] = []
-    ready: dict[str, pd.DataFrame] = {}
-    for code, frame in fetched_histories.items():
-        dates = pd.to_datetime(frame.get("trade_date"), errors="coerce").dropna().dt.normalize()
-        if dates.empty:
-            coverage = 0.0
-        else:
-            first = pd.Timestamp(dates.min())
-            relevant = {day for day in expected_set if first <= day <= end}
-            actual = set(pd.Timestamp(value) for value in dates)
-            coverage = len(actual & relevant) / len(relevant) if relevant else 0.0
-        coverage_by_code[code] = round(float(coverage), 4)
-        if len(frame) < minimum_rows or coverage < minimum_coverage:
-            incomplete.append(
-                {
-                    "ts_code": code,
-                    "rows": int(len(frame)),
-                    "session_coverage": round(float(coverage), 4),
-                }
-            )
-            continue
-        ready[code] = frame
+    coverage_by_code = {
+        code: quality["session_coverage"] for code, quality in quality_by_code.items()
+    }
+    incomplete = [quality for code, quality in quality_by_code.items() if code not in ready]
     actual_min = min(
         (pd.Timestamp(frame["trade_date"].min()) for frame in ready.values()),
         default=None,
@@ -1466,13 +1514,8 @@ def huoqu_piliang_qfq_lishi(
         default=None,
     )
     source_counts = {
-        "tencent_qfq_daily": (
-            len(ready)
-            - sum(code in ready for code in secondary_histories)
-            - sum(code in ready for code in tushare_histories)
-        ),
-        "eastmoney_qfq_fallback": sum(code in ready for code in secondary_histories),
-        "tushare_qfq_fallback": sum(code in ready for code in tushare_histories),
+        source: sum(value == source for value in source_by_code.values())
+        for source in ("tencent_qfq_daily", "eastmoney_qfq_fallback", "tushare_qfq_fallback")
     }
     used_sources = [source for source, count in source_counts.items() if count > 0]
     return ready, {
@@ -1499,6 +1542,8 @@ def huoqu_piliang_qfq_lishi(
         },
         "incomplete_examples": incomplete[:20],
         "incomplete_count": len(incomplete),
+        "quality_failures": quality_failures[:20],
+        "quality_failure_count": len(quality_failures),
         "source_counts": source_counts,
         "primary_source": primary_meta,
         "secondary_source": secondary_meta,
@@ -1566,8 +1611,6 @@ def huoqu_fenzhong_xingqing(
 
 
 __all__ = [
-    "huoqu_akshare_hengjiemian",
-    "huoqu_tushare_hengjiemian",
     "FenxiShujuShangxiawen",
     "JiaoyiJieduan",
     "JiaoyiRili",

@@ -13,7 +13,7 @@ import pytest
 
 from src.ashare import gupiao_yanjiu
 from src.ashare import peizhi
-from src.ashare.fenxi_yinzi import jisuan_shendu_jibenmian
+from src.ashare.xuangu_guize import hebing_jibenmian_zhengju
 from src.ashare.shuju_yuan import huoqu_zhangdieting_guize
 
 
@@ -244,6 +244,9 @@ def test_financials_use_only_announcements_known_by_as_of(monkeypatch: pytest.Mo
     result = gupiao_yanjiu.huoqu_jibenmian("600000.SH", trade_date="2024-06-28")
 
     assert result["valuation"]["as_of"] == "2024-06-28"
+    assert result["valuation"]["pe"] == 12
+    assert result["valuation"]["pe_ttm"] == 11
+    assert "pe_dynamic" not in result["valuation"]
     assert result["financials"]["announcement_date"] == "2024-04-20"
     assert result["financials"]["roe_pct"] == 10.0
     assert result["financials"]["missing_fields"] == ["net_profit_yoy_pct"]
@@ -294,7 +297,7 @@ def test_completed_history_uses_calendar_confirmed_date_instead_of_weekday_guess
     assert any("尚未确认收盘" in warning for warning in warnings)
 
 
-def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company() -> None:
+def test_financial_industry_debt_ratio_is_preserved_without_scoring() -> None:
     fundamentals = {
         "profile": {"industry": "银行"},
         "financials": {
@@ -305,22 +308,21 @@ def test_financial_industry_debt_ratio_is_not_scored_like_an_industrial_company(
         "valuation": {"pe_ttm": 8},
     }
 
-    _, evidence = jisuan_shendu_jibenmian(fundamentals)
+    evidence = hebing_jibenmian_zhengju({}, fundamentals)
+    assert evidence["financials"]["debt_to_assets_pct"] == 92
+    assert "score_0_100" not in evidence
 
-    assert "金融行业资产负债率口径特殊，本项只展示、不加减分" in evidence
-    assert "资产负债率偏高，需结合行业解释" not in evidence
 
-
-def test_quant_config_rejects_out_of_range_validation_settings(
+def test_quant_config_rejects_out_of_range_history_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import json
 
     config = json.loads(peizhi.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
-    config["moxing"]["validation_ratio"] = 0.9
+    config["fenxi"]["minimum_history_session_coverage"] = 1.1
     path = tmp_path / "invalid_quant.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
     monkeypatch.setattr(peizhi, "DEFAULT_CONFIG_PATH", path)
-    with pytest.raises(ValueError, match="validation_ratio"):
+    with pytest.raises(ValueError, match="minimum_history_session_coverage"):
         peizhi.jiazai_lianghua_peizhi()

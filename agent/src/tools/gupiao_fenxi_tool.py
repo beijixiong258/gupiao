@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal, get_args
 
 from src.agent.tools import BaseTool
 from src.tools.gupiao_analysis_state import analysis_session_store
+
+
+FenxiScope = Literal["all_market", "named_scope", "single_stock"]
 
 
 def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
@@ -39,21 +42,21 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
 class GupiaoFenxiTool(BaseTool):
     name = "gupiao_fenxi"
     description = (
-        "Run the primary quantitative A-share analysis. Use single_stock with gupiao for a quantitative buy assessment of one named stock, "
-        "all_market for the whole mainland A-share market, or named_scope for one ordinary-language named scope. "
-        "For a named scope it dynamically queries and verifies the live source "
-        "catalog instead of guessing whether the phrase is an industry or concept. It automatically applies hard risk filters, all eight daily-K factor "
-        "groups, fundamentals and valuation, explanatory MACD structure evidence, the limit-up pullback pattern, and late-session evidence when the local "
-        "market time is after 14:30. A single-stock analysis builds a bounded live comparison pool, reuses the same quantitative "
-        "scoring and recommendation thresholds, and returns an explicit buy/no-buy research recommendation plus a plain-language closing synthesis without prediction eligibility. A selection returns one primary stock, "
-        "up to four alternatives, or an explicit decision not to recommend. The score is a research ranking score, never an upside probability."
+        "Analyze mainland A-share evidence or select research candidates by explicit conditions. Use single_stock with gupiao "
+        "to retrieve all currently analyzable stock evidence, including every raw daily-factor value and missing field, technical "
+        "structure, financials and valuation context, pattern and late-session conditions, supplemental diagnostics, execution "
+        "constraints and source provenance. Optional source failure yields a partial report, never a forced buy/no-buy label. "
+        "Use all_market or named_scope for rule-based selection; named scopes are dynamically discovered and verified. "
+        "Selection filters explicit upward-signal conditions and compares five raw dimensions by non-dominated layers; "
+        "same-layer ordering is stable display only. Return the exposed research candidates or explain no qualification. "
+        "Do not calculate scores, weights, predicted probabilities or model forecasts."
     )
     parameters = {
         "type": "object",
         "properties": {
             "fanwei": {
                 "type": "string",
-                "enum": ["all_market", "named_scope", "single_stock"],
+                "enum": list(get_args(FenxiScope)),
                 "default": "all_market",
                 "description": "Use single_stock for one stock, all_market for the whole market, or named_scope whenever the user says an ordinary industry/board/theme phrase. Never classify a named scope yourself.",
             },
@@ -87,16 +90,12 @@ class GupiaoFenxiTool(BaseTool):
             gupiao=str(kwargs.get("gupiao") or "").strip() or None,
             shuliang=kwargs.get("shuliang"),
         )
-        if full_result.get("status") != "ok":
+        if full_result.get("status") not in {"ok", "partial"}:
             return json.dumps(full_result, ensure_ascii=False)
-        prediction_context = full_result.get("_prediction_context")
         stored_result = {
             key: value for key, value in full_result.items() if not str(key).startswith("_")
         }
-        analysis_id = analysis_session_store.save(
-            stored_result,
-            prediction_context=prediction_context,
-        )
+        analysis_id = analysis_session_store.save(stored_result)
         if stored_result.get("analysis_type") == "single_stock_analysis":
             stock = stored_result.get("stock") or stored_result.get("selected_stock")
             public_result = {
@@ -105,14 +104,8 @@ class GupiaoFenxiTool(BaseTool):
                 "selected_stock": stock,
                 "analysis_stage": stored_result.get("analysis_stage") or {
                     "status": "completed",
-                    "scope": "单股八组因子、综合评分和买入门槛复核已完成",
-                    "prediction_status": "not_available",
-                    "prediction_confirmation_required": False,
-                    "confirmation_timing": "not_applicable",
-                    "initial_preapproval_counts": False,
-                    "affirmative_reply_defaults_to": None,
-                    "prediction_data_policy": "fresh_remote_download_without_local_market_cache",
-                    "next_step": "当前结果已明确是否建议买入，但不产生自动预测资格",
+                    "scope": "单股可取得的原始指标、财务、形态、尾盘和来源证据已整理",
+                    "next_step": "完整说明支持和反向证据、缺口、风险与重新评估条件",
                 },
             }
             return json.dumps(public_result, ensure_ascii=False)
@@ -123,26 +116,15 @@ class GupiaoFenxiTool(BaseTool):
             "selected_stock": stored_result.get("primary"),
             "analysis_stage": {
                 "status": "completed",
-                "scope": "候选池、风险硬过滤、八组日K因子、基本面、形态、尾盘证据、深度复核和排序已完成",
-                "prediction_status": "not_requested" if recommendation_available else "not_available",
-                "prediction_confirmation_required": recommendation_available,
-                "confirmation_timing": (
-                    "later_user_turn_after_analysis_result"
-                    if recommendation_available
-                    else "not_applicable"
-                ),
-                "initial_preapproval_counts": False,
-                "affirmative_reply_defaults_to": "primary" if recommendation_available else None,
-                "prediction_data_policy": "fresh_remote_download_without_local_market_cache",
+                "scope": "候选范围核验、原始证据、显式选股条件与非支配比较已完成",
                 "next_step": (
-                    "先用自然语言讲清量化结论，再单独询问是否预测；即使用户最初说不用再问，也必须在分析结果后询问一次。"
-                    "后续回复‘行’或‘继续’即默认预测首选，点名合格备选则预测该备选，不再重复确认；确认后才重新下载远端数据并训练 T+1/T+2/T+3 模型"
+                    "说明候选的量化依据、证据缺口、主要风险与重新评估条件"
                     if recommendation_available
-                    else "当前没有达到门槛的候选，不能继续预测"
+                    else "说明当前没有通过选股条件的候选，以及缺失和未满足条件"
                 ),
             },
         }
         return json.dumps(public_result, ensure_ascii=False)
 
 
-__all__ = ["GupiaoFenxiTool"]
+__all__ = ["FenxiScope", "GupiaoFenxiTool"]

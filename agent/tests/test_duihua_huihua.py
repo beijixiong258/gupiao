@@ -119,6 +119,33 @@ def test_persisted_analysis_keeps_reference_but_drops_market_result() -> None:
     assert "reviewed_candidates" not in payload
 
 
+def test_persistence_discards_legacy_forecast_values() -> None:
+    messages = [{
+        "role": "tool", "name": "gupiao_yuce", "tool_call_id": "legacy",
+        "content": json.dumps({"status": "ok", "forecast": {"T+3": {"predicted_close": 123.45}}}),
+    }, {"role": "assistant", "content": "预计未来收盘价为 123.45 元。"}]
+    persisted = zhengli_chijiuhua_xiaoxi(messages)
+    payload = json.loads(persisted[0]["content"])
+    assert payload["status"] == "obsolete_history_result"
+    assert payload["outcome"] == "feature_removed"
+    assert "forecast" not in payload
+    assert "123.45" not in persisted[0]["content"]
+    assert "123.45" not in persisted[1]["content"]
+    assert "历史预测已过期" in persisted[1]["content"]
+
+
+def test_reloading_reference_marker_keeps_scope_request() -> None:
+    messages = [{
+        "role": "tool", "name": "gupiao_fenxi", "tool_call_id": "analysis",
+        "content": json.dumps({
+            "status": "reanalysis_required",
+            "scope_request": {"fanwei": "single_stock", "gupiao": "深科技"},
+            "stock_reference": {"name": "深科技"}, "market_data_persistence": "none",
+        }),
+    }]
+    assert zhengli_chijiuhua_xiaoxi(messages) == messages
+
+
 def test_clear_keeps_session_identity(tmp_path) -> None:
     store = DuihuaCunchu(tmp_path)
     session = store.xinjian()
