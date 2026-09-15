@@ -37,9 +37,11 @@ from src.ashare.xuangu_guize import (
     hebing_jibenmian_zhengju,
     jichu_ying_guolv,
     paixu_shangzhang_houxuan,
+    pinggu_shangzhang_tiaojian,
     shishi_ying_guolv,
     xuyao_shishi_kuaizhao,
     zhuan_json_zhi,
+    zhuan_you_xian_shuzhi,
 )
 
 
@@ -62,7 +64,7 @@ def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[
     count = _normalize_requested_count(requested_count)
     if (
         count is None
-        or result.get("status") != "ok"
+        or result.get("status") not in {"ok", "partial"}
         or result.get("analysis_type") != "unified_stock_selection"
         or not result.get("recommendation_available")
     ):
@@ -77,6 +79,8 @@ def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[
     limited["alternatives"] = selected[1:]
     limited["requested_candidate_count"] = count
     limited["displayed_candidate_count"] = len(selected)
+    if isinstance(result.get("candidate_counts"), dict):
+        limited["candidate_counts"] = {**result["candidate_counts"], "displayed": len(selected)}
     return limited
 
 
@@ -92,7 +96,7 @@ class XuanguFenxiFuWu:
         self._config = config
         self._context = context
 
-    def fenxi(self, fanwei: FenxiFanwei) -> dict[str, Any]:
+    def fenxi(self, fanwei: FenxiFanwei, *, requested_count: int | None = None) -> dict[str, Any]:
         if fanwei.leixing is FanweiLeixing.DANGU_GUPIAO:
             return fenxi_dangu(
                 gupiao=str(fanwei.gupiao or ""),
@@ -100,6 +104,9 @@ class XuanguFenxiFuWu:
                 context=self._context,
             )
         settings = self._config["fenxi"]
+        requested_count = _normalize_requested_count(requested_count)
+        display_target = min(requested_count or 1 + int(settings["backup_limit"]),
+                             1 + int(settings["backup_limit"]), int(settings["deep_analysis_limit"]))
         if fanwei.leixing is FanweiLeixing.MINGMING_FANWEI:
             discovery = self._context.faxian_fanwei(str(fanwei.mingcheng or ""))
             if discovery.status != "resolved" or discovery.scope is None:
@@ -153,21 +160,33 @@ class XuanguFenxiFuWu:
                 quote_is_completed=quote_is_completed,
             )
             if reasons:
-                rejected.append({"ts_code": row.get("ts_code"), "name": row.get("name"), "reasons": reasons})
+                required_fields = ("latest_price", "volume", "amount_yuan") if quote_is_completed else ("latest_price",)
+                missing_fields = [field for field in required_fields if zhuan_you_xian_shuzhi(row.get(field)) is None]
+                rejected.append({"ts_code": row.get("ts_code"), "name": row.get("name"), "reasons": reasons,
+                                 "missing_fields": missing_fields})
             else:
                 accepted_indices.append(index)
         filtered = data.loc[accepted_indices].reset_index(drop=True)
         if filtered.empty:
+            incomplete = any(item["missing_fields"] for item in rejected)
             return {
-                "status": "ok",
-                "outcome": "no_recommendation",
+                "status": "partial" if incomplete else "ok",
+                "outcome": "information_partial" if incomplete else "no_recommendation",
+                "selection_outcome": "evidence_unavailable" if incomplete else "no_recommendation",
                 "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
+                "analysis_type": "unified_stock_selection",
                 "scope": pool.metadata,
                 "as_of": analysis_date.strftime("%Y-%m-%d"),
                 "recommendation_available": False,
-                "no_recommendation_reason": "全部候选都触发了风险硬过滤",
+                "no_recommendation_reason": (
+                    "候选基础价量字段存在缺失，暂时无法完成筛选；缺失数据不能解释为全部股票不满足条件"
+                    if incomplete else "全部候选都触发了风险硬过滤"
+                ),
                 "primary": None,
                 "alternatives": [],
+                "displayed_candidate_count": 0,
+                "candidate_counts": {"scope_input": len(data), "after_hard_filter": 0,
+                                     "technical_reviewed": 0, "deep_reviewed": 0, "qualified": 0, "displayed": 0},
                 "filter_summary": {"input_count": len(data), "rejected_count": len(rejected), "examples": rejected[:20]},
             }
         prefiltered = choushu_liudongxing_houxuan(filtered, int(settings["prefilter_limit"]))
@@ -179,6 +198,7 @@ class XuanguFenxiFuWu:
             end_date=end_date,
             minimum_rows=int(settings["minimum_history_rows"]),
         )
+        history_loaded_count = len(histories)
         histories, history_rejected = guolv_lishi_wanzhengxing(
             histories,
             analysis_date=analysis_date,
@@ -188,6 +208,23 @@ class XuanguFenxiFuWu:
         )
         rejected.extend(history_rejected)
         if not histories:
+            all_unmet = bool(history_rejected) and history_loaded_count == len(prefiltered) and all(
+                item.get("status") == "unmet" for item in history_rejected
+            )
+            if all_unmet:
+                return {
+                    "status": "ok", "outcome": "no_recommendation", "selection_outcome": "no_recommendation",
+                    "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION, "analysis_type": "unified_stock_selection",
+                    "scope": pool.metadata, "as_of": analysis_date.strftime("%Y-%m-%d"),
+                    "recommendation_available": False, "primary": None, "alternatives": [],
+                    "displayed_candidate_count": 0,
+                    "no_recommendation_reason": "本次已取得的完整日线均未通过流动性条件，没有合格候选",
+                    "candidate_counts": {"scope_input": len(data), "after_hard_filter": len(filtered),
+                                         "after_prefilter": len(prefiltered), "history_ready": 0,
+                                         "technical_reviewed": 0, "deep_reviewed": 0, "qualified": 0, "displayed": 0},
+                    "data_provenance": {"history": history_meta},
+                    "filter_summary": {"rejected_count": len(rejected), "rejected_examples": rejected[:20]},
+                }
             return {
                 "status": "unavailable",
                 "outcome": "data_unavailable",
@@ -197,6 +234,8 @@ class XuanguFenxiFuWu:
                 "retryable": True,
                 "next_action": "稍后重新获取完整远端日线",
                 "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
+                "analysis_type": "unified_stock_selection",
+                "recommendation_available": False, "primary": None, "alternatives": [],
                 "scope": pool.metadata,
                 "as_of": analysis_date.strftime("%Y-%m-%d"),
                 "error": "硬过滤后没有具备足够完整日线的候选",
@@ -208,6 +247,7 @@ class XuanguFenxiFuWu:
             histories,
             ready_profiles,
             source="auto",
+            calendar=self._context.jiaoyi_rili(start_date=start_date, end_date=end_date),
         )
         if panel.empty:
             raise RuntimeError("候选日 K 因子面板为空")
@@ -342,36 +382,15 @@ class XuanguFenxiFuWu:
             }
             preliminary.append(item)
         preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config)[:factor_limit]
-        if late_stage is WeipanJieduan.PANZHONG_ZANDING:
-            for item in preliminary[: int(self._config["weipan"]["minute_candidate_limit"])]:
-                try:
-                    minute_data, minute_meta = self._context.fenzhong_xingqing(item["ts_code"])
-                except Exception as exc:
-                    minute_data, minute_meta = pd.DataFrame(), {"status": "unavailable", "error": str(exc)}
-                item["late"] = fenxi_weipan(
-                    item["history"],
-                    snapshot=item["snapshot"],
-                    clock=clock,
-                    config=self._config["weipan"],
-                    minute_data=minute_data,
-                )
-                item["late"]["minute_data"] = minute_meta
-        deep_candidates = preliminary[: int(settings["deep_analysis_limit"])]
-        for item in deep_candidates:
-            try:
-                fundamentals = self._context.jibenmian(
-                    item["ts_code"],
-                    trade_date=analysis_date.strftime("%Y-%m-%d"),
-                    allow_current_snapshot=bool(
-                        late_stage is WeipanJieduan.SHOUPAN_FUHE
-                        and completed_quote_is_current
-                    ),
-                )
-            except Exception as exc:
-                fundamentals = {"profile": item["profile"], "financials": {}, "valuation": {}, "errors": [str(exc)]}
-            if not fundamentals.get("profile"):
-                fundamentals["profile"] = item["profile"]
-            item["fundamental"] = hebing_jibenmian_zhengju(item["fundamental"], fundamentals)
+        # 本地技术复核可继续检查后续候选；远端财务和分钟请求仍受原上限约束。
+        # 已明确未满足基础条件者不消耗补充来源请求，仅在没有合格者时保留一个观察报告。
+        review_pool = [item for item in preliminary if item["selection"]["eligible"]]
+        if not review_pool:
+            review_pool = preliminary[:1]
+        technical_reviewed: list[dict[str, Any]] = []
+        deep_candidates: list[dict[str, Any]] = []
+        review_stop_reason = "candidate_pool_exhausted"
+        for item in review_pool:
             try:
                 technical = zongjie_jishu(
                     item["history"],
@@ -396,6 +415,47 @@ class XuanguFenxiFuWu:
                     "outcome": "program_error",
                     "error": str(exc),
                 }
+            item["selection"] = pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True)
+            technical_reviewed.append(item)
+            if item["selection"]["outcome"] == "program_error":
+                review_stop_reason = "program_error"
+                break
+            if item["selection"]["eligible"]:
+                deep_candidates.append(item)
+                if len(deep_candidates) >= display_target:
+                    review_stop_reason = "display_target_reached"
+                    break
+        if not deep_candidates and technical_reviewed:
+            deep_candidates = technical_reviewed[:1]
+        technical_errors = [
+            {"ts_code": item["ts_code"], "reason": item["technical"].get("error") or item["technical"].get("reason")}
+            for item in technical_reviewed if item["selection"]["outcome"] == "program_error"
+        ]
+        for index, item in enumerate(deep_candidates):
+            if not technical_errors:
+                try:
+                    fundamentals = self._context.jibenmian(
+                        item["ts_code"],
+                        trade_date=analysis_date.strftime("%Y-%m-%d"),
+                        allow_current_snapshot=bool(
+                            late_stage is WeipanJieduan.SHOUPAN_FUHE and completed_quote_is_current
+                        ),
+                    )
+                except Exception as exc:
+                    fundamentals = {"profile": item["profile"], "financials": {}, "valuation": {}, "errors": [str(exc)]}
+                if not fundamentals.get("profile"):
+                    fundamentals["profile"] = item["profile"]
+                item["fundamental"] = hebing_jibenmian_zhengju(item["fundamental"], fundamentals)
+                if late_stage is WeipanJieduan.PANZHONG_ZANDING and index < int(self._config["weipan"]["minute_candidate_limit"]):
+                    try:
+                        minute_data, minute_meta = self._context.fenzhong_xingqing(item["ts_code"])
+                    except Exception as exc:
+                        minute_data, minute_meta = pd.DataFrame(), {"status": "unavailable", "error": str(exc)}
+                    item["late"] = fenxi_weipan(
+                        item["history"], snapshot=item["snapshot"], clock=clock,
+                        config=self._config["weipan"], minute_data=minute_data,
+                    )
+                    item["late"]["minute_data"] = minute_meta
             item["supplemental_diagnostics"] = goujian_buchong_zhenduan(
                 item["history"],
                 item["fundamental"],
@@ -421,24 +481,49 @@ class XuanguFenxiFuWu:
             )
             for index, item in enumerate(deep_candidates, start=1)
         ]
-        technical_errors = [
-            {
-                "ts_code": item["ts_code"],
-                "reason": item["technical_summary"].get("reason")
-                or item["technical_summary"].get("error")
-                or (item["technical_summary"].get("macd_structure") or {}).get("reason"),
-            }
-            for item in summaries
-            if item["technical_summary"].get("outcome") == "program_error"
-            or item["technical_summary"].get("status") == "error"
-        ]
         qualified = [] if technical_errors else [item for item in summaries if item["meets_selection_conditions"]]
         primary = qualified[0] if qualified else None
         alternatives = qualified[1 : 1 + int(settings["backup_limit"])]
         recommendation_available = primary is not None
+        reviewed_codes = {item["ts_code"] for item in technical_reviewed}
+        condition_checks = [
+            {
+                "ts_code": item["ts_code"], "name": item["name"],
+                "technical_reviewed": item["ts_code"] in reviewed_codes,
+                "missing_conditions": item["selection"]["missing_conditions"],
+                "unmet_conditions": item["selection"]["unmet_conditions"],
+                "technical_review": {
+                    "status": item["technical"].get("status", "not_requested"),
+                    "outcome": item["technical"].get("outcome"),
+                    "reason": item["technical"].get("error") or item["technical"].get("reason"),
+                    "missing_indicators": item["technical"].get("missing_indicators", []),
+                },
+            }
+            for item in preliminary
+        ]
+        undecided_count = sum(bool(item["missing_conditions"]) and not item["unmet_conditions"] for item in condition_checks)
+        source_partial = (
+            any(item.get("missing_fields") for item in rejected)
+            or any(item.get("status") == "unavailable" for item in history_rejected)
+            or history_loaded_count < len(prefiltered) or len(factor_map) < len(histories)
+            or any(metadata.get("status") in {"partial", "unavailable", "degraded"}
+                   for metadata in (pool.metadata, history_meta, panel_meta, panel_meta.get("market_benchmarks") or {}))
+        )
+        evidence_partial = bool(
+            source_partial or any(item["missing_conditions"] for item in condition_checks)
+            or any(item["evidence_gaps"] or item["technical_summary"].get("status") == "partial"
+                   or item["late_session_analysis"].get("status") in {"partial", "unavailable"}
+                   or (item["late_session_analysis"].get("minute_data") or {}).get("status") == "unavailable"
+                   for item in summaries)
+        )
+        selection_outcome = (
+            "program_error" if technical_errors else "recommendation" if recommendation_available
+            else "evidence_unavailable" if undecided_count or source_partial else "no_recommendation"
+        )
         result = {
-            "status": "error" if technical_errors else "ok",
-            "outcome": "program_error" if technical_errors else "recommendation" if recommendation_available else "no_recommendation",
+            "status": "error" if technical_errors else "partial" if evidence_partial else "ok",
+            "outcome": "program_error" if technical_errors else "information_partial" if evidence_partial else selection_outcome,
+            "selection_outcome": selection_outcome,
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
             "analysis_type": "unified_stock_selection",
             "scope": pool.metadata,
@@ -471,24 +556,39 @@ class XuanguFenxiFuWu:
             "alternatives": alternatives,
             "reviewed_candidates": summaries,
             "diagnostic_candidates": [
-                {**summaries[0], "diagnostic_role": "observation_only", "diagnostic_label": "观察对象（未满足选股条件）"}
+                {**summaries[0], "diagnostic_role": "observation_only", "diagnostic_label": "观察对象（未通过选股条件）"}
             ] if summaries and not recommendation_available and not technical_errors else [],
             "no_recommendation_reason": (
                 None
                 if recommendation_available
                 else "技术复核发生程序错误，当前诊断未完整完成"
                 if technical_errors
+                else "部分候选的必需证据尚未取得或核验，当前无法完整确认是否合格；不能将数据不足解释为全部股票不满足条件"
+                if selection_outcome == "evidence_unavailable"
                 else "当前样本中没有股票同时满足趋势、动量、相对强弱、量能、波动和可交易性条件；具体缺项与反证已保留"
             ),
-            "selection_limits": {"maximum_alternatives": int(settings["backup_limit"])},
+            "selection_limits": {
+                "maximum_alternatives": int(settings["backup_limit"]),
+                "maximum_full_reports": int(settings["deep_analysis_limit"]),
+                "maximum_technical_reviews": factor_limit,
+                "maximum_minute_requests": int(self._config["weipan"]["minute_candidate_limit"]),
+                "display_target": display_target,
+                "review_stop_reason": review_stop_reason,
+            },
+            "displayed_candidate_count": int(bool(primary)) + len(alternatives),
+            "candidate_condition_checks": condition_checks,
             "candidate_counts": {
                 "scope_input": int(len(data)),
                 "after_hard_filter": int(len(filtered)),
                 "after_prefilter": int(len(prefiltered)),
                 "history_ready": int(len(histories)),
-                "factor_ready": int(len(preliminary)),
+                "factor_ready": int(len(factor_map)),
+                "after_factor_limit": int(len(preliminary)),
+                "technical_reviewed": int(len(technical_reviewed)),
                 "deep_reviewed": int(len(deep_candidates)),
                 "qualified": int(len(qualified)),
+                "unverified": int(undecided_count),
+                "displayed": int(bool(primary)) + len(alternatives),
             },
             "filter_summary": {
                 "rejected_count": int(len(rejected)),
@@ -510,7 +610,7 @@ class XuanguFenxiFuWu:
                 "conditions": "价格和短均线高于MA20、5/20日收益为正且MACD柱为正、20日跑赢沪深300、5/20日量比不低于1、波动未超过上限、深度复核与可交易性通过",
                 "comparison_dimensions": ["20日相对沪深300超额", "5日收益", "20日收益", "20日波动（越低越好）", "完整日线真实成交额"],
                 "ranking_basis": "满足条件后按多维不劣且至少一维更优的关系分层；同层按成交额和代码稳定展示，不代表上涨概率高低",
-                "sampling_limit": "只比较本次抽样取得并完成复核的候选，不等于已经遍历全市场所有机会",
+                "sampling_limit": "只比较本次抽样取得并完成复核的候选；本地技术复核顺序补位，达到展示目标或候选上限即停止，完整报告和分钟请求各有上限，不等于已经遍历全市场所有机会",
                 "missing_evidence": "必需条件缺失不能视为通过，保留原因供复核",
                 "llm_boundary": "解释实际指标与证据冲突，不生成分数、权重或上涨概率，不将候选排序说成经验证的概率排名",
             },
@@ -525,6 +625,8 @@ class XuanguFenxiFuWu:
                 "next_action": "修复技术复核错误后重新获取数据并诊断",
                 "retryable": False,
             })
+        if requested_count is not None:
+            result["requested_candidate_count"] = requested_count
         return result
 
 
@@ -549,7 +651,9 @@ def fenxi_xuangu(
         config, _ = jiazai_lianghua_peizhi()
         resolved_scope = FenxiFanwei.create(fanwei, mingcheng, gupiao)
         request_context = context or FenxiShujuShangxiawen()
-        result = XuanguFenxiFuWu(config=config, context=request_context).fenxi(resolved_scope)
+        result = XuanguFenxiFuWu(config=config, context=request_context).fenxi(
+            resolved_scope, requested_count=_normalize_requested_count(shuliang),
+        )
         return xianzhi_xuangu_jieguo(result, shuliang)
     except WangluoQingqiuYichang as exc:
         return {

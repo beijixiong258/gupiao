@@ -12,6 +12,7 @@ from src.ashare.fanwei_faxian import BankuaiLeixing, ShichangFanwei
 from src.ashare.fenxi_weipan import fenxi_weipan
 from src.ashare.fenxi_yinzi import huizong_houxuan_yinzi, jisuan_hengjiemian_jibenmian
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen, _normalize_constituents, _normalize_snapshot
+from src.ashare.shuju_yuan import heyan_kuaizhao_shidian
 from src.ashare.xuangu_fanwei import FenxiFanwei, MingmingFanweiHouXuanChi, YijiexiFenxiFanwei
 from src.ashare.xuangu_guize import goujian_houxuan_zhaiyao, goujian_kejiaoyixing_zhaiyao, goujian_kuaizhao_jilu
 
@@ -57,14 +58,16 @@ def test_provider_timestamp_survives_request_memory_and_candidate_projection():
         assert snapshot["provider_trade_date"] == "2026-09-11"
 
 
-def _quote(timestamp):
+def _quote(timestamp, captured_at="2026-09-14 09:40:00"):
     return {"status": "ok", "last_price": 12, "previous_close": 11, "open": 11.5, "high": 12.1, "low": 11.2,
-            "captured_at": "2026-09-14 09:40:00", "provider_quote_time": timestamp}
+            "volume": 1000, "amount_yuan": 12000,
+            "captured_at": captured_at, "provider_quote_time": timestamp}
 
 
 @pytest.mark.parametrize("timestamp,verified,state", [
     (None, False, "unavailable"), ("2026-09-11 15:00:00", False, "stale"),
     ("2026-09-15 09:35:00", False, "future"), ("2026-09-14 09:50:00", False, "future"),
+    ("2026-09-14 09:30:00", False, "stale"),
     ("2026-09-14 09:39:30", True, "verified"),
 ])
 def test_current_tradability_needs_provider_time_not_just_positive_prices(timestamp, verified, state):
@@ -79,6 +82,87 @@ def test_current_tradability_needs_provider_time_not_just_positive_prices(timest
         assert result["quote_time_verification"]["quote_age_seconds"] == 30
 
 
+@pytest.mark.parametrize("captured,quoted,verified,active_age", [
+    ("09:40:00", "09:38:00", True, 120),
+    ("09:40:00", "09:37:59", False, 121),
+    ("09:29:00", "09:25:00", True, 0),
+    ("12:20:00", "11:29:30", True, 30),
+    ("12:20:00", "11:25:00", False, 300),
+    ("13:01:00", "11:29:30", True, 90),
+    ("13:02:00", "11:29:30", False, 150),
+    ("14:59:00", "14:56:00", False, 180),
+    ("15:04:00", "15:00:00", True, 0),
+    ("15:04:00", "14:59:00", False, 60),
+])
+def test_current_quote_freshness_counts_only_active_session_time(captured, quoted, verified, active_age):
+    captured_at = "2026-09-14 " + captured
+    result = heyan_kuaizhao_shidian(_quote("2026-09-14 " + quoted, captured_at),
+                                  expected_trade_date="2026-09-14", reference_time=captured_at, require_timestamp=True)
+    assert result["source_date_verified"] is True
+    assert result["verified"] is verified
+    assert result["timeliness_status"] == ("verified" if verified else "stale")
+    assert result["quote_active_age_seconds"] == active_age
+    if captured == "12:20:00" and verified:
+        assert result["quote_age_seconds"] == 3030
+        assert result["session_phase"] == "midday_break"
+
+
+def test_quote_acquired_after_request_start_is_valid_but_future_at_acquisition_is_rejected():
+    acquired_later = heyan_kuaizhao_shidian(_quote("2026-09-14 09:40:10", "2026-09-14 09:40:20"),
+                                         expected_trade_date="2026-09-14", reference_time="2026-09-14 09:40:00", require_timestamp=True)
+    assert acquired_later["verified"] is True
+    assert acquired_later["quote_age_seconds"] == 10
+    future_at_acquisition = heyan_kuaizhao_shidian(_quote("2026-09-14 09:39:30", "2026-09-14 09:39:00"),
+                                               expected_trade_date="2026-09-14", reference_time="2026-09-14 09:40:00", require_timestamp=True)
+    assert future_at_acquisition["status"] == "future"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("volume", None), ("volume", 0), ("volume", -1), ("volume", float("inf")),
+    ("amount_yuan", None), ("amount_yuan", 0), ("amount_yuan", -1), ("amount_yuan", float("nan")),
+])
+def test_current_tradability_requires_positive_turnover_fields(field, value):
+    snapshot = _quote("2026-09-14 09:39:30")
+    snapshot[field] = value
+    result = goujian_kejiaoyixing_zhaiyao(code="000021.SZ", name="样本", snapshot=snapshot,
+                                       history=pd.DataFrame([{"trade_date": "2026-09-11", "close": 10, "amount_yuan": 1e8}]),
+                                       minimum_amount=5e7, realtime_required=True, reference_time="2026-09-14 09:40:00")
+    assert result["quote_time_verification"]["verified"] is True
+    assert result["current_quote_verified"] is False
+    assert result["basic_execution_feasible"] is False
+    assert "成交量或成交额" in result["current_quote_reason"]
+
+
+@pytest.mark.parametrize("captured,quoted,feasible", [
+    ("09:24:30", "09:24:00", False),
+    ("09:26:00", "09:24:59", False),
+    ("09:26:00", "09:25:00", True),
+])
+def test_opening_auction_needs_matched_turnover(captured, quoted, feasible):
+    captured_at = "2026-09-14 " + captured
+    result = goujian_kejiaoyixing_zhaiyao(code="000021.SZ", name="样本",
+                                       snapshot=_quote("2026-09-14 " + quoted, captured_at),
+                                       history=pd.DataFrame([{"trade_date": "2026-09-11", "close": 10, "amount_yuan": 1e8}]),
+                                       minimum_amount=5e7, realtime_required=True, reference_time=captured_at)
+    assert result["quote_time_verification"]["verified"] is True
+    assert result["basic_execution_feasible"] is feasible
+    # 盘中已有成交即可核验；12000元不应套用完整日线5000万元底线。
+    assert result["current_amount_yuan"] == 12000
+
+
+def test_historical_date_verification_does_not_claim_current_freshness_or_require_live_quote():
+    result = heyan_kuaizhao_shidian(_quote("2026-09-11 15:00:00"), expected_trade_date="2026-09-11",
+                                  reference_time="2026-09-14 09:40:00")
+    assert result["verified"] is True
+    assert result["source_date_verified"] is True
+    assert result["timeliness_status"] == "not_requested"
+    result = goujian_kejiaoyixing_zhaiyao(code="000021.SZ", name="样本", snapshot={"status": "unavailable"},
+                                       history=pd.DataFrame([{"trade_date": "2026-09-11", "close": 10, "amount_yuan": 1e8}]),
+                                       minimum_amount=5e7, realtime_required=False, reference_time="2026-09-14 09:40:00")
+    assert result["basic_execution_feasible"] is True
+    assert result["analysis_price_basis"] == "latest_completed_qfq_close"
+
+
 def test_stale_quote_cannot_produce_late_session_confirmation():
     result = fenxi_weipan(pd.DataFrame(), snapshot=_quote("2026-09-11 15:00:00"),
                          clock={"is_trading_day": True, "captured_at": "2026-09-14 14:35:00"}, config={})
@@ -88,7 +172,7 @@ def test_stale_quote_cannot_produce_late_session_confirmation():
 
 
 def test_preclose_quote_is_not_published_as_a_completed_close():
-    result = fenxi_weipan(pd.DataFrame(), snapshot=_quote("2026-09-14 14:58:00"),
+    result = fenxi_weipan(pd.DataFrame(), snapshot=_quote("2026-09-14 14:58:00", "2026-09-14 15:10:00"),
                          clock={"is_trading_day": True, "captured_at": "2026-09-14 15:10:00"}, config={})
     assert result["status"] == "unavailable"
     assert result["confirmation_level"] == "not_confirmed"

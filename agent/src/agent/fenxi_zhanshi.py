@@ -65,6 +65,15 @@ _LABELS = {
     "provider_trade_date": "来源交易日期", "expected_trade_date": "待核验交易日期",
     "quote_age_seconds": "来源更新时间距核验时点（秒）", "verification_scope": "核验范围",
     "current_quote_reason": "当前行情核验说明",
+    "scope_input": "输入范围股票数", "after_hard_filter": "基础检查通过数", "after_prefilter": "抽样数量",
+    "history_ready": "完整日线可用数", "factor_ready": "指标可用数", "after_factor_limit": "进入本地复核范围数",
+    "technical_reviewed": "已完成本地技术复核", "deep_reviewed": "已整理完整报告", "qualified": "已确认合格数",
+    "unverified": "必需条件尚无法核验数", "displayed": "实际展示候选数", "display_target": "本次展示目标数",
+    "maximum_full_reports": "完整报告数量上限", "maximum_technical_reviews": "本地技术复核数量上限",
+    "maximum_minute_requests": "分钟请求数量上限", "maximum_alternatives": "后续候选数量上限",
+    "review_stop_reason": "复核停止原因", "selection_outcome": "筛选结果",
+    "source_date_verified": "来源日期是否有效", "timeliness_status": "行情时效状态", "session_phase": "时段",
+    "quote_active_age_seconds": "有效交易时段延迟（秒）", "maximum_active_age_seconds": "有效交易时段延迟上限（秒）",
 }
 _STATUS = {
     "ok": "可用", "partial": "部分可用", "unavailable": "不可用", "insufficient_data": "数据不足",
@@ -73,6 +82,9 @@ _STATUS = {
     "analysis_success": "分析完成", "information_partial": "部分证据缺失", "analysis_completed": "分析完成",
     "intraday_provisional": "盘中暂定", "completed_daily_close": "完整日线确认", "close_pending": "收盘待确认",
     "latest_completed_daily_bar": "最近完整交易日", "realtime_snapshot": "实时行情快照", "diagnostic_only": "补充观察",
+    "evidence_unavailable": "必需证据不足，尚无法确认是否合格", "no_recommendation": "没有已确认合格候选",
+    "recommendation": "已有通过条件的研究候选", "display_target_reached": "已达到本次展示目标",
+    "candidate_pool_exhausted": "已检查完本次可复核候选", "stale": "行情已过期", "future": "行情时点超前",
 }
 _HIDDEN_KEYS = {
     "analysis_id", "tool_contract_version", "buy_decision", "ranking_details", "ranking_score_0_100",
@@ -229,7 +241,7 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
         ("fundamental_analysis", "公司基本面与估值"),
         ("limit_up_pullback_pattern", "涨停回马枪形态"), ("late_session_analysis", "尾盘证据"),
         ("supplemental_diagnostics", "补充诊断"), ("tradability", "可交易性与执行限制"),
-        ("realtime_snapshot", "本次实时行情"), ("data_analysis", "原始行情与比较资料"),
+        ("realtime_snapshot", "本次实时行情"), ("snapshot", "本次实时行情"), ("data_analysis", "原始行情与比较资料"),
         ("evidence_gaps", "证据缺口"), ("risks", "风险"), ("warnings", "注意事项"),
         ("supporting_evidence", "支持证据"), ("positive_evidence", "正向证据"),
         ("counter_evidence", "反向证据"), ("unmet_conditions", "未满足条件"),
@@ -252,7 +264,10 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
         identity = _identity(stock if isinstance(stock, dict) else {}, _text(payload.get("query")) or "当前股票")
         return _candidate_sections(payload, identity, single=True)
     sections: list[tuple[str, str]] = []
-    for key, title in (("scope", "选股范围及核验"), ("selection_methodology", "选股方法"), ("diagnosis_validity", "诊断时点"), ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
+    for key, title in (("scope", "选股范围及核验"), ("candidate_counts", "本次筛选与复核数量"),
+                       ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
+                       ("selection_methodology", "选股方法"), ("diagnosis_validity", "诊断时点"),
+                       ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
         if key in payload:
             sections.append((title, "\n".join(_tree(payload[key]))))
     targets: list[tuple[dict[str, Any], str]] = []
@@ -339,6 +354,8 @@ def goujian_fenxi_anquan_huitui(payload: dict[str, Any] | None) -> str:
             lead += "部分来源或指标缺失，以下保留可用证据和具体缺口。"
     elif payload.get("recommendation_available") is True:
         lead = "以下为通过明确选股条件的研究候选，按原始维度比较；同层展示顺序不代表上涨概率。"
+        if status == "partial":
+            lead += "部分来源或补充证据缺失，报告保留具体缺口和实际复核范围。"
     else:
         lead = _text(payload.get("no_recommendation_reason")) or "本次没有候选通过全部选股条件。"
     return buquan_zhengju_baogao(lead, payload)

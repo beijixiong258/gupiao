@@ -830,6 +830,9 @@ def huoqu_zuixin_hengjiemian(
         actual_date, daily = _latest_tushare_daily(pro, date_text)
         daily = daily.copy()
         daily["ts_code"] = daily["ts_code"].map(_normalize_code)
+        daily["trade_date"] = pd.to_datetime(
+            daily.get("trade_date", pd.Series(pd.NaT, index=daily.index)), errors="coerce",
+        ).dt.normalize()
         daily["latest_price"] = pd.to_numeric(daily.get("close"), errors="coerce")
         daily["open"] = pd.to_numeric(daily.get("open"), errors="coerce")
         daily["high"] = pd.to_numeric(daily.get("high"), errors="coerce")
@@ -854,12 +857,18 @@ def huoqu_zuixin_hengjiemian(
             if valuation is not None and not valuation.empty:
                 valuation = valuation.copy()
                 valuation["ts_code"] = valuation["ts_code"].map(_normalize_code)
+                valuation["valuation_trade_date"] = pd.to_datetime(
+                    valuation.get("trade_date", pd.Series(pd.NaT, index=valuation.index)), errors="coerce",
+                ).dt.normalize()
+                valuation["valuation_source"] = "tushare_daily_basic"
                 for column in ("turnover_rate", "volume_ratio", "pe_ttm", "pb", "total_mv", "circ_mv"):
                     valuation[column] = pd.to_numeric(valuation.get(column), errors="coerce")
                 valuation["total_market_value_yuan"] = valuation["total_mv"] * 10_000.0
                 valuation["circulating_market_value_yuan"] = valuation["circ_mv"] * 10_000.0
                 keep = [
                     "ts_code",
+                    "valuation_trade_date",
+                    "valuation_source",
                     "turnover_rate",
                     "volume_ratio",
                     "pe_ttm",
@@ -868,12 +877,28 @@ def huoqu_zuixin_hengjiemian(
                     "circulating_market_value_yuan",
                 ]
                 daily = daily.merge(valuation[keep], on="ts_code", how="left")
+                daily["valuation_is_complete_daily"] = (
+                    daily["trade_date"].eq(pd.Timestamp(actual_date).normalize())
+                    & daily["valuation_trade_date"].notna()
+                    & daily["valuation_trade_date"].eq(daily["trade_date"])
+                )
+                unverified_count = int((
+                    daily["valuation_source"].notna() & ~daily["valuation_is_complete_daily"]
+                ).sum())
+                if unverified_count:
+                    warnings.append(
+                        f"{unverified_count} 只股票的日终估值日期缺失或与日线不一致；原值保留，不补入日线因子"
+                    )
         except Exception as exc:
             warnings.append(f"完整交易日估值横截面不可用：{exc}")
         keep_daily = [
             column
             for column in (
                 "ts_code",
+                "trade_date",
+                "valuation_trade_date",
+                "valuation_source",
+                "valuation_is_complete_daily",
                 "latest_price",
                 "open",
                 "high",

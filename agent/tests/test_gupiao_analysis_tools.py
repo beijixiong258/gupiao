@@ -63,6 +63,31 @@ def test_analysis_state_rejects_nested_market_tables():
         store.save({"nested": [{"history": pd.DataFrame({"close": [10.0]})}]})
 
 
+def test_partial_scope_preserves_actual_review_count_and_stage(monkeypatch):
+    payload = _selection_result()
+    payload.update(status="partial", outcome="information_partial", requested_candidate_count=1,
+                   reviewed_candidates=[payload["primary"], {"ts_code": "600002.SH"}, {"ts_code": "600003.SH"}])
+    monkeypatch.setattr("src.ashare.xuangu_fenxi.fenxi_xuangu", lambda **kwargs: payload)
+    result = json.loads(GupiaoFenxiTool().execute(fanwei="all_market", shuliang=1))
+    assert result["status"] == "partial"
+    assert result["analysis_stage"]["status"] == "partial"
+    assert ContextBuilder.is_compatible_analysis_result(result)
+    assert result["reviewed_candidate_count"] == 3
+    assert result["displayed_candidate_count"] == 1
+    from src.agent.loop import _analysis_run_status
+    assert _analysis_run_status(result) == "information_partial"
+
+
+@pytest.mark.parametrize("status,stage,compatible", [
+    ("partial", "partial", True), ("ok", "ok", True),
+    ("ok", "partial", False), ("partial", "error", False),
+])
+def test_analysis_stage_must_preserve_the_outer_status(status, stage, compatible):
+    payload = _selection_result()
+    payload.update(status=status, analysis_id="fx_contract", analysis_stage={"status": stage})
+    assert ContextBuilder.is_compatible_analysis_result(payload) is compatible
+
+
 def test_retired_prediction_history_is_obsolete_and_hides_old_forecast():
     history = [
         {"role": "tool", "name": "gupiao_yuce", "tool_call_id": "old", "content": json.dumps({"forecast": {"T+3": 88}})},

@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.ashare.shichang_shuju import akshare_zhilian
+from src.ashare.shichang_shuju import JiaoyiRili, akshare_zhilian
 from src.ashare.shuju_yuan import _tushare_pro
 from src.ashare.yinzi_gongcheng import describe_factor_coverage
 
@@ -86,18 +86,97 @@ def _normalize_index_history(frame: pd.DataFrame, *, tushare: bool) -> pd.DataFr
                 "成交量": "volume",
             }
         )
-    data["trade_date"] = pd.to_datetime(data.get("trade_date"), errors="coerce").dt.normalize()
+    if not {"trade_date", "close"}.issubset(data.columns):
+        return pd.DataFrame()
+    data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
     for column in ["open", "high", "low", "close", "volume"]:
         if column in data.columns:
             data[column] = pd.to_numeric(data[column], errors="coerce")
-    if "close" not in data.columns:
-        return pd.DataFrame()
     return (
-        data.dropna(subset=["trade_date", "close"])
-        .drop_duplicates("trade_date", keep="last")
+        data.dropna(subset=["trade_date"])
         .sort_values("trade_date")
         .reset_index(drop=True)
     )
+
+
+def _benchmark_calendar_dates(
+    *, start: pd.Timestamp, end: pd.Timestamp, calendar: JiaoyiRili | None,
+) -> tuple[pd.DatetimeIndex, dict[str, Any]]:
+    """只消费本次权威日历；短个股历史也可请求指数所需的前 21 个交易日。"""
+    quality: dict[str, Any] = {
+        "source": calendar.source if calendar is not None else None,
+        "fetched_at": calendar.fetched_at if calendar is not None else None,
+        "required_latest_date": end.strftime("%Y-%m-%d"),
+        "required_observations": 21,
+    }
+    if calendar is None:
+        quality.update(status="unavailable", reason="calendar_unavailable")
+        return pd.DatetimeIndex([]), quality
+    if pd.Timestamp(calendar.start_date) > start or pd.Timestamp(calendar.end_date) < end:
+        quality.update(status="unavailable", reason="calendar_coverage_insufficient")
+        return pd.DatetimeIndex([]), quality
+    dates = pd.DatetimeIndex(sorted(day for day in calendar.open_dates if day <= end))
+    if end not in dates:
+        quality.update(status="unavailable", reason="analysis_date_not_in_calendar")
+        return pd.DatetimeIndex([]), quality
+    if len(dates) < 21:
+        quality.update(status="unavailable", reason="calendar_window_insufficient")
+        return pd.DatetimeIndex([]), quality
+    dates = dates[dates >= min(start, dates[-21])]
+    quality.update(
+        status="ok",
+        requested_start_date=dates[0].strftime("%Y-%m-%d"),
+        required_window_start_date=dates[-21].strftime("%Y-%m-%d"),
+        expected_sessions=int(len(dates)),
+    )
+    return dates, quality
+
+
+def _check_benchmark_history(
+    history: pd.DataFrame, *, expected_dates: pd.DatetimeIndex,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """当前窗口必须完整；更早的无效观测留空，不让行数冒充交易日。"""
+    data = history.copy()
+    if not {"trade_date", "close"}.issubset(data.columns):
+        data = pd.DataFrame(columns=["trade_date", "close"])
+    data = data[data["trade_date"].between(expected_dates[0], expected_dates[-1])].copy()
+    dates = data["trade_date"]
+    close = pd.to_numeric(data["close"], errors="coerce")
+    invalid_close = ~np.isfinite(close) | close.le(0)
+    duplicate = dates.duplicated(keep=False)
+    outside_calendar = ~dates.isin(expected_dates)
+    valid = data.loc[~invalid_close & ~duplicate & ~outside_calendar].copy()
+    missing = expected_dates.difference(pd.DatetimeIndex(valid["trade_date"]))
+    required_missing = expected_dates[-21:].intersection(missing)
+
+    def labels(values: Any) -> list[str]:
+        return [day.strftime("%Y-%m-%d") for day in sorted(set(values))]
+
+    reasons: list[str] = []
+    if data.empty:
+        reasons.append("empty_history")
+    if expected_dates[-1] in missing:
+        reasons.append("latest_session_missing")
+    if len(required_missing):
+        reasons.append("required_window_incomplete")
+    if bool((invalid_close & dates.isin(expected_dates[-21:])).any()):
+        reasons.append("invalid_close_in_required_window")
+    if bool((duplicate & dates.isin(expected_dates[-21:])).any()):
+        reasons.append("duplicate_date_in_required_window")
+    quality = {
+        "accepted": not reasons,
+        "rows": int(len(valid)),
+        "required_latest_date": expected_dates[-1].strftime("%Y-%m-%d"),
+        "latest_date": valid["trade_date"].max().strftime("%Y-%m-%d") if not valid.empty else None,
+        "missing_trade_dates": labels(missing),
+        "required_window_missing_dates": labels(required_missing),
+        "invalid_close_dates": labels(dates[invalid_close]),
+        "duplicate_trade_dates": labels(dates[duplicate]),
+        "non_trading_dates": labels(dates[outside_calendar]),
+        "historical_partial": bool(len(missing) or outside_calendar.any()),
+        "reasons": reasons,
+    }
+    return valid.sort_values("trade_date").reset_index(drop=True), quality
 
 
 def _fetch_one_benchmark(
@@ -106,9 +185,19 @@ def _fetch_one_benchmark(
     start: pd.Timestamp,
     end: pd.Timestamp,
     source: str,
+    calendar: JiaoyiRili | None = None,
+    quality: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, str, list[str]]:
     spec = BENCHMARKS[key]
     errors: list[str] = []
+    details = quality if quality is not None else {}
+    expected_dates, calendar_quality = _benchmark_calendar_dates(start=start, end=end, calendar=calendar)
+    details.update(calendar=calendar_quality, attempted_providers=[], degraded=False)
+    if expected_dates.empty:
+        details.update(status="unavailable", reasons=[calendar_quality["reason"]])
+        errors.append(f"{spec['name']} 无法核验指数交易日窗口：{calendar_quality['reason']}")
+        return pd.DataFrame(), "unavailable", errors
+    request_start = expected_dates[0]
     providers = [source] if source in {"tushare", "akshare"} else ["tushare", "akshare"]
     for provider in providers:
         try:
@@ -116,7 +205,7 @@ def _fetch_one_benchmark(
                 pro = _tushare_pro()
                 raw = pro.index_daily(
                     ts_code=spec["ts_code"],
-                    start_date=start.strftime("%Y%m%d"),
+                    start_date=request_start.strftime("%Y%m%d"),
                     end_date=end.strftime("%Y%m%d"),
                     fields="ts_code,trade_date,open,high,low,close,vol,amount",
                 )
@@ -127,12 +216,26 @@ def _fetch_one_benchmark(
                 with akshare_zhilian():
                     raw = ak.stock_zh_index_daily(symbol=spec["ak_symbol"])
                 fresh = _normalize_index_history(raw, tushare=False)
-                fresh = fresh[(fresh["trade_date"] >= start) & (fresh["trade_date"] <= end)]
-            if fresh.empty:
-                raise RuntimeError("返回空日线")
-            return fresh[(fresh["trade_date"] >= start) & (fresh["trade_date"] <= end)], provider, errors
+            fresh, source_quality = _check_benchmark_history(fresh, expected_dates=expected_dates)
+            attempt = {"source": provider, **source_quality}
+            details["attempted_providers"].append(attempt)
+            if not source_quality["accepted"]:
+                errors.append(f"{spec['name']} {provider} 日K质量不合格：{', '.join(source_quality['reasons'])}")
+                continue
+            details.update(
+                status="partial" if source_quality["historical_partial"] else "ok",
+                source=provider,
+                degraded=bool(errors),
+                quality=source_quality,
+            )
+            return fresh, provider, errors
         except Exception as exc:
+            details["attempted_providers"].append({
+                "source": provider, "accepted": False,
+                "reasons": ["source_request_failed"], "error": str(exc),
+            })
             errors.append(f"{spec['name']} {provider} 日K失败：{exc}")
+    details.update(status="unavailable", source="unavailable", reasons=["no_qualified_source"])
     return pd.DataFrame(), "unavailable", errors
 
 
@@ -141,34 +244,47 @@ def _benchmark_features(
     start: pd.Timestamp,
     end: pd.Timestamp,
     source: str,
+    calendar: JiaoyiRili | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     merged: pd.DataFrame | None = None
     details: dict[str, Any] = {}
     warnings: list[str] = []
+    expected_dates, _ = _benchmark_calendar_dates(start=start, end=end, calendar=calendar)
     for key in BENCHMARKS:
+        source_meta: dict[str, Any] = {}
         history, provider, errors = _fetch_one_benchmark(
             key=key,
             start=start,
             end=end,
             source=source,
+            calendar=calendar,
+            quality=source_meta,
         )
         warnings.extend(errors)
         if history.empty:
-            details[key] = {"status": "unavailable", "source": provider, "rows": 0}
+            details[key] = {**source_meta, "status": "unavailable", "source": provider, "rows": 0}
             continue
-        values = history[["trade_date", "close"]].copy()
+        values = history.set_index("trade_date")[["close"]].reindex(expected_dates)
+        values.index.name = "trade_date"
+        values = values.reset_index()
         close = pd.to_numeric(values["close"], errors="coerce")
-        values[f"market_{key}_ret_1"] = close.pct_change(1, fill_method=None)
-        values[f"market_{key}_ret_5"] = close.pct_change(5, fill_method=None)
-        values[f"market_{key}_ret_20"] = close.pct_change(20, fill_method=None)
+        for period in (1, 5, 20):
+            complete = close.rolling(period + 1, min_periods=period + 1).count().eq(period + 1)
+            values[f"market_{key}_ret_{period}"] = close.pct_change(period, fill_method=None).where(complete)
         values[f"market_{key}_volatility_20"] = (
             close.pct_change(fill_method=None).rolling(20, min_periods=20).std() * math.sqrt(252)
         )
         values = values.drop(columns=["close"])
         merged = values if merged is None else merged.merge(values, on="trade_date", how="outer")
-        details[key] = {"status": "ok", "source": provider, "rows": int(len(history))}
+        details[key] = {**source_meta, "source": provider, "rows": int(len(history))}
+        if source_meta.get("status") == "partial":
+            warnings.append(f"{BENCHMARKS[key]['name']} 较早历史存在无效或缺失观测，受影响窗口的指数指标留空")
+    available = merged is not None and not merged.empty
     return (merged if merged is not None else pd.DataFrame()), {
-        "status": "ok" if merged is not None and not merged.empty else "unavailable",
+        "status": (
+            "ok" if available and all(item.get("status") == "ok" for item in details.values())
+            else "partial" if available else "unavailable"
+        ),
         "benchmarks": details,
         "warnings": warnings,
         "frequency": "daily_k_only",
@@ -302,6 +418,7 @@ def enrich_daily_factor_panel(
     panel: pd.DataFrame,
     *,
     source: str,
+    calendar: JiaoyiRili | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Add benchmark, group and size-neutral factors from supplied daily evidence."""
     if panel is None or panel.empty:
@@ -324,7 +441,7 @@ def enrich_daily_factor_panel(
         else:
             data[column] = pd.to_numeric(data[column], errors="coerce")
 
-    benchmark, benchmark_meta = _benchmark_features(start=start, end=end, source=source)
+    benchmark, benchmark_meta = _benchmark_features(start=start, end=end, source=source, calendar=calendar)
     if not benchmark.empty:
         data = data.merge(benchmark, on="trade_date", how="left")
     for column in BENCHMARK_FEATURE_COLUMNS:

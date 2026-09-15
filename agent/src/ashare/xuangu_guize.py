@@ -186,12 +186,12 @@ def guolv_lishi_wanzhengxing(
     for code, raw in histories.items():
         data = raw.copy() if raw is not None else pd.DataFrame()
         if data.empty or "trade_date" not in data.columns:
-            rejected.append({"ts_code": code, "reason": "没有可用历史日线"})
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": "没有可用历史日线"})
             continue
         data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
         data = data.dropna(subset=["trade_date"]).sort_values("trade_date").reset_index(drop=True)
         if len(data) < minimum_rows:
-            rejected.append({"ts_code": code, "reason": f"历史只有 {len(data)} 行，少于 {minimum_rows} 行"})
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": f"历史只有 {len(data)} 行，少于 {minimum_rows} 行"})
             continue
         earliest_date = pd.Timestamp(data.iloc[0]["trade_date"]).normalize()
         observed_calendar_days = int((analysis_date.normalize() - earliest_date).days)
@@ -199,6 +199,7 @@ def guolv_lishi_wanzhengxing(
             rejected.append(
                 {
                     "ts_code": code,
+                    "status": "unavailable",
                     "reason": (
                         f"远端日线只能证明约 {observed_calendar_days} 个自然日的上市历史，"
                         f"不足 {minimum_listing_calendar_days} 日新股风险门槛"
@@ -208,11 +209,14 @@ def guolv_lishi_wanzhengxing(
             continue
         latest_date = pd.Timestamp(data.iloc[-1]["trade_date"]).normalize()
         if latest_date != analysis_date.normalize():
-            rejected.append({"ts_code": code, "reason": f"最新日线停留在 {latest_date.strftime('%Y-%m-%d')}"})
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": f"最新日线停留在 {latest_date.strftime('%Y-%m-%d')}"})
             continue
         latest_amount = zhuan_you_xian_shuzhi(data.iloc[-1].get("amount_yuan"))
-        if latest_amount is None or latest_amount < minimum_amount:
-            rejected.append({"ts_code": code, "reason": "最新完整日线成交额低于流动性底线"})
+        if latest_amount is None or latest_amount < 0:
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": "最新完整日线成交额缺失或无效"})
+            continue
+        if latest_amount < minimum_amount:
+            rejected.append({"ts_code": code, "status": "unmet", "reason": "最新完整日线成交额低于流动性底线"})
             continue
         accepted[code] = data
     return accepted, rejected
@@ -472,24 +476,36 @@ def goujian_kejiaoyixing_zhaiyao(
         zhuan_you_xian_shuzhi(snapshot.get(field))
         for field in ("previous_close", "open", "high", "low")
     ]
+    current_volume = zhuan_you_xian_shuzhi(snapshot.get("volume"))
+    current_amount = zhuan_you_xian_shuzhi(snapshot.get("amount_yuan"))
+    current_turnover_valid = all(value is not None and value > 0 for value in (current_volume, current_amount))
     time_check = heyan_kuaizhao_shidian(
         snapshot, expected_trade_date=reference_time if realtime_required else amount_trade_date,
         reference_time=reference_time, require_timestamp=realtime_required,
     )
+    quote_time = pd.Timestamp(time_check["provider_quote_time"]) if time_check["provider_quote_time"] else None
+    auction_pending = bool(realtime_required and (
+        time_check["session_phase"] == "opening_auction"
+        or (quote_time is not None and quote_time < quote_time.normalize() + pd.Timedelta(hours=9, minutes=25))
+    ))
     current_verified = bool(
         snapshot.get("status") == "ok"
         and all(value is not None and value > 0 for value in current_fields)
+        and current_turnover_valid and not auction_pending
         and time_check["verified"]
     )
     quote_reason = (
         str(snapshot.get("error") or "实时快照不可用") if snapshot.get("status") != "ok"
+        else str(time_check["reason"]) if not time_check["verified"]
+        else "开盘集合竞价尚无已核验的撮合成交，快照仅供参考" if auction_pending
         else "实时价格或涨跌停核验字段不完整" if any(value is None or value <= 0 for value in current_fields)
+        else "当前成交量或成交额缺失、无效或尚无成交，无法确认当前可交易性" if not current_turnover_valid
         else str(time_check["reason"])
     )
     if snapshot.get("status") == "ok" and not time_check["verified"]:
         cautions.append(str(time_check["reason"]))
     if realtime_required and not current_verified:
-        hard_blocks.append("盘中行情时点或实时价格、涨跌停字段未通过核验，无法确认当前可交易性")
+        hard_blocks.append("当前行情时点、价格、涨跌停或成交字段未通过核验，无法确认当前可交易性")
     analysis_price = current_price if current_verified else zhuan_you_xian_shuzhi(latest.get("close"))
     try:
         price_rule = huoqu_zhangdieting_guize(code, name)
@@ -511,6 +527,9 @@ def goujian_kejiaoyixing_zhaiyao(
         "current_quote_status": "verified" if current_verified else "unavailable",
         "current_quote_reason": quote_reason,
         "quote_time_verification": time_check,
+        "current_volume": current_volume,
+        "current_amount_yuan": current_amount,
+        "current_turnover_requirement": "当前成交量和成交额须为有效正数；全天流动性底线仅用于最近完整日线",
         "analysis_price": analysis_price,
         "analysis_price_basis": (
             "realtime_snapshot"

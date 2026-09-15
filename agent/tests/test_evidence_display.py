@@ -196,6 +196,22 @@ def test_rule_selection_report_keeps_conditions_raw_values_and_all_evidence(obse
     assert "综合分" not in text
 
 
+def test_partial_scope_report_discloses_coverage_limits_and_actual_snapshot():
+    payload = _selection()
+    payload.update(status="partial", selection_outcome="recommendation",
+                   candidate_counts={"scope_input": 240, "technical_reviewed": 6, "deep_reviewed": 1, "displayed": 1},
+                   selection_limits={"maximum_technical_reviews": 120, "review_stop_reason": "display_target_reached"})
+    payload["primary"]["snapshot"] = {"provider_quote_time": "2026-09-14 09:39:30", "last_price": 12.34}
+    text = goujian_fenxi_anquan_huitui(payload)
+    assert "部分来源或补充证据缺失" in text
+    assert "输入范围股票数：240" in text
+    assert "已完成本地技术复核：6" in text
+    assert "已整理完整报告：1" in text
+    assert "实际展示候选数：1" in text
+    assert "已达到本次展示目标" in text
+    assert "2026-09-14 09:39:30" in text
+
+
 def test_tool_preserves_partial_analysis_and_adds_live_session_identifier(monkeypatch):
     analysis_session_store.clear()
     payload = _single("partial")

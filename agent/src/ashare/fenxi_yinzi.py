@@ -84,6 +84,7 @@ def goujian_fenxi_yinzi_mianban(
     profiles: pd.DataFrame,
     *,
     source: str,
+    calendar: Any | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """从批量前复权日线构造不含未来标签的分析因子面板。"""
     profile_by_code = (
@@ -117,6 +118,7 @@ def goujian_fenxi_yinzi_mianban(
         panel, factor_meta = enrich_daily_factor_panel(
             panel,
             source=source,
+            calendar=calendar,
         )
     except Exception as exc:
         factor_meta = {"status": "degraded", "warnings": [f"市场背景增强失败：{exc}"]}
@@ -130,28 +132,48 @@ def zengjia_dangri_guzhi_yinzi(
     latest_panel: pd.DataFrame,
     profiles: pd.DataFrame,
 ) -> pd.DataFrame:
-    """用已取得的同日横截面补充最新风险因子，不逐股读取历史估值。"""
+    """仅用来源和逐行日期已核验的日终估值补缺，不覆盖已有日线值。"""
     if latest_panel is None or latest_panel.empty:
         return pd.DataFrame()
     data = latest_panel.copy()
     if profiles is None or profiles.empty or "ts_code" not in profiles.columns:
         return data
+    required = (
+        "trade_date", "valuation_trade_date", "valuation_source", "valuation_is_complete_daily",
+    )
+    if "trade_date" not in data.columns or not set(required).issubset(profiles.columns):
+        return data
     available = [
-        column
-        for column in ("ts_code", "turnover_rate", "circulating_market_value_yuan")
+        column for column in ("ts_code", *required, "turnover_rate", "circulating_market_value_yuan")
         if column in profiles.columns
     ]
-    profile_values = profiles[available].drop_duplicates("ts_code", keep="last").copy()
+    profile_values = profiles[available].copy()
+    profile_dates = pd.to_datetime(profile_values["trade_date"], errors="coerce").dt.normalize()
+    valuation_dates = pd.to_datetime(profile_values["valuation_trade_date"], errors="coerce").dt.normalize()
+    verified = (
+        profile_values["valuation_is_complete_daily"].eq(True)
+        & profile_values["valuation_source"].eq("tushare_daily_basic")
+        & profile_dates.notna()
+        & valuation_dates.eq(profile_dates)
+    )
+    profile_values = profile_values.loc[verified].copy()
+    profile_values["trade_date"] = profile_dates.loc[verified]
+    profile_values = profile_values.drop_duplicates(["ts_code", "trade_date"], keep="last")
+    if profile_values.empty:
+        return data
+    profile_values = profile_values.drop(columns=list(required[1:]))
     profile_values = profile_values.rename(
         columns={
             "turnover_rate": "_snapshot_turnover_rate",
             "circulating_market_value_yuan": "_snapshot_circ_mv_yuan",
         }
     )
+    data["_snapshot_trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
+    profile_values = profile_values.rename(columns={"trade_date": "_snapshot_trade_date"})
     data = data.drop(
         columns=["_snapshot_turnover_rate", "_snapshot_circ_mv_yuan"],
         errors="ignore",
-    ).merge(profile_values, on="ts_code", how="left")
+    ).merge(profile_values, on=["ts_code", "_snapshot_trade_date"], how="left")
     turnover = pd.to_numeric(
         data.get("_snapshot_turnover_rate", pd.Series(np.nan, index=data.index)),
         errors="coerce",
@@ -160,8 +182,15 @@ def zengjia_dangri_guzhi_yinzi(
         data.get("_snapshot_circ_mv_yuan", pd.Series(np.nan, index=data.index)),
         errors="coerce",
     )
-    data["turnover_rate_daily"] = turnover / 100.0
-    data["log_circ_mv"] = np.log(circ_mv.where(circ_mv > 0))
+    for column, supplement in {
+        "turnover_rate_daily": turnover.where(turnover.ge(0)) / 100.0,
+        "log_circ_mv": np.log(circ_mv.where(circ_mv > 0)),
+    }.items():
+        current = pd.to_numeric(data.get(column, pd.Series(np.nan, index=data.index)), errors="coerce")
+        current = current.where(np.isfinite(current))
+        if column == "turnover_rate_daily":
+            current = current.where(current.ge(0))
+        data[column] = current.fillna(supplement.where(np.isfinite(supplement)))
     by_date = data.groupby("trade_date", group_keys=False)
     data["rank_turnover_rate_daily"] = by_date["turnover_rate_daily"].transform(
         lambda values: values.rank(pct=True) if values.count() >= 2 else np.nan
@@ -170,7 +199,7 @@ def zengjia_dangri_guzhi_yinzi(
         lambda values: values.rank(pct=True) if values.count() >= 2 else np.nan
     )
     return data.drop(
-        columns=["_snapshot_turnover_rate", "_snapshot_circ_mv_yuan"],
+        columns=["_snapshot_trade_date", "_snapshot_turnover_rate", "_snapshot_circ_mv_yuan"],
         errors="ignore",
     ).replace([np.inf, -np.inf], np.nan)
 

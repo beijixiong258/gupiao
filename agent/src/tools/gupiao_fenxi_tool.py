@@ -21,14 +21,8 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
     }
     reviewed = result.get("reviewed_candidates")
     if isinstance(reviewed, list):
-        requested_count = result.get("requested_candidate_count")
-        if isinstance(requested_count, int) and requested_count > 0:
-            public["reviewed_candidate_count"] = min(
-                requested_count,
-                int(bool(result.get("primary"))) + len(result.get("alternatives") or []),
-            )
-        else:
-            public["reviewed_candidate_count"] = len(reviewed)
+        public["reviewed_candidate_count"] = len(reviewed)
+        public["displayed_candidate_count"] = int(bool(result.get("primary"))) + len(result.get("alternatives") or [])
 
     provenance = public.get("data_provenance")
     if isinstance(provenance, dict):
@@ -115,8 +109,12 @@ class GupiaoFenxiTool(BaseTool):
             "analysis_id": analysis_id,
             "selected_stock": stored_result.get("primary"),
             "analysis_stage": {
-                "status": "completed",
-                "scope": "候选范围核验、原始证据、显式选股条件与非支配比较已完成",
+                "status": "partial" if stored_result.get("status") == "partial" else "completed",
+                "scope": (
+                    "已整理当前可取得的候选证据；部分来源或条件尚未完成核验"
+                    if stored_result.get("status") == "partial"
+                    else "候选范围核验、原始证据、显式选股条件与非支配比较已完成"
+                ),
                 "next_step": (
                     "说明候选的量化依据、证据缺口、主要风险与重新评估条件"
                     if recommendation_available

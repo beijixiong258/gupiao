@@ -84,7 +84,7 @@ def yunxing_dangu_tongyi_lianghua(
     config: dict[str, Any], context: FenxiShujuShangxiawen,
 ) -> dict[str, Any]:
     """保留已有函数入口，返回原始诊断证据，不计算综合分或买入结论。"""
-    del technical, tradability
+    del technical
     gaps: list[dict[str, Any]] = []
     target_profile = {
         **(fundamentals.get("profile") or {}),
@@ -136,8 +136,13 @@ def yunxing_dangu_tongyi_lianghua(
     factor: dict[str, Any] = {"status": "unavailable", "groups": {}}
     panel_meta: dict[str, Any] = {}
     try:
+        calendar = context.jiaoyi_rili()
+    except Exception as exc:
+        calendar = None
+        gaps.append(_gap("benchmark_calendar_unavailable", "指数交易日历", exc))
+    try:
         ready_profiles = profiles[profiles["ts_code"].isin(histories)].copy()
-        panel, panel_meta = goujian_fenxi_yinzi_mianban(histories, ready_profiles, source="auto")
+        panel, panel_meta = goujian_fenxi_yinzi_mianban(histories, ready_profiles, source="auto", calendar=calendar)
         if panel.empty:
             raise RuntimeError("本股日线没有形成可用的因子行")
         panel_dates = pd.to_datetime(panel["trade_date"], errors="coerce").dt.normalize()

@@ -212,7 +212,8 @@ def test_tool_count_argument_limits_public_selection(monkeypatch) -> None:
         )
     )
     assert result["requested_candidate_count"] == 2
-    assert result["reviewed_candidate_count"] == 2
+    assert result["reviewed_candidate_count"] == 3
+    assert result["displayed_candidate_count"] == 2
     assert [result["primary"]["ts_code"], result["alternatives"][0]["ts_code"]] == [
         "000001.SZ",
         "000002.SZ",

@@ -124,7 +124,7 @@ class ContextBuilder:
             and isinstance(payload.get("analysis_id"), str)
             and payload.get("analysis_id")
             and isinstance(payload.get("analysis_stage"), dict)
-            and payload["analysis_stage"].get("status") == "completed"
+            and payload["analysis_stage"].get("status") in {"completed", payload["status"]}
             and not any("prediction" in str(key) for key in payload["analysis_stage"])
             and "buy_decision" not in payload
             and "ranking_details" not in payload
