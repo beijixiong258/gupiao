@@ -195,6 +195,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
             minimum_amount=float((config.get("fenxi") or {}).get("min_amount_yuan", 50_000_000)),
             realtime_required=realtime_required,
             reference_time=context.reference,
+            market_clock=clock,
         )
     except Exception as exc:
         tradability = {"status": "unavailable", "cautions": [str(exc)]}
@@ -249,7 +250,11 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
             "session_status": clock.get("session_status"), "result_confirmation": confirmation,
             "realtime_required": realtime_required,
             "realtime_status": tradability.get("current_quote_status") or snapshot.get("status"),
-            "explanation": f"日线证据截至 {as_of}，生成于 {generated_at}。盘中行情会变化，缺失来源已单独列明；新日线或财报发布后需重新分析。",
+            "explanation": (
+                f"日线证据截至 {as_of}，生成于 {generated_at}。"
+                + str(tradability.get("execution_note") or "成交条件尚未完成核验")
+                + "。缺失来源已单独列明；新日线或财报发布后需重新分析。"
+            ),
             "reassess_when": summary["reassessment_conditions"],
         },
         "data_analysis": {

@@ -29,31 +29,19 @@ gpyj-mcp = "mcp_server:main"
 [tool.setuptools]
 package-dir = {"" = "agent"}
 py-modules = ["cli", "mcp_server"]
+include-package-data = false
 
 [tool.setuptools_scm]
 
 [tool.setuptools.packages.find]
 where = ["agent"]
-include = ["src*"]
+include = ["src", "src.*"]
+exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-"src" = [
-    "providers/*.json",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["agent/tests"]
-pythonpath = ["agent"]
-markers = [
-    "unit: Unit tests (fast, no network)",
-    "integration: Integration tests (may need network)",
-]
+"src" = ["lianghua_peizhi.json"]
+"src.providers" = ["llm_providers.json"]
 
 [tool.ruff]
 target-version = "py311"

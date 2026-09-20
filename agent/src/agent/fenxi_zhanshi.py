@@ -31,6 +31,13 @@ _LABELS = {
     "state": "形态状态", "state_label": "形态说明", "eligible": "条件是否满足", "stage": "时段", "stage_label": "时段说明",
     "confirmation_level": "确认状态", "conditions": "条件核验", "actuals": "实际观测值", "metrics": "原始指标",
     "baseline_date": "基准日", "shrink_date": "缩量日", "breakout_date": "突破日", "risk_reference_price": "风险参考价格",
+    "rule_semantics": "形态规则口径", "session_origin": "交易日计数起点",
+    "shrink_window_start_session": "缩量窗口起始交易日序号", "shrink_window_end_session": "缩量窗口截止交易日序号",
+    "shrink_window_sessions": "缩量窗口交易日数", "breakout_deadline_sessions": "突破截止交易日序号",
+    "breakout_deadline_session": "突破截止交易日序号", "breakout_after_shrink_required": "突破是否必须晚于缩量",
+    "breakout_deadline_inclusive": "截止交易日是否包含在内",
+    "shrink_session_after_baseline": "缩量发生在基准日后第几个交易日",
+    "breakout_session_after_baseline": "突破发生在基准日后第几个交易日",
     "profile": "公司资料", "valuation": "估值数据", "financials": "财务数据", "sources": "数据来源",
     "pe_ttm": "滚动市盈率（倍）", "pe_dynamic": "动态市盈率（倍）", "pe": "市盈率（总市值/净利润，倍）", "pe_definition": "市盈率来源口径",
     "pe_unspecified": "市盈率（来源未明确口径，倍）", "pb": "市净率（倍）",
@@ -42,9 +49,16 @@ _LABELS = {
     "turnover_rate_pct": "换手率（%）", "turnover_rate": "换手率（来源单位）", "volume_ratio": "量比（倍）",
     "pe_percentile": "市盈率原始分位", "pb_percentile": "市净率原始分位", "valuation_percentiles": "估值分位",
     "valuation_context": "估值比较背景", "sample_size": "比较样本数量", "available_fields": "字段可用性",
+    "valuation_time_verification": "估值时点核验", "valuation_trade_date": "估值对应交易日",
+    "valuation_source": "估值来源", "valuation_is_complete_daily": "估值是否确认为完整日终数据",
+    "excluded_unverified_or_other_date_count": "因时点未核验或日期不同排除的样本数",
     "last_price": "最新价", "latest_price": "最新价", "pct_change": "涨跌幅（%）", "pct_chg": "涨跌幅（%）",
-    "basic_execution_feasible": "基础执行条件是否满足", "hard_blocks": "执行限制", "cautions": "注意事项",
-    "realtime_required": "当前是否需要实时行情", "current_quote_verified": "实时行情是否已核验",
+    "basic_execution_feasible": "本次适用的基础条件是否满足", "hard_blocks": "执行限制", "cautions": "注意事项",
+    "realtime_required": "当前是否需要实时行情", "current_quote_verified": "当前行情时效及价量是否已核验",
+    "execution_check_scope": "基础条件检查范围", "execution_note": "成交条件解释",
+    "current_volume": "快照成交量（股）", "current_amount_yuan": "快照成交额（元）",
+    "historical_quote_verified": "历史快照日期及价量是否已核验", "market_session_status": "权威日历确认时段",
+    "current_quote_status": "当前行情核验状态",
     "analysis_price": "诊断参考价格", "analysis_price_basis": "价格依据", "amount_basis": "成交额依据",
     "amount_trade_date": "成交额对应交易日", "price_limit_pct": "涨跌幅限制（%）", "data_quality": "数据质量",
     "source": "来源", "history": "历史日线", "history_summary": "日线覆盖概况", "rows": "有效行数",
@@ -52,7 +66,8 @@ _LABELS = {
     "requested_end_date": "请求结束日", "actual_range": "实际覆盖区间", "requested_range": "请求区间",
     "session_coverage": "交易日覆盖情况", "minimum": "最小值", "maximum": "最大值", "mean": "均值",
     "latest_daily_bar": "最近完整日线", "resolved_profile": "已核验身份资料", "comparison_profile": "本次比较池资料",
-    "comparison_pool": "比较池来源", "factor_panel": "指标面板来源", "realtime_snapshot": "实时行情来源",
+    "comparison_pool": "比较池来源", "factor_panel": "指标面板来源", "realtime_snapshot": "行情快照来源",
+    "feature_coverage": "指标有效观测覆盖情况", "source_warnings": "来源降级记录",
     "data_as_of": "证据截止日", "daily_data_as_of": "日线截止日", "explanation": "口径说明", "reassess_when": "何时更新诊断",
     "result_confirmation": "结果确认状态", "session_status": "交易时段", "realtime_status": "实时核验状态",
     "selection_analysis": "选股条件核验", "meets_selection_conditions": "是否通过选股条件",
@@ -66,6 +81,13 @@ _LABELS = {
     "quote_age_seconds": "来源更新时间距核验时点（秒）", "verification_scope": "核验范围",
     "current_quote_reason": "当前行情核验说明",
     "scope_input": "输入范围股票数", "after_hard_filter": "基础检查通过数", "after_prefilter": "抽样数量",
+    "after_market_cap_filter": "市值条件通过数", "market_cap_unverified": "市值尚未核验数",
+    "market_cap_check": "市值条件核验", "condition": "指定条件", "basis_label": "市值口径",
+    "maximum_yuan": "市值上限（元）", "maximum_yi": "市值上限（亿元）", "actual_yuan": "已核验市值（元）",
+    "operator": "比较边界", "time_basis": "时点口径", "source_dates": "来源原始日期",
+    "fetched_at": "来源取得时间", "verified_count": "已核验数量", "matched_count": "满足条件数量",
+    "unmet_count": "未满足条件数量", "unavailable_count": "证据不足数量",
+    "unmet_examples": "未满足条件示例", "unavailable_examples": "证据不足示例", "application_stage": "条件执行阶段",
     "history_ready": "完整日线可用数", "factor_ready": "指标可用数", "after_factor_limit": "进入本地复核范围数",
     "technical_reviewed": "已完成本地技术复核", "deep_reviewed": "已整理完整报告", "qualified": "已确认合格数",
     "unverified": "必需条件尚无法核验数", "displayed": "实际展示候选数", "display_target": "本次展示目标数",
@@ -76,6 +98,7 @@ _LABELS = {
     "quote_active_age_seconds": "有效交易时段延迟（秒）", "maximum_active_age_seconds": "有效交易时段延迟上限（秒）",
 }
 _STATUS = {
+    "lt": "低于（不含上限）", "le": "不超过（含上限）", "not_evaluated": "尚未核验",
     "ok": "可用", "partial": "部分可用", "unavailable": "不可用", "insufficient_data": "数据不足",
     "error": "程序错误", "program_error": "程序错误", "failed": "未完成", "not_applicable": "当前不适用", "not_used": "未使用",
     "met": "已满足", "unmet": "未满足", "verified": "已核验", "pending": "待确认",
@@ -85,7 +108,14 @@ _STATUS = {
     "evidence_unavailable": "必需证据不足，尚无法确认是否合格", "no_recommendation": "没有已确认合格候选",
     "recommendation": "已有通过条件的研究候选", "display_target_reached": "已达到本次展示目标",
     "candidate_pool_exhausted": "已检查完本次可复核候选", "stale": "行情已过期", "future": "行情时点超前",
+    "historical_reference": "历史日线基础条件通过，仅作研究参考",
+    "conditions_verified": "本次行情基础条件已核验，不代表即时成交",
+    "historical_daily": "最近完整日线", "current_quote": "当前行情",
+    "not_required": "本次不要求", "not_requested": "本次未请求",
+    "non_trading_day": "休市", "pre_open": "开市前", "post_close": "收盘后",
+    "latest_completed_qfq_close": "最近完整日线前复权收盘价",
 }
+_METADATA_CONTAINERS = {"data_provenance", "data_quality", "sources", "method", "configuration"}
 _HIDDEN_KEYS = {
     "analysis_id", "tool_contract_version", "buy_decision", "ranking_details", "ranking_score_0_100",
     "ranking_score_definition", "score", "score_0_100", "score_definition", "score_interpretation",
@@ -120,7 +150,7 @@ def _label(key: str) -> str:
     return key.replace("_", " ")
 
 
-def _value(value: Any) -> str:
+def _value(value: Any, *, field: str | None = None) -> str:
     if value is None:
         return "缺失（未取得或无法计算）"
     if isinstance(value, bool):
@@ -130,10 +160,16 @@ def _value(value: Any) -> str:
             return "缺失（不是有效有限数）"
         return str(value) if isinstance(value, int) else f"{value:.12g}"
     text = _text(value)
+    if field == "freshness":
+        return {"fresh": "新近信号", "recent": "近期信号", "stale": "陈旧信号"}.get(text, text) or "未提供"
+    if field == "timeliness_status" and text == "not_requested":
+        return "本次未核验当前时效"
+    if field in {"current_quote_status", "realtime_status"} and text == "not_required":
+        return "本次不要求当前行情核验"
     return _STATUS.get(text, text) or "未提供"
 
 
-def _tree(value: Any, prefix: str = "", metric_key: str | None = None) -> list[str]:
+def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_kind: str = "observation") -> list[str]:
     """完整展开已返回结构，不截断列表；仅屏蔽已取消的评价字段。"""
     if isinstance(value, dict):
         lines: list[str] = []
@@ -142,23 +178,28 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None) -> list[s
             if key in _HIDDEN_KEYS or key.startswith("_") or key in {"field_metadata", "metric_definitions"}:
                 continue
             path = f"{prefix} / {_label(key)}" if prefix else _label(key)
-            lines.extend(_tree(child, path, key))
+            child_kind = "coverage" if key == "feature_coverage" else "metadata" if key in _METADATA_CONTAINERS else value_kind
+            lines.extend(_tree(child, path, key, value_kind=child_kind))
         return lines or ([f"- {prefix}：未返回可用字段。"] if prefix else [])
     if isinstance(value, (list, tuple)):
         if not value:
             return [f"- {prefix}：未列出项目。"]
         lines = []
         for index, child in enumerate(value, start=1):
-            lines.extend(_tree(child, f"{prefix} {index}", metric_key))
+            lines.extend(_tree(child, f"{prefix} {index}", metric_key, value_kind=value_kind))
         return lines
+    if value_kind == "coverage":
+        # 覆盖率与指标共享字段标识，但不是指标数值，不能套用收益、波动率或分位的单位与释义。
+        displayed = value * 100 if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+        return [f"- {prefix} / 有效观测覆盖率（%）：{_value(displayed)}"]
     definition = factor_definition(metric_key or "")
-    known_metric = bool(metric_key and definition.get("label") != metric_key)
+    known_metric = bool(value_kind == "observation" and metric_key and definition.get("label") != metric_key)
     displayed = value
     if known_metric and isinstance(value, (int, float)) and not isinstance(value, bool):
         scale = definition.get("display_scale", 1)
         if isinstance(scale, (int, float)):
             displayed = value * scale
-    text = _value(displayed)
+    text = _value(displayed, field=metric_key)
     unit = definition.get("unit") if known_metric else None
     meaning = definition.get("meaning") if known_metric else None
     if unit:
@@ -200,12 +241,17 @@ def _factor_sections(factor: Any) -> list[tuple[str, str]]:
             if field in _HIDDEN_KEYS:
                 continue
             meta = metadata.get(field) if isinstance(metadata.get(field), dict) else {}
+            if meta.get("definition_ref") == field:
+                meta = {**factor_definition(field), **meta}
             label = meta.get("label") or meta.get("name") or _label(str(field))
             unit = (meta["unit"] or "无量纲") if "unit" in meta else "原始口径（未标注单位）"
             explanation = meta.get("meaning") or meta.get("description") or meta.get("economic_meaning") or "来源未提供此字段的独立释义"
+            for key, explanation_title in (("formula", "公式"), ("window", "窗口"), ("minimum_observations", "所需样本"), ("valid_observations", "本次有效样本数")):
+                if meta.get(key) is not None:
+                    explanation += f"；{explanation_title}：{meta[key]}"
             if field in missing_keys:
                 cause = missing.get(field) if isinstance(missing, dict) else None
-                explanation += f"；缺失：{_text(cause) or '所需输入未齐全'}"
+                explanation += f"；缺失：{_text(cause) or meta.get('missing_rule') or '所需输入未齐全'}"
             displayed = values.get(field)
             scale = meta.get("display_scale", 1)
             if isinstance(displayed, (int, float)) and not isinstance(displayed, bool) and isinstance(scale, (int, float)):
@@ -238,10 +284,11 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
         sections.append((identity + " / 选股条件与比较依据", "\n".join(_tree(candidate["selection_analysis"]))))
     for key, title in (
         ("stock", "股票身份"), ("technical_summary", "技术指标与结构"),
+        ("market_cap_check", "市值条件与原始值"),
         ("fundamental_analysis", "公司基本面与估值"),
         ("limit_up_pullback_pattern", "涨停回马枪形态"), ("late_session_analysis", "尾盘证据"),
         ("supplemental_diagnostics", "补充诊断"), ("tradability", "可交易性与执行限制"),
-        ("realtime_snapshot", "本次实时行情"), ("snapshot", "本次实时行情"), ("data_analysis", "原始行情与比较资料"),
+        ("realtime_snapshot", "本次行情快照"), ("snapshot", "本次行情快照"), ("data_analysis", "原始行情与比较资料"),
         ("evidence_gaps", "证据缺口"), ("risks", "风险"), ("warnings", "注意事项"),
         ("supporting_evidence", "支持证据"), ("positive_evidence", "正向证据"),
         ("counter_evidence", "反向证据"), ("unmet_conditions", "未满足条件"),
@@ -250,7 +297,8 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
         ("data_provenance", "来源与核验记录"),
     ):
         if key in candidate:
-            sections.append((identity + " / " + title, "\n".join(_tree(candidate[key])) or "当前没有可展示的字段。"))
+            kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
+            sections.append((identity + " / " + title, "\n".join(_tree(candidate[key], value_kind=kind)) or "当前没有可展示的字段。"))
     if "daily_factor_analysis" in candidate:
         sections.extend((identity + " / " + title, body) for title, body in _factor_sections(candidate["daily_factor_analysis"]))
     if isinstance(summary, dict):
@@ -265,11 +313,13 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
         return _candidate_sections(payload, identity, single=True)
     sections: list[tuple[str, str]] = []
     for key, title in (("scope", "选股范围及核验"), ("candidate_counts", "本次筛选与复核数量"),
+                       ("market_cap_filter", "市值筛选条件及核验"),
                        ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
                        ("selection_methodology", "选股方法"), ("diagnosis_validity", "诊断时点"),
                        ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
         if key in payload:
-            sections.append((title, "\n".join(_tree(payload[key]))))
+            kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
+            sections.append((title, "\n".join(_tree(payload[key], value_kind=kind))))
     targets: list[tuple[dict[str, Any], str]] = []
     if isinstance(payload.get("primary"), dict):
         targets.append((payload["primary"], "研究候选 1"))

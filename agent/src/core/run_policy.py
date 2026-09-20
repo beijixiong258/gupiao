@@ -13,8 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT_DIR = Path(__file__).resolve().parents[3]
-CONFIG_PATH = ROOT_DIR / "lianghua_peizhi.json"
+from src.core.config import DEFAULT_CONFIG_PATH as CONFIG_PATH
 _SENSITIVE_KEY = re.compile(
     r"(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|credential)",
     flags=re.IGNORECASE,

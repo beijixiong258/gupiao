@@ -124,6 +124,11 @@ def build_scope_clarification(content: Any) -> ClarificationRequest | None:
         return None
     if payload.get("stage") not in {"scope_discovery", "request_validation"}:
         return None
+    if isinstance(payload.get("clarification"), dict):
+        try:
+            return ClarificationRequest.from_dict(payload["clarification"])
+        except ValueError:
+            pass  # 无效的展示选项不能丢失业务工具已经返回的澄清状态。
     raw_candidates = payload.get("candidates") or []
     choices: list[ClarificationChoice] = []
     if isinstance(raw_candidates, list):

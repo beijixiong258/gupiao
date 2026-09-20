@@ -16,7 +16,7 @@ def build_registry(
     include_shell_tools: bool = False,
     clarification_handler: ClarificationHandler | None = None,
 ) -> ToolRegistry:
-    """Build business tools and the optional presentation-layer clarification tool.
+    """Build business tools and structured clarification for every client.
 
     ``persistent_memory`` is accepted for compatibility with the agent loop;
     this build does not expose a memory-write tool.
@@ -26,8 +26,7 @@ def build_registry(
     for tool_class in _BUSINESS_TOOLS:
         if tool_class.check_available():
             registry.register(tool_class())
-    if clarification_handler is not None:
-        registry.register(ClarifyTool(clarification_handler))
+    registry.register(ClarifyTool(clarification_handler))
     return registry
 
 

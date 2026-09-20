@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from src.ashare.buchong_zhenduan import goujian_buchong_zhenduan
+from src.ashare.fanwei_faxian import shencha_fanwei_houxuan
 from src.ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from src.ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
 from src.ashare.dangu_fenxi import DANGU_ANALYSIS_TYPE, fenxi_dangu
@@ -43,6 +44,7 @@ from src.ashare.xuangu_guize import (
     zhuan_json_zhi,
     zhuan_you_xian_shuzhi,
 )
+from src.ashare.xuangu_shizhi import guolv_shizhi, jiexi_shizhi_tiaojian
 
 
 XUANGU_TOOL_CONTRACT_VERSION = 9
@@ -96,7 +98,11 @@ class XuanguFenxiFuWu:
         self._config = config
         self._context = context
 
-    def fenxi(self, fanwei: FenxiFanwei, *, requested_count: int | None = None) -> dict[str, Any]:
+    def fenxi(
+        self, fanwei: FenxiFanwei, *, requested_count: int | None = None,
+        market_cap_condition: dict[str, Any] | None = None,
+        scope_choice: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if fanwei.leixing is FanweiLeixing.DANGU_GUPIAO:
             return fenxi_dangu(
                 gupiao=str(fanwei.gupiao or ""),
@@ -109,6 +115,8 @@ class XuanguFenxiFuWu:
                              1 + int(settings["backup_limit"]), int(settings["deep_analysis_limit"]))
         if fanwei.leixing is FanweiLeixing.MINGMING_FANWEI:
             discovery = self._context.faxian_fanwei(str(fanwei.mingcheng or ""))
+            if scope_choice is not None:
+                discovery = shencha_fanwei_houxuan(discovery, scope_choice)
             if discovery.status != "resolved" or discovery.scope is None:
                 return {
                     **discovery.to_result(),
@@ -167,8 +175,26 @@ class XuanguFenxiFuWu:
             else:
                 accepted_indices.append(index)
         filtered = data.loc[accepted_indices].reset_index(drop=True)
+        base_filtered_count = len(filtered)
+        cap_summary: dict[str, Any] = {"status": "not_requested"}
+        if market_cap_condition is not None and not filtered.empty:
+            cap_metadata: dict[str, Any] = {}
+            cap_error = None
+            try:
+                valuation = self._context.rizhong_guzhi(
+                    analysis_date.strftime("%Y-%m-%d"), metadata=cap_metadata,
+                )
+            except Exception as exc:
+                valuation, cap_error = pd.DataFrame(), str(exc)
+            filtered, cap_summary = guolv_shizhi(
+                filtered, market_cap_condition, valuation, analysis_date=analysis_date,
+                fetched_at=cap_metadata.get("fetched_at"), source_error=cap_error,
+            )
+        elif market_cap_condition is not None:
+            cap_summary = {"status": "not_evaluated", "condition": market_cap_condition,
+                           "reason": "没有通过基础检查的候选"}
         if filtered.empty:
-            incomplete = any(item["missing_fields"] for item in rejected)
+            incomplete = any(item["missing_fields"] for item in rejected) or bool(cap_summary.get("unavailable_count"))
             return {
                 "status": "partial" if incomplete else "ok",
                 "outcome": "information_partial" if incomplete else "no_recommendation",
@@ -179,13 +205,17 @@ class XuanguFenxiFuWu:
                 "as_of": analysis_date.strftime("%Y-%m-%d"),
                 "recommendation_available": False,
                 "no_recommendation_reason": (
-                    "候选基础价量字段存在缺失，暂时无法完成筛选；缺失数据不能解释为全部股票不满足条件"
-                    if incomplete else "全部候选都触发了风险硬过滤"
+                    "候选的基础价量或市值证据存在缺失，暂时无法完整确认是否合格"
+                    if incomplete else "通过基础检查的候选均未满足指定市值条件"
+                    if market_cap_condition and base_filtered_count else "全部候选都触发了风险硬过滤"
                 ),
                 "primary": None,
                 "alternatives": [],
                 "displayed_candidate_count": 0,
-                "candidate_counts": {"scope_input": len(data), "after_hard_filter": 0,
+                "market_cap_filter": cap_summary,
+                "candidate_counts": {"scope_input": len(data), "after_hard_filter": base_filtered_count,
+                                     "after_market_cap_filter": 0, "market_cap_unverified": cap_summary.get("unavailable_count", 0),
+                                     "after_prefilter": 0,
                                      "technical_reviewed": 0, "deep_reviewed": 0, "qualified": 0, "displayed": 0},
                 "filter_summary": {"input_count": len(data), "rejected_count": len(rejected), "examples": rejected[:20]},
             }
@@ -212,14 +242,22 @@ class XuanguFenxiFuWu:
                 item.get("status") == "unmet" for item in history_rejected
             )
             if all_unmet:
+                incomplete = bool(cap_summary.get("unavailable_count")) or any(item.get("missing_fields") for item in rejected)
                 return {
-                    "status": "ok", "outcome": "no_recommendation", "selection_outcome": "no_recommendation",
+                    "status": "partial" if incomplete else "ok",
+                    "outcome": "information_partial" if incomplete else "no_recommendation",
+                    "selection_outcome": "evidence_unavailable" if incomplete else "no_recommendation",
                     "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION, "analysis_type": "unified_stock_selection",
                     "scope": pool.metadata, "as_of": analysis_date.strftime("%Y-%m-%d"),
                     "recommendation_available": False, "primary": None, "alternatives": [],
                     "displayed_candidate_count": 0,
-                    "no_recommendation_reason": "本次已取得的完整日线均未通过流动性条件，没有合格候选",
-                    "candidate_counts": {"scope_input": len(data), "after_hard_filter": len(filtered),
+                    "no_recommendation_reason": (
+                        "已复核日线未通过条件，另有候选的基础价量或市值尚无法核验"
+                        if incomplete else "本次已取得的完整日线均未通过流动性条件，没有合格候选"
+                    ),
+                    "market_cap_filter": cap_summary,
+                    "candidate_counts": {"scope_input": len(data), "after_hard_filter": base_filtered_count,
+                                         "after_market_cap_filter": len(filtered), "market_cap_unverified": cap_summary.get("unavailable_count", 0),
                                          "after_prefilter": len(prefiltered), "history_ready": 0,
                                          "technical_reviewed": 0, "deep_reviewed": 0, "qualified": 0, "displayed": 0},
                     "data_provenance": {"history": history_meta},
@@ -238,6 +276,7 @@ class XuanguFenxiFuWu:
                 "recommendation_available": False, "primary": None, "alternatives": [],
                 "scope": pool.metadata,
                 "as_of": analysis_date.strftime("%Y-%m-%d"),
+                "market_cap_filter": cap_summary,
                 "error": "硬过滤后没有具备足够完整日线的候选",
                 "data_provenance": {"history": history_meta},
                 "filter_summary": {"input_count": len(data), "rejected_count": len(rejected), "examples": rejected[:20]},
@@ -329,9 +368,10 @@ class XuanguFenxiFuWu:
                 minimum_amount=float(settings["min_amount_yuan"]),
                 realtime_required=str(clock.get("session_status")) in {"opening_auction", "trading", "midday_break", "close_pending"},
                 reference_time=self._context.reference,
+                market_clock=clock,
             )
             realtime_blocks = shishi_ying_guolv(
-                snapshot if quote_check["current_quote_verified"] else {},
+                snapshot if quote_check["current_quote_verified"] or quote_check["historical_quote_verified"] else {},
                 code=code,
                 name=name,
                 config=self._config,
@@ -472,6 +512,7 @@ class XuanguFenxiFuWu:
                     "opening_auction", "trading", "midday_break", "close_pending",
                 },
                 reference_time=self._context.reference,
+                market_clock=clock,
             )
         deep_candidates = paixu_shangzhang_houxuan(deep_candidates, config=self._config, deep_reviewed=True)
         summaries = [
@@ -481,6 +522,9 @@ class XuanguFenxiFuWu:
             )
             for index, item in enumerate(deep_candidates, start=1)
         ]
+        if market_cap_condition is not None:
+            for summary, item in zip(summaries, deep_candidates):
+                summary["market_cap_check"] = item["profile"]["market_cap_check"]
         qualified = [] if technical_errors else [item for item in summaries if item["meets_selection_conditions"]]
         primary = qualified[0] if qualified else None
         alternatives = qualified[1 : 1 + int(settings["backup_limit"])]
@@ -503,7 +547,8 @@ class XuanguFenxiFuWu:
         ]
         undecided_count = sum(bool(item["missing_conditions"]) and not item["unmet_conditions"] for item in condition_checks)
         source_partial = (
-            any(item.get("missing_fields") for item in rejected)
+            bool(cap_summary.get("unavailable_count"))
+            or any(item.get("missing_fields") for item in rejected)
             or any(item.get("status") == "unavailable" for item in history_rejected)
             or history_loaded_count < len(prefiltered) or len(factor_map) < len(histories)
             or any(metadata.get("status") in {"partial", "unavailable", "degraded"}
@@ -527,6 +572,7 @@ class XuanguFenxiFuWu:
             "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
             "analysis_type": "unified_stock_selection",
             "scope": pool.metadata,
+            "market_cap_filter": cap_summary,
             "as_of": analysis_date.strftime("%Y-%m-%d"),
             "generated_at": self._context.reference.strftime("%Y-%m-%d %H:%M:%S"),
             "market_clock": clock,
@@ -579,7 +625,9 @@ class XuanguFenxiFuWu:
             "candidate_condition_checks": condition_checks,
             "candidate_counts": {
                 "scope_input": int(len(data)),
-                "after_hard_filter": int(len(filtered)),
+                "after_hard_filter": base_filtered_count,
+                "after_market_cap_filter": int(len(filtered)),
+                "market_cap_unverified": cap_summary.get("unavailable_count", 0),
                 "after_prefilter": int(len(prefiltered)),
                 "history_ready": int(len(histories)),
                 "factor_ready": int(len(factor_map)),
@@ -636,7 +684,9 @@ def fenxi_xuangu(
     mingcheng: str | None = None,
     gupiao: str | None = None,
     shuliang: int | str | None = None,
+    shizhi: dict[str, Any] | None = None,
     context: FenxiShujuShangxiawen | None = None,
+    scope_choice: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """自然语言智能体调用的统一分析入口。"""
     analysis_type = DANGU_ANALYSIS_TYPE if str(fanwei or "").strip().lower() in {
@@ -648,11 +698,29 @@ def fenxi_xuangu(
         "个股",
     } or (gupiao and str(fanwei or "all_market").strip().lower() in {"", "all_market", "all", "quan_shichang", "全市场"}) else "unified_stock_selection"
     try:
-        config, _ = jiazai_lianghua_peizhi()
         resolved_scope = FenxiFanwei.create(fanwei, mingcheng, gupiao)
+        market_cap_condition = None
+        if resolved_scope.leixing is not FanweiLeixing.DANGU_GUPIAO:
+            try:
+                market_cap_condition = jiexi_shizhi_tiaojian(shizhi)
+            except ValueError as exc:
+                question = str(exc)
+                return {
+                    "status": "clarification_required", "outcome": "clarification_required",
+                    "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
+                    "analysis_type": analysis_type, "stage": "request_validation",
+                    "error_code": "market_cap_condition_required", "error": question,
+                    "clarification": {"kind": "market_cap", "title": "确认市值条件", "question": question},
+                    "requested_candidate_count": _normalize_requested_count(shuliang),
+                    "recommendation_available": False, "primary": None, "alternatives": [],
+                    "displayed_candidate_count": 0,
+                }
+        config, _ = jiazai_lianghua_peizhi()
         request_context = context or FenxiShujuShangxiawen()
         result = XuanguFenxiFuWu(config=config, context=request_context).fenxi(
             resolved_scope, requested_count=_normalize_requested_count(shuliang),
+            market_cap_condition=market_cap_condition,
+            scope_choice=scope_choice,
         )
         return xianzhi_xuangu_jieguo(result, shuliang)
     except WangluoQingqiuYichang as exc:

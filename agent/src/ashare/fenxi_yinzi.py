@@ -9,7 +9,7 @@ import pandas as pd
 
 from src.ashare.gupiao_yanjiu import jisuan_tezheng_biao
 from src.ashare.riping_yinzi import enrich_daily_factor_panel
-from src.ashare.yinzi_gongcheng import FACTOR_GROUPS, FACTOR_REGISTRY
+from src.ashare.yinzi_gongcheng import FACTOR_GROUPS, FACTOR_REGISTRY, RAW_PRICE_VOLUME_FEATURE_COLUMNS, add_price_volume_factors
 
 
 
@@ -35,19 +35,13 @@ def _number(value: Any, digits: int | None = None) -> float | None:
 
 def zengjia_hengjiemian_yinzi(panel: pd.DataFrame) -> pd.DataFrame:
     data = panel.copy().sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
-    grouped = data.groupby("ts_code", group_keys=False)
-    close = pd.to_numeric(data["close"], errors="coerce")
-    open_price = pd.to_numeric(data["open"], errors="coerce")
-    high = pd.to_numeric(data["high"], errors="coerce")
-    low = pd.to_numeric(data["low"], errors="coerce")
-    previous_close = grouped["close"].shift(1)
-    data["gap_open"] = open_price / pd.to_numeric(previous_close, errors="coerce") - 1.0
-    data["intraday_return"] = close / open_price.replace(0, np.nan) - 1.0
-    daily_range = (high - low).replace(0, np.nan)
-    data["close_location"] = ((close - low) / daily_range).clip(0.0, 1.0).fillna(0.5)
+    if not set(RAW_PRICE_VOLUME_FEATURE_COLUMNS).issubset(data.columns):
+        data = add_price_volume_factors(data)
     if "amount_yuan" not in data.columns:
         data["amount_yuan"] = np.nan
-    data["log_amount_yuan"] = np.log1p(pd.to_numeric(data["amount_yuan"], errors="coerce").clip(lower=0))
+    amount = pd.to_numeric(data["amount_yuan"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    data["amount_yuan"] = amount.where(amount >= 0)
+    data["log_amount_yuan"] = np.log1p(data["amount_yuan"])
     data["amount_mean_5"] = data.groupby("ts_code")["amount_yuan"].transform(
         lambda values: pd.to_numeric(values, errors="coerce").rolling(5, min_periods=5).mean()
     )
@@ -128,6 +122,18 @@ def goujian_fenxi_yinzi_mianban(
     return panel, factor_meta
 
 
+def _daily_valuation_dates(data: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    missing_dates = pd.Series(pd.NaT, index=data.index, dtype="datetime64[ns]")
+    trade_dates = pd.to_datetime(data.get("trade_date", missing_dates), errors="coerce").dt.normalize()
+    valuation_dates = pd.to_datetime(data.get("valuation_trade_date", missing_dates), errors="coerce").dt.normalize()
+    verified = (
+        data.get("valuation_is_complete_daily", pd.Series(False, index=data.index)).eq(True)
+        & data.get("valuation_source", pd.Series("", index=data.index)).eq("tushare_daily_basic")
+        & trade_dates.notna() & valuation_dates.eq(trade_dates)
+    ).fillna(False)
+    return trade_dates, valuation_dates, verified
+
+
 def zengjia_dangri_guzhi_yinzi(
     latest_panel: pd.DataFrame,
     profiles: pd.DataFrame,
@@ -144,18 +150,15 @@ def zengjia_dangri_guzhi_yinzi(
     if "trade_date" not in data.columns or not set(required).issubset(profiles.columns):
         return data
     available = [
-        column for column in ("ts_code", *required, "turnover_rate", "circulating_market_value_yuan")
+        column for column in ("ts_code", *required, "turnover_rate", "turnover_rate_pct", "circulating_market_value_yuan")
         if column in profiles.columns
     ]
     profile_values = profiles[available].copy()
-    profile_dates = pd.to_datetime(profile_values["trade_date"], errors="coerce").dt.normalize()
-    valuation_dates = pd.to_datetime(profile_values["valuation_trade_date"], errors="coerce").dt.normalize()
-    verified = (
-        profile_values["valuation_is_complete_daily"].eq(True)
-        & profile_values["valuation_source"].eq("tushare_daily_basic")
-        & profile_dates.notna()
-        & valuation_dates.eq(profile_dates)
-    )
+    if "turnover_rate_pct" in profile_values:
+        turnover = pd.to_numeric(profile_values.get("turnover_rate", pd.Series(np.nan, index=profile_values.index)), errors="coerce")
+        profile_values["turnover_rate"] = turnover.fillna(pd.to_numeric(profile_values["turnover_rate_pct"], errors="coerce"))
+        profile_values = profile_values.drop(columns=["turnover_rate_pct"])
+    profile_dates, _, verified = _daily_valuation_dates(profile_values)
     profile_values = profile_values.loc[verified].copy()
     profile_values["trade_date"] = profile_dates.loc[verified]
     profile_values = profile_values.drop_duplicates(["ts_code", "trade_date"], keep="last")
@@ -215,7 +218,8 @@ def huizong_houxuan_yinzi(
     definitions = {
         entry["feature"]: {
             key: entry[key]
-            for key in ("label", "unit", "meaning", "display_scale", "canonical_source", "input_requirement", "frequency", "availability", "group", "role")
+            for key in ("label", "unit", "meaning", "display_scale", "canonical_source", "input_requirement", "frequency", "availability", "group", "role",
+                        "formula", "window", "minimum_observations", "missing_rule", "source_basis")
             if key in entry
         }
         for entry in FACTOR_REGISTRY
@@ -236,7 +240,12 @@ def huizong_houxuan_yinzi(
                 "economic_meaning": meaning,
                 "values": values,
                 "missing_fields": missing,
-                "metric_definitions": {feature: definitions.get(feature, {}) for feature in members},
+                "metric_definitions": {
+                    feature: {**definitions.get(feature, {}), **(
+                        {"valid_observations": int(row[f"{feature}_sample_count"])}
+                        if _number(row.get(f"{feature}_sample_count")) is not None else {}
+                    )} for feature in members
+                },
                 "available_factor_count": available,
                 "factor_count": len(members),
             }
@@ -247,6 +256,8 @@ def huizong_houxuan_yinzi(
                 + (f"；缺少 {len(missing)} 项" if missing else "")
             )
         results[str(row["ts_code"])] = {
+            "ts_code": str(row["ts_code"]),
+            "trade_date": pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d") if pd.notna(row.get("trade_date")) else None,
             "status": "ok" if available_count == total_count else "partial" if available_count else "unavailable",
             "groups": groups,
             "available_factor_count": available_count,
@@ -257,32 +268,44 @@ def huizong_houxuan_yinzi(
 
 
 def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, Any]]:
-    """保留同日原始估值与相对分位；分位描述样本位置，不表示投资优劣。"""
+    """原始估值完整保留，仅经逐行核验的同日日终估值参与相对分位。"""
     if snapshot is None or snapshot.empty or "ts_code" not in snapshot.columns:
         return {}
     data = snapshot.copy().drop_duplicates("ts_code", keep="last").reset_index(drop=True)
     industry = data.get("industry", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
     known_industry = ~industry.str.lower().isin({"", "unknown", "nan", "none", "未知", "未分类"})
+    trade_dates, valuation_dates, verified = _daily_valuation_dates(data)
     results: dict[str, dict[str, Any]] = {}
     fields = ("pe_ttm", "pe_dynamic", "pe", "pe_unspecified", "pb", "total_market_value_yuan", "circulating_market_value_yuan", "turnover_rate")
     for index, row in data.iterrows():
         values = {feature: _number(row.get(feature)) for feature in fields}
         relative: dict[str, dict[str, Any]] = {}
         evidence: list[str] = []
+        date_reason = (
+            "" if verified.loc[index]
+            else "行情日期缺失，无法核验同日估值" if pd.isna(trade_dates.loc[index])
+            else "估值日期缺失，无法核验同日估值" if pd.isna(valuation_dates.loc[index])
+            else f"估值日期 {valuation_dates.loc[index]:%Y-%m-%d} 与行情日期 {trade_dates.loc[index]:%Y-%m-%d} 不一致"
+            if valuation_dates.loc[index] != trade_dates.loc[index]
+            else "估值来源未核验为日终来源" if str(row.get("valuation_source")) != "tushare_daily_basic"
+            else "估值尚未确认为完整日终数据"
+        )
+        same_day_verified = verified & valuation_dates.eq(trade_dates.loc[index])
         for feature, label in (("pe_ttm", "市盈率"), ("pb", "市净率")):
             value = values[feature]
             series = pd.to_numeric(data.get(feature, pd.Series(np.nan, index=data.index)), errors="coerce")
-            series = series.where(np.isfinite(series) & series.gt(0))
+            series = series.where(np.isfinite(series) & series.gt(0) & same_day_verified)
             peers = series[industry.eq(industry.loc[index])].dropna() if known_industry.loc[index] else pd.Series(dtype=float)
             source = "same_industry" if len(peers) >= 5 else "current_comparison_pool"
             comparable = peers if source == "same_industry" else series.dropna()
             percentile = (
                 round(float(comparable.le(value).mean()) * 100.0, 4)
-                if value is not None and value > 0 and len(comparable) >= 5
+                if verified.loc[index] and value is not None and value > 0 and len(comparable) >= 5
                 else None
             )
             reason = (
                 "" if percentile is not None
+                else date_reason if date_reason
                 else "缺少有效正估值" if value is None or value <= 0
                 else "有效正估值比较样本少于 5 只"
             )
@@ -292,6 +315,7 @@ def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, 
                 "percentile_unit": "percent",
                 "definition": "不高于当前值的有效正估值样本占比；仅描述相对位置",
                 "sample_count": len(comparable),
+                "excluded_unverified_or_other_date_count": int((~same_day_verified).sum()),
                 "comparison_source": source,
                 "industry": industry.loc[index] if source == "same_industry" else None,
                 "status": "ok" if percentile is not None else "unavailable",
@@ -307,7 +331,7 @@ def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, 
                     f"{label} {value:g}；在{comparison_label} {len(comparable)} 个有效样本中"
                     f"的分位为 {percentile:g}%"
                 )
-        source_fields = ("source", "valuation_source", "captured_at", "trade_date", "as_of")
+        source_fields = ("source", "valuation_source", "captured_at", "trade_date", "valuation_trade_date", "as_of")
         sources = {field: str(row.get(field)) for field in source_fields if pd.notna(row.get(field)) and row.get(field) is not None}
         sources.update({key: value for key, value in snapshot.attrs.items() if key in source_fields and key not in sources})
         available = any(value is not None for value in values.values())
@@ -316,9 +340,15 @@ def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, 
             "values": values,
             "missing_fields": [field for field, value in values.items() if value is None],
             "relative_valuation": relative,
+            "valuation_time_verification": {
+                "status": "verified" if verified.loc[index] else "unavailable",
+                "reason": date_reason,
+                "trade_date": trade_dates.loc[index].strftime("%Y-%m-%d") if pd.notna(trade_dates.loc[index]) else None,
+                "valuation_trade_date": valuation_dates.loc[index].strftime("%Y-%m-%d") if pd.notna(valuation_dates.loc[index]) else None,
+            },
             "sources": sources,
             "evidence": evidence,
-            "scope": "同日估值证据",
+            "scope": "同日估值证据" if verified.loc[index] else "原始估值证据（时点未核验）",
             "limitations": ["估值分位仅反映当前有效比较样本，不代表上涨概率或价格低估程度"],
         }
     return results

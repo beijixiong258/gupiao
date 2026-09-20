@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .caiwu_zhenduan import goujian_caiwu_zhenduan
+from .yinzi_gongcheng import daily_atr
 
 
 def _block(key: str, label: str, *, metrics: dict[str, Any], summaries: list[str], missing: list[str]) -> dict[str, Any]:
@@ -68,13 +69,8 @@ def _technical_blocks(data: pd.DataFrame, minimum_amount: float) -> list[dict[st
         # 与既有技术摘要的 ATR 完全相同，缺失日不被填平；只沿用最后一段有效日线。
         bad_positions = np.flatnonzero(~valid_bar.to_numpy())
         start = int(bad_positions[-1] + 1) if len(bad_positions) else 0
-        segment_high, segment_low = high.iloc[start:], low.iloc[start:]
-        previous = close.iloc[start:].shift(1)
-        true_range = pd.concat([
-            segment_high - segment_low, (segment_high - previous).abs(), (segment_low - previous).abs(),
-        ], axis=1).max(axis=1)
-        atr = float(true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1])
-        metrics["atr_valid_history_rows"] = len(true_range)
+        atr = float(daily_atr(high, low, close).iloc[-1])
+        metrics["atr_valid_history_rows"] = len(close) - start
         ma20 = float(close.tail(20).mean())
         metrics.update(ma20=round(ma20, 8), atr14=round(atr, 8))
         if np.isfinite(atr) and atr > 0:

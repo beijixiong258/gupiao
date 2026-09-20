@@ -262,6 +262,7 @@ def _is_tool_success(result: str) -> bool:
                 "blocked",
                 "cancelled",
                 "clarification_required",
+                "scope_review_required",
                 "reanalysis_required",
             }:
                 return False
@@ -287,6 +288,8 @@ def _business_run_status(payload: dict[str, Any] | None, tool_name: str) -> str 
         return "no_recommendation" if outcome == "no_recommendation" else "success"
     if status == "insufficient_data":
         return "information_insufficient"
+    if status == "scope_review_required":
+        return "clarification_required"
     if status in {"clarification_required", "reanalysis_required", "cancelled"}:
         return status
     if status in {"unavailable", "data_unavailable"}:
@@ -419,6 +422,7 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self._called_ok: set[str] = set()
         self._pending_clarification: ClarificationRequest | None = None
+        self._pending_scope_review: dict[str, Any] | None = None
         self._latest_analysis_payload: dict[str, Any] | None = None
         self._latest_business_result: tuple[str, dict[str, Any]] | None = None
         self._cancelled: bool = False
@@ -447,6 +451,9 @@ class AgentLoop:
         self._cancelled = False
         self._called_ok = set()
         self._pending_clarification = None
+        self._pending_scope_review = None
+        reset_scope_request = getattr(self.registry.get("gupiao_fenxi"), "reset_request", lambda: None)
+        reset_scope_request()
         self._latest_analysis_payload = None
         self._latest_business_result = None
         self._previous_summary = ""
@@ -516,6 +523,14 @@ class AgentLoop:
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
                 if not response.has_tool_calls:
+                    if self._pending_scope_review is not None:
+                        final_content = self._finish_scope_review(context)
+                        answer_message = {"role": "assistant", "content": final_content}
+                        messages.append(answer_message)
+                        durable_history.append(copy.deepcopy(answer_message))
+                        trace.write({"type": "answer", "iter": iteration, "content": final_content})
+                        react_trace.append({"type": "answer", "content": final_content})
+                        break
                     if context.contains_unexpected_script(response.content):
                         from src.agent.fenxi_zhanshi import goujian_fenxi_anquan_huitui
 
@@ -574,12 +589,28 @@ class AgentLoop:
                     response.tool_calls, context, messages, durable_history, trace, react_trace, iteration,
                 )
 
+                if self._pending_clarification is not None:
+                    request = self._pending_clarification
+                    interactive = getattr(self.registry.get("clarify"), "has_interactive_handler", False)
+                    final_content = "请先确认分析条件，再继续筛选。" if interactive else context.sanitize_user_facing_content(request.question)
+                    if request.choices and not interactive:
+                        final_content += "\n\n" + "\n".join(
+                            f"{index}. {choice.label}" for index, choice in enumerate(request.choices, 1)
+                        )
+                    answer_message = {"role": "assistant", "content": final_content}
+                    messages.append(answer_message)
+                    durable_history.append(copy.deepcopy(answer_message))
+                    trace.write({"type": "answer", "iter": iteration, "content": final_content})
+                    react_trace.append({"type": "answer", "content": final_content})
+                    break
+
                 # Layer 3: compress after all tools have executed
                 if compact_requested:
                     logger.info("Manual compact triggered by model")
                     self._auto_compact(messages, run_dir, trace, focus_topic=focus_topic)
 
         except Exception as exc:
+            reset_scope_request()
             logger.exception(f"AgentLoop error: {exc}")
             trace.write({"type": "end", "status": "error", "reason": str(exc), "iterations": iteration})
             trace.close()
@@ -607,6 +638,10 @@ class AgentLoop:
                 "history": durable_history,
             }
 
+        if self._pending_scope_review is not None and not self._cancelled:
+            final_content = self._finish_scope_review(context)
+            durable_history.append({"role": "assistant", "content": final_content})
+        reset_scope_request()
         # Determine final status without treating an LLM fallback sentence as business success.
         business_payload = self._latest_business_result[1] if self._latest_business_result else None
         reason = ""
@@ -673,6 +708,21 @@ class AgentLoop:
 
     # -- Tool execution with read/write batching --------------------------------
 
+    def _finish_scope_review(self, context: ContextBuilder) -> str:
+        """智能体未完成范围选择时，保留真实澄清状态，不能靠一段文字变成成功。"""
+        payload = {**(self._pending_scope_review or {}), "status": "clarification_required", "outcome": "clarification_required"}
+        self._pending_scope_review = None
+        self._latest_analysis_payload = payload
+        self._latest_business_result = ("gupiao_fenxi", payload)
+        request = build_scope_clarification(payload)
+        self._pending_clarification = request
+        if request is None:
+            return "范围仍需确认，请补充具体的行业或主题。"
+        text = context.sanitize_user_facing_content(request.question)
+        if request.choices and not getattr(self.registry.get("clarify"), "has_interactive_handler", False):
+            text += "\n\n" + "\n".join(f"{index}. {choice.label}" for index, choice in enumerate(request.choices, 1))
+        return text
+
     def _process_tool_calls(
         self,
         tool_calls: list,
@@ -699,9 +749,7 @@ class AgentLoop:
         compact_requested = False
         focus_topic = ""
         to_execute = []
-        analysis_requested_in_batch = any(
-            tool_call.name == "gupiao_fenxi" for tool_call in tool_calls
-        )
+        clarification_requested_in_batch = any(tool_call.name == "clarify" for tool_call in tool_calls)
 
         for tc in tool_calls:
             # Layer 4: compact tool — mark then defer execution
@@ -714,9 +762,15 @@ class AgentLoop:
                 trace.write({"type": "compact_requested", "iter": iteration})
                 continue
 
-            if tc.name == "clarify" and (
-                analysis_requested_in_batch or self._pending_clarification is not None
-            ):
+            if tc.name == "gupiao_fenxi" and clarification_requested_in_batch:
+                self._record_skipped_tool_call(
+                    tc=tc, payload={"status": "blocked", "error": "先澄清本次条件，再重新发起分析"},
+                    reason="clarification_precedes_analysis", context=context, messages=messages,
+                    durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                )
+                continue
+
+            if tc.name == "clarify" and self._pending_clarification is not None:
                 self._record_skipped_tool_call(
                     tc=tc,
                     payload={
@@ -856,6 +910,14 @@ class AgentLoop:
             batches.append(("parallel", current_ro))
 
         for mode, batch in batches:
+            if self._pending_clarification is not None:
+                for tc in batch:
+                    self._record_skipped_tool_call(
+                        tc=tc, payload={"status": "blocked", "error": "请先回答当前澄清，不能跳过条件继续分析"},
+                        reason="clarification_required", context=context, messages=messages,
+                        durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                    )
+                continue
             if mode == "parallel" and len(batch) > 1:
                 self._execute_parallel(batch, context, messages, durable_history, trace, react_trace, iteration)
             else:
@@ -975,7 +1037,7 @@ class AgentLoop:
         self._update_memory(tc.name)
 
         success = _is_tool_success(result)
-        if tc.name in {"gupiao_fenxi", "gupiao_yuce"}:
+        if tc.name in {"gupiao_fenxi", "gupiao_yuce", "clarify"}:
             try:
                 parsed = json.loads(result)
             except (json.JSONDecodeError, TypeError):
@@ -985,15 +1047,22 @@ class AgentLoop:
                 "outcome": "program_error",
                 "error": "业务工具没有返回有效的结构化结果",
             }
+            if tc.name == "clarify":
+                getattr(self.registry.get("gupiao_fenxi"), "reset_request", lambda: None)()
+                self._latest_analysis_payload = None
+                if payload.get("status") == "ok":
+                    payload = {**payload,
+                               "status": "cancelled" if payload.get("cancelled") else "reanalysis_required",
+                               "outcome": "cancelled" if payload.get("cancelled") else "reanalysis_required"}
             self._latest_business_result = (tc.name, payload)
+            self._pending_scope_review = payload if payload.get("status") == "scope_review_required" else None
             success = _business_run_status(payload, tc.name) in {"success", "no_recommendation", "information_partial"}
             if tc.name == "gupiao_fenxi":
                 self._latest_analysis_payload = payload
-        if tc.name == "gupiao_fenxi":
-            if "clarify" in self.registry:
-                self._pending_clarification = (
-                    build_scope_clarification(result) if not success else None
-                )
+        if tc.name in {"gupiao_fenxi", "clarify"}:
+            self._pending_clarification = (
+                build_scope_clarification(result) if not success else None
+            )
         if success:
             self._called_ok.add(tc.name)
 
@@ -1117,6 +1186,29 @@ class AgentLoop:
 
         # Fix orphaned tool pairs in the reconstructed message list
         _fix_tool_pairs(messages)
+        # 摘要模型可能只看到截断的旧范围审查消息。以本轮真实完成载荷补回状态、
+        # 原始值和反证；完整组件仍由本地展示层从原载荷补齐，不交给摘要模型决定状态。
+        payload = self._latest_analysis_payload
+        if isinstance(payload, dict) and payload.get("status") in {"ok", "partial"}:
+            anchor = {key: payload[key] for key in (
+                "status", "outcome", "selection_outcome", "analysis_type", "analysis_id", "as_of", "generated_at",
+                "scope", "candidate_counts", "selection_limits", "recommendation_available", "no_recommendation_reason",
+                "indicator_definitions",
+            ) if key in payload}
+            candidates = [payload] if payload.get("analysis_type") == "single_stock_analysis" else [
+                payload.get("primary"), *(payload.get("alternatives") or []), *(payload.get("diagnostic_candidates") or []),
+            ]
+            anchor["completed_reports"] = [{
+                **{key: item[key] for key in ("stock", "name", "ts_code", "diagnosis_summary", "selection_analysis", "risks", "evidence_gaps", "data_quality", "reassessment_conditions") if key in item},
+                "raw_factor_groups": {key: {field: value for field, value in group.items() if field != "metric_definitions"}
+                                      for key, group in (item.get("daily_factor_analysis") or {}).get("groups", {}).items()},
+            } for item in candidates if isinstance(item, dict)]
+            messages.append(_TransientMessage(role="user", content=(
+                "本轮分析已完成，以下是程序保留的当前结果，优先于可能遗漏状态的对话摘要。直接解释结果和缺口；"
+                "不要重新选范围、重复分析或再确认。按所附指标定义解释，不能根据英文缩写猜测含义。"
+                "合格数量仅针对已复核对象，达到目标数量而停止不代表范围内只有这些股票合格。"
+                "正文简洁归纳支持、反证、缺口和复评条件；完整指标公式及组件将由展示层补齐。\n" + json.dumps(anchor, ensure_ascii=False)
+            )))
 
     def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
         """Fire an event via the callback."""

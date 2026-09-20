@@ -1,7 +1,7 @@
 """自然语言分析范围发现与东方财富实时目录适配。
 
-大模型只负责抽取用户说出的范围名称；本模块实时读取行业和概念目录，确定唯一范围，
-或返回一次可展示的通俗澄清。候选池只接收已经解析且带来源的范围对象。
+智能体理解范围语义；本模块实时读取目录并核验身份。名称匹配不能唯一确定时，
+先交给智能体审查真实候选，仍有歧义才澄清。候选池只接收带核验来源的范围对象。
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ class ShichangFanwei:
     catalog_counts: dict[str, int] = field(default_factory=dict)
     attempted_providers: tuple[dict[str, Any], ...] = ()
     verification: dict[str, Any] = field(default_factory=dict)
+    interpretation_reason: str | None = None
 
     @property
     def user_label(self) -> str:
@@ -69,6 +70,7 @@ class ShichangFanwei:
             "catalog_counts": dict(self.catalog_counts),
             "attempted_providers": [dict(value) for value in self.attempted_providers],
             "verification": dict(self.verification),
+            "interpretation_reason": self.interpretation_reason,
         }
         if include_internal_code:
             payload["canonical_code"] = self.code
@@ -121,6 +123,22 @@ class FanweiFaxianJieguo:
         if self.message:
             payload["error"] = self.message
         return payload
+
+
+def shencha_fanwei_houxuan(discovery: FanweiFaxianJieguo, choice: dict[str, Any]) -> FanweiFaxianJieguo:
+    """只接受本次已核验集合中的语义选择；模型不能注入新范围或排除未核验候选。"""
+    candidates = discovery.candidates
+    if discovery.status != "clarification_required" or not candidates or any(
+        candidate.verification.get("verified") is not True for candidate in candidates
+    ):
+        return discovery
+    reason = str(choice.get("reason") or "").strip()
+    selected = [candidate for candidate in candidates
+                if candidate.code == choice.get("code") and candidate.kind.value == choice.get("kind")]
+    if len(selected) != 1 or not reason:
+        return discovery
+    scope = replace(selected[0], ambiguity_resolution="agent_context_review", interpretation_reason=reason)
+    return replace(discovery, status="resolved", scope=scope, error_code=None, message=None)
 
 
 class DongcaiFanweiShujuYuan:

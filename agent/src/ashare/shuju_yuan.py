@@ -141,9 +141,9 @@ def biaozhunhua_gupiao_daima(code: str) -> str:
 
 
 def _tushare_pro() -> Any:
-    from src.providers.llm import _ensure_dotenv
+    from src.core.config import ensure_dotenv
 
-    _ensure_dotenv()
+    ensure_dotenv()
     token = os.getenv("TUSHARE_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TUSHARE_TOKEN not set")

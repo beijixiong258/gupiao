@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 from typing import Any
 
-ROOT_DIR = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG_PATH = ROOT_DIR / "lianghua_peizhi.json"
+from src.core.config import DEFAULT_CONFIG_PATH
 
 
 def _peizhi_duixiang(value: dict[str, Any], key: str) -> dict[str, Any]:
@@ -139,8 +137,8 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
     macd_validation = analysis.get("macd_structure_validation")
     if not isinstance(macd_validation, dict):
         raise ValueError("fenxi.macd_structure_validation 必须是 JSON 对象")
-    # 回放模块自身是这组研究口径的唯一校验入口，避免配置层复制一套逐渐分叉的规则。
-    from src.ashare.macd_huifang import MacdHuifangPeizhi
+    # 共享轻量配置定义，不为校验参数加载整条历史研究链路。
+    from src.ashare.macd_huifang_peizhi import MacdHuifangPeizhi
 
     required_validation_keys = set(MacdHuifangPeizhi.__dataclass_fields__)
     if set(macd_validation) != required_validation_keys:

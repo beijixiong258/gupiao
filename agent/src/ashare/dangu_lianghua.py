@@ -54,6 +54,14 @@ def _comparison_pool(
     data = data.assign(_amount_order=amount).sort_values("_amount_order", ascending=False, na_position="last")
     found = data[data["ts_code"].eq(code)]
     current = {**target_profile, **(found.iloc[0].drop(labels=["_amount_order"]).to_dict() if not found.empty else {})}
+    if target_profile.get("valuation_is_complete_daily") is True:
+        # 目标日终估值已经核验；比较池的空字段或未核验快照不得覆盖它。
+        for field in (
+            "trade_date", "valuation_trade_date", "valuation_source", "valuation_is_complete_daily",
+            "turnover_rate", "turnover_rate_pct", "circulating_market_value_yuan",
+            "total_market_value_yuan", "pe", "pe_definition", "pe_ttm", "pb", "volume_ratio",
+        ):
+            current[field] = target_profile.get(field)
     current["name"] = name if name and name != code else current.get("name") or code
     current["industry"] = industry or current.get("industry") or ""
     current["peer_role"] = "target"
@@ -91,6 +99,19 @@ def yunxing_dangu_tongyi_lianghua(
         **(fundamentals.get("valuation") or {}),
         "ts_code": code, "name": name, "industry": industry, "peer_role": "target",
     }
+    valuation = fundamentals.get("valuation") or {}
+    valuation_dates = pd.to_datetime(
+        [valuation.get("as_of"), valuation.get("valuation_trade_date")], errors="coerce",
+    )
+    target_profile["valuation_is_complete_daily"] = bool(
+        valuation.get("valuation_is_complete_daily") is True
+        and valuation.get("valuation_source") == "tushare_daily_basic"
+        and valuation_dates.notna().all()
+        and (valuation_dates.normalize() == analysis_date.normalize()).all()
+    )
+    if target_profile["valuation_is_complete_daily"]:
+        target_profile["trade_date"] = analysis_date.normalize()
+        target_profile["turnover_rate"] = valuation.get("turnover_rate_pct")
     profiles = pd.DataFrame([target_profile])
     universe_meta: dict[str, Any] = {}
     pool_meta: dict[str, Any] = {"status": "unavailable", "selected_stocks": 1}

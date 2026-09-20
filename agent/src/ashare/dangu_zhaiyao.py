@@ -31,7 +31,8 @@ def goujian_dangu_zhaiyao(
     conflicts: list[str] = []
     context: dict[str, list[str]] = {}
     reassessment = _texts([gap.get("reassessment_condition") for gap in evidence_gaps])
-    returns = technical.get("returns") or {}
+    raw = technical.get("raw_indicators") or {}
+    returns = {**(technical.get("returns") or {}), **{f"{period}d": raw[f"ret_{period}"] for period in (5, 20) if f"ret_{period}" in raw}}
     price_facts: list[str] = []
     for period in ("5d", "20d"):
         value = _number(returns.get(period))
@@ -42,8 +43,8 @@ def goujian_dangu_zhaiyao(
                 supporting.append(fact)
             elif value < 0:
                 counter.append(fact)
-    close = _number(technical.get("close"))
-    averages = technical.get("moving_averages") or {}
+    close = _number(raw.get("close", technical.get("close")))
+    averages = {**(technical.get("moving_averages") or {}), **{f"ma{period}": raw[f"ma_{period}"] for period in (20, 60) if f"ma_{period}" in raw}}
     for period in (20, 60):
         value = _number(averages.get(f"ma{period}"))
         if close is not None and value is not None:
@@ -65,7 +66,7 @@ def goujian_dangu_zhaiyao(
     def factor(group: str, field: str) -> float | None:
         return _number(((groups.get(group) or {}).get("values") or {}).get(field))
 
-    volume_ratio = _number(technical.get("volume_ratio_5_to_20"))
+    volume_ratio = _number(raw.get("volume_ratio_5_20", technical.get("volume_ratio_5_to_20")))
     if volume_ratio is None:
         volume_ratio = factor("price_volume_confirmation", "volume_ratio_5_20")
     context["量价配合"] = [f"5日与20日均量比为 {volume_ratio:.3f}；仅描述量能变化"] if volume_ratio is not None else ["均量比较证据缺失"]
@@ -144,7 +145,7 @@ def goujian_dangu_zhaiyao(
         "counter_evidence": counter,
         "evidence_context": context,
         "evidence_conflicts": _texts(conflicts),
-        "interpretation_basis": "同源价格指标不作独立投票；以上关系由已有观测整理，未计算综合分或上涨概率",
+        "interpretation_basis": "关系判断优先采用未舍入原值，文字数值按展示精度舍入；同源价格指标不作独立投票，未计算综合分或上涨概率",
         "reassessment_conditions": _texts(reassessment),
     }
 

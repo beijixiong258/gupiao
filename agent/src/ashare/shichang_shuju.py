@@ -159,8 +159,32 @@ class FenxiShujuShangxiawen:
                 allow_current_snapshot=allow_current_snapshot,
                 stock_basic_loader=self.gupiao_ziliao,
                 realtime_loader=self.shishi_kuaizhao,
+                daily_basic_loader=self.rizhong_guzhi,
             )
         return copy.deepcopy(self._memo[key])
+
+    def rizhong_guzhi(self, trade_date: str, *, metadata: dict[str, Any] | None = None) -> pd.DataFrame:
+        """同一次分析按交易日复用日终估值，单股和比较池不重复请求同一接口。"""
+        date_text = pd.Timestamp(trade_date).strftime("%Y%m%d")
+        key = f"rizhong_guzhi:{date_text}"
+        if key not in self._memo:
+            try:
+                frame = _tushare_pro().daily_basic(
+                    trade_date=date_text,
+                    fields="ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm,pb,total_mv,circ_mv",
+                )
+                if frame is None or frame.empty:
+                    raise RuntimeError(f"{date_text} 的日终估值为空")
+                self._memo[key] = (frame.copy(), None)
+            except Exception as exc:
+                self._memo[key] = (pd.DataFrame(), str(exc))
+            self._memo[f"{key}:fetched_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+        frame, error = self._memo[key]
+        if metadata is not None:
+            metadata.update(source="tushare_daily_basic", fetched_at=self._memo[f"{key}:fetched_at"])
+        if error is not None:
+            raise RuntimeError(error)
+        return frame.copy()
 
     def shichang_shizhong(self) -> dict[str, Any]:
         if "shichang_shizhong" not in self._memo:
@@ -205,6 +229,7 @@ class FenxiShujuShangxiawen:
                 self.zuixin_wanzheng_jiaoyiri(),
                 realtime_loader=self.shishi_kuaizhao,
                 stock_basic_loader=self.gupiao_ziliao,
+                daily_basic_loader=self.rizhong_guzhi,
             )
         frame, meta = self._memo["zuixin_hengjiemian"]
         return frame.copy(), dict(meta)
@@ -821,6 +846,7 @@ def huoqu_zuixin_hengjiemian(
     *,
     realtime_loader: Any | None = None,
     stock_basic_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
+    daily_basic_loader: Callable[[str], pd.DataFrame] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """读取一个完整交易日的全市场行情、估值和股票资料横截面。"""
     warnings: list[str] = []
@@ -850,9 +876,12 @@ def huoqu_zuixin_hengjiemian(
         basic = basic.copy()
         basic["ts_code"] = basic["ts_code"].map(_normalize_code)
         try:
-            valuation = pro.daily_basic(
-                trade_date=actual_date,
-                fields="ts_code,trade_date,turnover_rate,volume_ratio,pe_ttm,pb,total_mv,circ_mv",
+            valuation = (
+                daily_basic_loader(actual_date) if daily_basic_loader is not None
+                else pro.daily_basic(
+                    trade_date=actual_date,
+                    fields="ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm,pb,total_mv,circ_mv",
+                )
             )
             if valuation is not None and not valuation.empty:
                 valuation = valuation.copy()
@@ -861,7 +890,7 @@ def huoqu_zuixin_hengjiemian(
                     valuation.get("trade_date", pd.Series(pd.NaT, index=valuation.index)), errors="coerce",
                 ).dt.normalize()
                 valuation["valuation_source"] = "tushare_daily_basic"
-                for column in ("turnover_rate", "volume_ratio", "pe_ttm", "pb", "total_mv", "circ_mv"):
+                for column in ("turnover_rate", "volume_ratio", "pe", "pe_ttm", "pb", "total_mv", "circ_mv"):
                     valuation[column] = pd.to_numeric(valuation.get(column), errors="coerce")
                 valuation["total_market_value_yuan"] = valuation["total_mv"] * 10_000.0
                 valuation["circulating_market_value_yuan"] = valuation["circ_mv"] * 10_000.0
@@ -871,6 +900,7 @@ def huoqu_zuixin_hengjiemian(
                     "valuation_source",
                     "turnover_rate",
                     "volume_ratio",
+                    "pe",
                     "pe_ttm",
                     "pb",
                     "total_market_value_yuan",
@@ -909,6 +939,7 @@ def huoqu_zuixin_hengjiemian(
                 "amount_yuan",
                 "turnover_rate",
                 "volume_ratio",
+                "pe",
                 "pe_ttm",
                 "pb",
                 "total_market_value_yuan",

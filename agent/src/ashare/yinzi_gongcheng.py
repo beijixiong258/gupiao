@@ -221,7 +221,7 @@ def factor_definition(feature: str) -> dict[str, Any]:
         "body_pct": ("K线有方向实体幅度", "%", 100, "收盘减开盘再除以前收盘价，保留涨跌方向"),
         "upper_shadow_pct": ("上影线幅度", "%", 100, "最高价超出开收盘较高者的幅度，相对前收盘价"),
         "lower_shadow_pct": ("下影线幅度", "%", 100, "开收盘较低者超出最低价的幅度，相对前收盘价"),
-        "signed_close_pressure": ("收盘位置与日内涨跌压力", "", 1, "收盘位置与日内涨跌方向共同描述的价量代理"),
+        "signed_close_pressure": ("收盘位置与日内涨跌组合", "", 1, "收盘位置与实体的乘积，只使用价格，不代表资金流向；正值并不总是上涨压力"),
         "shadow_imbalance": ("下影与上影差", "%", 100, "下影线幅度减上影线幅度"),
         "volume_ratio_5_20": ("5日与20日均量比", "倍", 1, "近5日平均成交量除以近20日平均成交量"),
         "amount_ratio_5_20": ("5日与20日均额比", "倍", 1, "近5日平均成交额除以近20日平均成交额"),
@@ -230,17 +230,18 @@ def factor_definition(feature: str) -> dict[str, Any]:
         "return_amount_corr_20": ("20日收益与成交额变化相关", "", 1, "相关系数，描述统计关系，不代表因果"),
         "price_turnover_corr_20": ("20日收益与换手变化相关", "", 1, "使用真实历史换手率变化，缺失时不由成交额代替"),
         "wvma_20": ("成交额加权收益波幅", "%", 100, "成交额加权收益均方根，只描述无方向波动"),
-        "volume_price_residual_20": ("20日量价残差", "", 1, "收益与成交额变化关系的偏离观测"),
+        "volume_price_residual_20": ("20日量价残差", "%", 100, "带截距的一元线性拟合残差，仅描述当前收益偏离，不作预测"),
         "overnight_intraday_corr_20": ("20日隔夜与日内收益相关", "", 1, "隔夜跳空与日内收益之间的相关系数"),
         "breakout_distance_20": ("相对前20日高点距离", "%", 100, "当前收盘价相对此前窗口高点的位置"),
-        "breakout_volume_confirmation": ("突破距离与量能确认", "", 1, "历史高点距离与量能变化的组合观测"),
+        "breakout_volume_confirmation": ("突破距离与成交额组合", "", 1, "历史高点距离与均额比的乘积，不是独立突破确认"),
         "pullback_quality_20": ("20日回撤量价特征", "", 1, "回撤位置与量能组合，仅作为形态证据"),
         "stalling_pressure_20": ("放量滞涨压力", "", 1, "成交额变化与有限价格推进的组合观测"),
-        "low_volume_long_lower_shadow": ("低量长下影特征", "", 1, "低成交量与下影线形态共同出现的程度"),
+        "low_volume_long_lower_shadow": ("区间位置、下影线与均额比组合", "", 1, "低位与下影线幅度除以1加均额比，实际使用成交额，不是成交量"),
         "atr_14_pct": ("14日平均真实波幅占价格", "%", 100, "ATR除以收盘价，包含跳空影响"),
         "volatility_20": ("20日年化波动率", "%", 100, "日收益标准差乘以根号252"),
         "amplitude_1": ("当日振幅", "%", 100, "日内最高最低价差相对前收盘价"),
         "drawdown_20": ("距20日高点的当前回撤", "%", 100, "当前价相对20日最高价的变化，不是窗口最大回撤"),
+        "position_20": ("收盘在20日高低区间的位置", "%", 100, "只在完整20日区间有效时计算；完整窗口全平时约定50%，不代表存在支撑"),
         "peer_dispersion_ret_5": ("比较池5日收益离散度", "%", 100, "本次比较池股票5日收益的标准差"),
         "log_amount_yuan": ("成交额对数", "", 1, "ln(1+成交额元)，用于跨股票比较尺度"),
         "turnover_rate_daily": ("当日换手率", "%", 100, "已归一为小数的真实换手率"),
@@ -256,7 +257,7 @@ def factor_definition(feature: str) -> dict[str, Any]:
     elif feature.startswith("ma_gap_"):
         period = feature.removeprefix("ma_gap_")
         label, unit, scale, meaning = f"价格相对MA{period}偏离", "%", 100, f"收盘价相对{period}日均线的距离"
-    elif feature.startswith("ret_"):
+    elif feature.startswith("ret_") and feature.removeprefix("ret_").isdigit():
         period = feature.removeprefix("ret_")
         label, unit, scale, meaning = f"近{period}日收益", "%", 100, f"最新收盘价相对{period}个交易日前的变化"
     elif feature.startswith("rank_"):
@@ -282,7 +283,71 @@ def factor_definition(feature: str) -> dict[str, Any]:
             label, unit, scale, meaning = basis + condition + "比例", "%", 100, "满足条件的有效股票比例，仅代表当前样本"
         else:
             label, unit, scale, meaning = feature, "", 1, "程序已计算的原始观测"
-    return {"label": label, "unit": unit, "display_scale": scale, "meaning": meaning}
+    return {"label": label, "unit": unit, "display_scale": scale, "meaning": meaning,
+            **_calculation_definition(feature, meaning)}
+
+
+def _calculation_definition(feature: str, meaning: str) -> dict[str, Any]:
+    """与注册表共用的计算契约；不在报告层维护第二份指标说明。"""
+    fixed = {
+        "ma_trend_5_20": ("MA5/MA20-1", "5和20条日线", "20条连续有效收盘价"),
+        "ma_5_20_gap_change": ("diff(close/MA5-close/MA20)", "连续两日的5和20日均线", "21条连续有效收盘价"),
+        "trend_slope_20": ("ln(close/close[-20])/20", "20个收益间隔", "21条连续有效收盘价"),
+        "trend_fit_quality_20": ("abs(ln(close/close[-20]))/(std(ret1,ddof=1)*sqrt(20))", "20个收益间隔", "21条连续收盘价且收益标准差大于零"),
+        "rsi_14": ("100-100/(1+EWM(涨幅)/EWM(跌幅)); alpha=1/14, adjust=False, 首个有效差分作种子", "14期递推，沿用全部连续有效历史", "14个连续差分；全平=50、仅涨=100、仅跌=0；缺失后重新预热"),
+        "macd_dif_pct": ("(EMA12-EMA26)/close; alpha=2/(N+1), adjust=False, 首价作种子", "12和26期递推", "26条连续有效收盘价；缺失后重新预热"),
+        "macd_hist_pct": ("2*(DIF-DEA)/close; DIF=EMA12-EMA26; DEA=EMA9(DIF); adjust=False", "12/26/9期递推，沿用全部连续有效历史", "34条连续有效收盘价；价格与DIF分别以首个有效值作种子；缺失后重新预热"),
+        "gap_open": ("open/previous_close-1", "当日和前一日", "有效开盘价及正前收盘价"),
+        "intraday_return": ("close/open-1", "当日", "有效开收盘价"),
+        "close_location": ("(close-low)/(high-low)", "当日", "高低收盘完整且high>low，平价日留空"),
+        "body_pct": ("(close-open)/previous_close", "当日和前一日", "有效开收盘及正前收盘价"),
+        "upper_shadow_pct": ("(high-max(open,close))/previous_close", "当日和前一日", "完整且范围一致的开高低收盘价及正前收盘价"),
+        "lower_shadow_pct": ("(min(open,close)-low)/previous_close", "当日和前一日", "完整且范围一致的开高低收盘价及正前收盘价"),
+        "signed_close_pressure": ("(close_location-0.5)*body_pct", "当日和前一日", "位置及实体均有效，缺失不填0或0.5"),
+        "shadow_imbalance": ("lower_shadow_pct-upper_shadow_pct", "当日和前一日", "上下影线均有效"),
+        "volume_ratio_5_20": ("mean(volume,5)/mean(volume,20)", "5和20条日线", "20条非负成交量且20日均量大于零"),
+        "amount_ratio_5_20": ("mean(amount_yuan,5)/mean(amount_yuan,20)", "5和20条日线", "20条真实非负成交额且20日均额大于零"),
+        "amount_anomaly_20": ("(ln(1+amount)-mean(ln(1+amount)))/std(ln(1+amount),ddof=1)", "最近20条日线", "至少10条真实非负成交额，标准差大于零"),
+        "signed_amount_shock": ("sign(ret1)*amount_anomaly_20", "最近20条日线", "当日收益和成交额异常程度均有效"),
+        "return_amount_corr_20": ("corr(ret1,diff(ln(1+amount_yuan)))", "最近20条日线", "至少10对有效收益与真实成交额对数变化，两者方差均大于零"),
+        "price_turnover_corr_20": ("corr(ret1,diff(turnover_rate/100))", "最近20条日线", "至少10对真实换手率变化与收益，两者方差均大于零"),
+        "wvma_20": ("sqrt(sum(ret1^2*w)/sum(w)); w=clip(amount/median(amount,20),0.25,4)", "权重基准和波幅各滚动20条日线", "基准至少10条真实成交额；波幅至少10对收益与权重，分子分母使用相同配对"),
+        "volume_price_residual_20": ("y-(intercept+beta*x); y=ret1; x=diff(ln(1+amount)); beta=cov(x,y)/var(x); intercept=mean(y)-beta*mean(x)", "最近20条日线", "至少10对有效x/y，均值、协方差、方差使用相同样本；x方差大于零"),
+        "overnight_intraday_corr_20": ("corr(gap_open,intraday_return)", "最近20条日线", "至少10对有效跳空与日内收益，两者方差均大于零"),
+        "breakout_distance_20": ("close/max(high[-20:-1])-1（此前20条，不含当日）", "前20条日线", "前20条高低收盘完整且范围一致，及当日有效收盘价"),
+        "breakout_volume_confirmation": ("max(breakout_distance_20,0)*(amount_ratio_5_20-1)", "此前20日高点和当前5/20日均额", "突破距离和均额比均有效"),
+        "pullback_quality_20": ("max(-ret5,0)*max(1-amount_ratio_5_20,0)*max(ma_trend_5_20,0)", "5和20条日线", "收益、均额比及均线比均有效"),
+        "stalling_pressure_20": ("position_20*max(amount_anomaly_20,0)*(1-close_location)", "20日区间与当日日内区间", "区间位置、真实成交额异常及收盘位置均有效"),
+        "low_volume_long_lower_shadow": ("(1-position_20)*max(lower_shadow_pct,0)/(1+amount_ratio_5_20)", "20日区间和5/20日均额", "区间位置、下影线及均额比均有效"),
+        "atr_14_pct": ("ATR14/close; TR=max(high-low,abs(high-prev_close),abs(low-prev_close)); EWM alpha=1/14, adjust=False", "14期递推，沿用连续有效历史", "14条完整高低收盘价；每段首日TR=high-low作种子；缺失后重新预热"),
+        "volatility_20": ("std(ret1,ddof=1)*sqrt(252)", "20个收益间隔", "21条连续有效收盘价；252为约定年化交易日数"),
+        "amplitude_1": ("(high-low)/previous_close", "当日和前一日", "有效高低价和正前收盘价"),
+        "drawdown_20": ("close/max(high,20)-1", "含当日最近20条日线", "20条完整高低收盘价；不是最大回撤"),
+        "position_20": ("(close-min(low,20))/(max(high,20)-min(low,20))", "含当日最近20条日线", "20条完整高低收盘价；仅完整全平区间约定0.5"),
+        "log_amount_yuan": ("ln(1+amount_yuan)", "当日", "真实非负成交额，负值或缺失留空"),
+        "turnover_rate_daily": ("turnover_rate/100", "当日", "真实日线换手率或已核验同日日终补充值；禁止实时快照回填"),
+        "log_circ_mv": ("ln(circulating_market_value_yuan)", "当日", "真实日线或已核验同日日终的正流通市值"),
+    }
+    if feature in fixed:
+        formula, window, minimum = fixed[feature]
+    elif feature.startswith("ret_") and feature.removeprefix("ret_").isdigit():
+        period = int(feature.rsplit("_", 1)[1])
+        formula, window, minimum = f"close/close[-{period}]-1", f"{period}个收益间隔", f"{period + 1}条连续有效收盘价"
+    elif feature.startswith("ma_gap_") and feature.removeprefix("ma_gap_").isdigit():
+        period = int(feature.rsplit("_", 1)[1])
+        formula, window, minimum = f"close/mean(close,{period})-1", f"{period}条日线", f"{period}条连续有效收盘价"
+    elif feature.startswith("rank_"):
+        formula, window, minimum = "同日有效值升序平均秩/有效样本数", "同一交易日的实际比较池", "沿用原指标有效样本，不能当成独立确认；样本数见比较池覆盖"
+    elif feature.startswith("excess_"):
+        formula, window, minimum = "本股收益-对应参照收益", feature.rsplit("_", 1)[-1] + "个收益间隔", "本股与参照同日同窗口均有效；参照缺失不以零替代"
+    elif "mean_ret_" in feature or "dispersion_ret_" in feature or "breadth_" in feature:
+        formula = "同日有效值等权均值" if "mean_ret_" in feature else "同日有效值样本标准差(ddof=1)" if "dispersion_ret_" in feature else "满足条件的有效股票数/该字段有效股票数"
+        window, minimum = "同一交易日；收益或均线窗口见指标名称", "比较池或子池至少2个有效观测；真实行业分组至少5个，字段缺失不计分母"
+    else:
+        formula, window, minimum = meaning, "指标注明的当前日线窗口", "全部对应输入有效；来源和样本范围见本次报告"
+    return {"formula": formula, "window": window, "minimum_observations": minimum,
+            "missing_rule": "输入缺失、非有限数、分母为零或样本不足时留空；不插值、不用零填缺失",
+            "source_basis": "本次核验日线及同日参照数据；具体来源和截止日见报告来源与数据质量"}
 
 
 def _registry_rows() -> list[dict[str, Any]]:
@@ -345,7 +410,24 @@ def factor_registry_rows() -> list[dict[str, Any]]:
 def _numeric(data: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
     if column not in data.columns:
         return pd.Series(default, index=data.index, dtype=float)
-    return pd.to_numeric(data[column], errors="coerce")
+    return pd.to_numeric(data[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def continuous_ewm(values: pd.Series, *, alpha: float, min_periods: int) -> pd.Series:
+    """按连续有效段递推；首个有效值作种子，缺失后重新累计预热窗口。"""
+    values = values.replace([np.inf, -np.inf], np.nan)
+    return values.groupby(values.isna().cumsum()).transform(
+        lambda segment: segment.ewm(alpha=alpha, adjust=False, min_periods=min_periods).mean()
+    ).where(values.notna())
+
+
+def daily_atr(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """共用 ATR14；每段首日 TR=高低价差，之后包含前收盘跳空。"""
+    valid = high.ge(low) & low.gt(0) & close.between(low, high)
+    valid &= np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
+    previous = close.where(valid).shift(1)
+    true_range = pd.concat([high - low, (high - previous).abs(), (low - previous).abs()], axis=1).max(axis=1).where(valid)
+    return continuous_ewm(true_range, alpha=1 / 14, min_periods=14)
 
 
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -372,38 +454,30 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
     if "trade_date" in data.columns:
         data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
     data = data.sort_values([column for column in ["ts_code", "trade_date"] if column in data.columns]).copy()
-    close = _numeric(data, "close")
-    open_price = _numeric(data, "open")
-    high = _numeric(data, "high")
-    low = _numeric(data, "low")
-    volume = _numeric(data, "volume")
-    amount = _numeric(data, "amount_yuan")
-    # Some providers omit amount.  Volume*close is a transparent proxy, not a
-    # fabricated valuation field, and is marked by the same daily availability.
-    amount = amount.where(amount.notna(), (volume * close).where(volume.notna() & close.notna()))
-
     # These fields expose the measured trend structure for technical diagnosis,
     # so calculate them even when an older caller did not request the new set.
     groups = list(_group_indices(data))
     for indices in groups:
         local = data.loc[indices].sort_values("trade_date")
-        c = _numeric(local, "close")
-        o = _numeric(local, "open")
-        h = _numeric(local, "high")
-        l = _numeric(local, "low")
-        v = _numeric(local, "volume")
-        a = _numeric(local, "amount_yuan")
-        a = a.where(a.notna(), (v * c).where(v.notna() & c.notna()))
+        c = _numeric(local, "close").where(lambda values: values > 0)
+        o = _numeric(local, "open").where(lambda values: values > 0)
+        h = _numeric(local, "high").where(lambda values: values > 0)
+        l = _numeric(local, "low").where(lambda values: values > 0)
+        valid_range = h.ge(l) & c.between(l, h)
+        h, l = h.where(valid_range), l.where(valid_range)
+        o = o.where(o.between(l, h))
+        # 只使用真实成交额；缺失和负数均不可由收盘价×成交量替代。
+        a = _numeric(local, "amount_yuan").where(lambda values: values >= 0)
         prev = c.shift(1)
         ret1 = c.pct_change(fill_method=None)
         gap = _safe_div(o, prev) - 1.0
         intraday = _safe_div(c, o) - 1.0
         daily_range = (h - l).replace(0, np.nan)
-        location = _safe_div(c - l, daily_range).clip(0.0, 1.0)
+        location = _safe_div(c - l, daily_range)
         body = _safe_div(c - o, prev)
-        upper = _safe_div(h - pd.concat([o, c], axis=1).max(axis=1), prev)
-        lower = _safe_div(pd.concat([o, c], axis=1).min(axis=1) - l, prev)
-        amount_log = np.log1p(a.clip(lower=0))
+        upper = _safe_div(h - pd.concat([o, c], axis=1).max(axis=1, skipna=False), prev)
+        lower = _safe_div(pd.concat([o, c], axis=1).min(axis=1, skipna=False) - l, prev)
+        amount_log = np.log1p(a)
         amount_change = amount_log.diff()
         mean5 = a.rolling(5, min_periods=5).mean()
         mean20 = a.rolling(20, min_periods=20).mean()
@@ -418,24 +492,30 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         turnover = turnover.where(turnover.ge(0.0))
         price_turnover_corr = ret1.rolling(20, min_periods=10).corr(turnover.diff())
         weight = _safe_div(a, a.rolling(20, min_periods=10).median()).clip(lower=0.25, upper=4.0)
-        wvma = np.sqrt(_safe_div((ret1.pow(2) * weight).rolling(20, min_periods=10).sum(), weight.rolling(20, min_periods=10).sum()))
-        cov = ret1.rolling(20, min_periods=10).cov(amount_change)
-        var = amount_change.rolling(20, min_periods=10).var().replace(0, np.nan)
+        paired_weight = weight.where(ret1.notna())
+        wvma = np.sqrt(_safe_div((ret1.pow(2) * paired_weight).rolling(20, min_periods=10).sum(), paired_weight.rolling(20, min_periods=10).sum()))
+        paired = ret1.notna() & amount_change.notna()
+        paired_return, paired_change = ret1.where(paired), amount_change.where(paired)
+        cov = paired_return.rolling(20, min_periods=10).cov(paired_change)
+        var = paired_change.rolling(20, min_periods=10).var().replace(0, np.nan)
         beta = _safe_div(cov, var)
-        residual = ret1 - beta * amount_change
+        intercept = paired_return.rolling(20, min_periods=10).mean() - beta * paired_change.rolling(20, min_periods=10).mean()
+        residual = ret1 - (intercept + beta * amount_change)
         overnight_corr = gap.rolling(20, min_periods=10).corr(intraday)
         log_close = np.log(c.where(c > 0))
-        slope = log_close.diff(20) / 20.0
-        volatility = ret1.rolling(20, min_periods=10).std()
-        fit_quality = _safe_div(log_close.diff(20).abs(), volatility * math.sqrt(20.0))
-        prior_high = h.rolling(20, min_periods=10).max().shift(1)
+        log_change = log_close.diff(20).where(c.rolling(21, min_periods=21).count().eq(21))
+        slope = log_change / 20.0
+        volatility = ret1.rolling(20, min_periods=20).std()
+        fit_quality = _safe_div(log_change.abs(), volatility * math.sqrt(20.0))
+        prior_high = h.rolling(20, min_periods=20).max().shift(1)
         breakout = _safe_div(c, prior_high) - 1.0
         breakout_confirmation = breakout.clip(lower=0.0) * (ratio - 1.0)
         ma_gap20 = _numeric(local, "ma_gap_20")
-        position20 = _numeric(local, "position_20", 0.5).fillna(0.5)
+        position20 = _numeric(local, "position_20")
         ma_trend = _numeric(local, "ma_trend_5_20")
-        pullback = (-c.pct_change(5, fill_method=None)).clip(lower=0.0) * (1.0 - ratio).clip(lower=0.0) * ma_trend.clip(lower=0.0)
-        stalling = position20.clip(lower=0.0, upper=1.0) * anomaly.clip(lower=0.0) * (1.0 - location.fillna(0.5))
+        ret5 = c.pct_change(5, fill_method=None).where(c.rolling(6, min_periods=6).count().eq(6))
+        pullback = (-ret5).clip(lower=0.0) * (1.0 - ratio).clip(lower=0.0) * ma_trend.clip(lower=0.0)
+        stalling = position20 * anomaly.clip(lower=0.0) * (1.0 - location)
         ma_gap_change = (_numeric(local, "ma_gap_5") - ma_gap20).diff()
         low_volume_shadow = (1.0 - position20).clip(lower=0.0, upper=1.0) * lower.clip(lower=0.0) / (1.0 + ratio.clip(lower=0.0))
         values = {
@@ -445,11 +525,11 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
             "body_pct": body,
             "upper_shadow_pct": upper,
             "lower_shadow_pct": lower,
-            "signed_close_pressure": location.fillna(0.5).sub(0.5) * body.abs().fillna(0.0) * np.sign(body.fillna(0.0)),
+            "signed_close_pressure": location.sub(0.5) * body,
             "shadow_imbalance": lower - upper,
             "amount_ratio_5_20": ratio,
             "amount_anomaly_20": anomaly,
-            "signed_amount_shock": np.sign(ret1.fillna(0.0)) * anomaly,
+            "signed_amount_shock": np.sign(ret1) * anomaly,
             "return_amount_corr_20": ret_amount_corr,
             "price_turnover_corr_20": price_turnover_corr,
             "wvma_20": wvma,
@@ -468,6 +548,16 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         }
         for column, series in values.items():
             data.loc[local.index, column] = pd.to_numeric(series, errors="coerce").to_numpy()
+        paired_samples = {
+            "amount_anomaly_20": a,
+            "return_amount_corr_20": ret1.where(amount_change.notna()),
+            "price_turnover_corr_20": ret1.where(turnover.diff().notna()),
+            "wvma_20": paired_weight,
+            "volume_price_residual_20": paired_return,
+            "overnight_intraday_corr_20": gap.where(intraday.notna()),
+        }
+        for column, samples in paired_samples.items():
+            data.loc[local.index, f"{column}_sample_count"] = samples.rolling(20, min_periods=1).count().to_numpy()
     return data.replace([np.inf, -np.inf], np.nan)
 
 

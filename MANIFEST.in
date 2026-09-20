@@ -1,0 +1,14 @@
+include agent/cli.py agent/mcp_server.py agent/.env.example
+include agent/src/lianghua_peizhi.json agent/src/providers/llm_providers.json
+recursive-include agent/src *.py
+prune agent/tests
+prune agent/runs
+prune venv
+prune .venv
+prune .agents
+prune .task-architecture-size
+prune build
+prune dist
+exclude .env agent/.env lianghua_peizhi.json
+global-exclude *.py[cod]
+recursive-exclude agent/src test_*.py conftest.py

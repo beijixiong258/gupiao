@@ -43,8 +43,12 @@ class ClarifyTool(BaseTool):
     repeatable = True
     is_readonly = False
 
-    def __init__(self, handler: ClarificationHandler) -> None:
+    def __init__(self, handler: ClarificationHandler | None = None) -> None:
         self._handler = handler
+
+    @property
+    def has_interactive_handler(self) -> bool:
+        return self._handler is not None
 
     def execute(self, **kwargs: Any) -> str:
         raw_choices = kwargs.get("choices")
@@ -75,6 +79,13 @@ class ClarifyTool(BaseTool):
         except ValueError as exc:
             return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
 
+        if self._handler is None:
+            return json.dumps({
+                "status": "clarification_required", "outcome": "clarification_required",
+                "stage": "request_validation", "error": request.question,
+                "clarification": request.to_dict(),
+                "recommendation_available": False, "primary": None, "alternatives": [],
+            }, ensure_ascii=False)
         answer = self._handler(request)
         return json.dumps(
             {

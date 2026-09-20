@@ -22,8 +22,10 @@ from src.ashare.shichang_shuju import akshare_zhilian
 from src.ashare.yinzi_gongcheng import (
     RAW_PRICE_VOLUME_FEATURE_COLUMNS as ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS,
     add_price_volume_factors,
+    continuous_ewm,
+    daily_atr,
+    factor_definition,
 )
-from src.providers.llm import _ensure_dotenv
 
 FEATURE_COLUMNS = [
     "ret_1",
@@ -397,29 +399,30 @@ def huoqu_rili_xingqing(
 
 
 def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
-    """Calculate leak-free daily technical features used by analysis and ML."""
+    """计算确定性日线指标，缺失不填充，不跨缺失行拼接窗口。"""
     if history is None or history.empty:
         raise ValueError("日线行情为空")
     if "trade_date" not in history.columns:
         raise ValueError("日线行情缺少 trade_date")
     data = history.copy()
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
-    data = (
-        data.dropna(subset=["trade_date"])
-        .sort_values("trade_date")
-        .drop_duplicates("trade_date", keep="last")
-        .reset_index(drop=True)
-    )
+    if data["trade_date"].isna().any() or data["trade_date"].duplicated().any():
+        raise ValueError("日线存在无效或重复交易日期，不能跳过或任选记录计算指标")
+    data = data.sort_values("trade_date").reset_index(drop=True)
     if data.empty:
         raise ValueError("日线行情没有有效交易日期")
-    close = pd.to_numeric(data["close"], errors="coerce")
-    high = pd.to_numeric(data["high"], errors="coerce")
-    low = pd.to_numeric(data["low"], errors="coerce")
-    volume = pd.to_numeric(data["volume"], errors="coerce")
+    for column in ("open", "close", "high", "low", "volume", "amount_yuan"):
+        values = pd.to_numeric(data.get(column, pd.Series(np.nan, index=data.index)), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        data[column] = values.where(values.ge(0) if column in {"volume", "amount_yuan"} else values.gt(0))
+    close, high, low, volume = (data[column] for column in ("close", "high", "low", "volume"))
+    valid_range = high.ge(low) & close.between(low, high)
+    high, low = high.where(valid_range), low.where(valid_range)
     previous_close = close.shift(1)
 
     for period in [1, 3, 5, 10, 20]:
-        data[f"ret_{period}"] = close.pct_change(period, fill_method=None)
+        data[f"ret_{period}"] = close.pct_change(period, fill_method=None).where(
+            close.rolling(period + 1, min_periods=period + 1).count().eq(period + 1)
+        )
     for period in [5, 10, 20, 60]:
         average = close.rolling(period, min_periods=period).mean()
         data[f"ma_{period}"] = average
@@ -427,8 +430,8 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     data["ma_trend_5_20"] = data["ma_5"] / data["ma_20"] - 1.0
 
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    gain = continuous_ewm(delta.clip(lower=0), alpha=1 / 14, min_periods=14)
+    loss = continuous_ewm(-delta.clip(upper=0), alpha=1 / 14, min_periods=14)
     relative_strength = gain / loss.replace(0, np.nan)
     rsi = 100.0 - 100.0 / (1.0 + relative_strength)
     both_flat = gain.eq(0) & loss.eq(0)
@@ -436,10 +439,10 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     only_losses = gain.eq(0) & loss.gt(0)
     data["rsi_14"] = rsi.mask(both_flat, 50.0).mask(only_gains, 100.0).mask(only_losses, 0.0)
 
-    ema_12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
-    ema_26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    ema_12 = continuous_ewm(close, alpha=2 / 13, min_periods=12)
+    ema_26 = continuous_ewm(close, alpha=2 / 27, min_periods=26)
     dif = ema_12 - ema_26
-    dea = dif.ewm(span=9, adjust=False, min_periods=9).mean()
+    dea = continuous_ewm(dif, alpha=2 / 10, min_periods=9)
     histogram = 2.0 * (dif - dea)
     data["macd_dif"] = dif
     data["macd_dea"] = dea
@@ -457,11 +460,7 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1, skipna=False)
 
-    true_range = pd.concat(
-        [(high - low).abs(), (high - previous_close).abs(), (low - previous_close).abs()],
-        axis=1,
-    ).max(axis=1)
-    data["atr_14"] = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    data["atr_14"] = daily_atr(high, low, close)
     data["atr_14_pct"] = data["atr_14"] / close
     daily_return = close.pct_change(fill_method=None)
     data["volatility_20"] = daily_return.rolling(20, min_periods=20).std() * math.sqrt(252)
@@ -469,8 +468,10 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     rolling_high = high.rolling(20, min_periods=20).max()
     rolling_low = low.rolling(20, min_periods=20).min()
     data["drawdown_20"] = close / rolling_high - 1.0
-    spread = (rolling_high - rolling_low).replace(0, np.nan)
-    data["position_20"] = ((close - rolling_low) / spread).fillna(0.5)
+    spread = rolling_high - rolling_low
+    data["position_20"] = ((close - rolling_low) / spread.where(spread > 0)).mask(
+        spread.eq(0) & close.eq(rolling_low), 0.5
+    )
     data["support_20"] = rolling_low
     data["resistance_20"] = rolling_high
 
@@ -483,14 +484,14 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     return data.replace([np.inf, -np.inf], np.nan)
 
 
-def _round_optional(value: Any, digits: int = 6) -> float | None:
+def _round_optional(value: Any, digits: int | None = 6) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
     if not math.isfinite(number):
         return None
-    return round(number, digits)
+    return round(number, digits) if digits is not None else number
 
 
 def _json_value(value: Any) -> Any:
@@ -513,9 +514,9 @@ def _json_value(value: Any) -> Any:
 def _technical_evidence(latest: pd.Series) -> list[str]:
 
     reasons: list[str] = []
-    close = _round_optional(latest.get("close"))
-    ma_5 = _round_optional(latest.get("ma_5"))
-    ma_20 = _round_optional(latest.get("ma_20"))
+    close = _round_optional(latest.get("close"), None)
+    ma_5 = _round_optional(latest.get("ma_5"), None)
+    ma_20 = _round_optional(latest.get("ma_20"), None)
     if close is not None and ma_20 is not None:
         if ma_5 is not None and close > ma_5 > ma_20:
 
@@ -527,7 +528,7 @@ def _technical_evidence(latest: pd.Series) -> list[str]:
 
             reasons.append("价格未站上 MA20")
 
-    ret_5 = _round_optional(latest.get("ret_5"))
+    ret_5 = _round_optional(latest.get("ret_5"), None)
     if ret_5 is not None:
         reasons.append(f"近5个交易日收益 {ret_5:.2%}，需结合波动尺度与成交量理解")
 
@@ -535,7 +536,7 @@ def _technical_evidence(latest: pd.Series) -> list[str]:
     if rsi is not None:
         reasons.append(f"14日RSI为 {rsi:.2f}，仅描述近期涨跌强弱，不能单独确认反转或买卖时点")
 
-    macd_hist = _round_optional(latest.get("macd_hist"))
+    macd_hist = _round_optional(latest.get("macd_hist"), None)
     if macd_hist is not None:
         if macd_hist > 0:
 
@@ -545,7 +546,7 @@ def _technical_evidence(latest: pd.Series) -> list[str]:
             reasons.append("MACD 柱为负（不代表刚发生死叉）")
         else:
             reasons.append("MACD 柱接近零")
-    volatility = _round_optional(latest.get("volatility_20"))
+    volatility = _round_optional(latest.get("volatility_20"), None)
     if volatility is not None and volatility > 0.55:
 
         reasons.append("20 日年化波动率偏高")
@@ -565,9 +566,9 @@ def zongjie_jishu(
     missing = [key for key in ("ma_5", "ma_10", "ma_20", "ma_60", "rsi_14", "macd_hist", "atr_14_pct", "volatility_20") if _round_optional(latest.get(key)) is None]
     indicator_warnings: list[str] = []
     if _round_optional(latest.get("ma_60")) is None:
-        indicator_warnings.append("历史不足 60 个交易日，MA60 暂不可用")
+        indicator_warnings.append("最近60条有效收盘价不足或有缺失，MA60 暂不可用")
     if _round_optional(latest.get("macd_hist")) is None:
-        indicator_warnings.append("历史不足以形成完整 MACD，MACD 暂不可用")
+        indicator_warnings.append("连续有效收盘价不足以形成完整 MACD，MACD 暂不可用")
     macd_structure = yanpan_macd_jiegou(features, macd_structure_config)
     if macd_structure.get("status") != "ok":
         reason = str(macd_structure.get("reason") or "MACD 结构研判暂不可用")
@@ -583,6 +584,14 @@ def zongjie_jishu(
         "status": summary_status,
         "outcome": summary_outcome,
         "trade_date": _json_value(latest["trade_date"]),
+        "raw_indicators": {key: float(latest[key]) if pd.notna(latest[key]) else None for key in (
+            "close", "ma_5", "ma_10", "ma_20", "ma_60", "ma_gap_20", "ma_trend_5_20", "ret_1", "ret_3", "ret_5", "ret_10", "ret_20",
+            "macd_hist", "macd_hist_pct", "volume_ratio_5_20", "volatility_20",
+        )},
+        "indicator_definitions": {key: factor_definition(key) for key in (
+            "rsi_14", "macd_hist_pct", "atr_14_pct", "volatility_20", "position_20", "drawdown_20",
+        )},
+        "calculation_basis": "同一份已核验完整日线；raw_indicators 保留计算精度，显示舍入不参与筛选",
         "close": _round_optional(latest["close"], 3),
         "returns": {f"{period}d": _round_optional(latest[f"ret_{period}"], 6) for period in [1, 3, 5, 10, 20]},
         "moving_averages": {f"ma{period}": _round_optional(latest[f"ma_{period}"], 3) for period in [5, 10, 20, 60]},
@@ -730,6 +739,7 @@ def huoqu_jibenmian(
     allow_current_snapshot: bool = False,
     stock_basic_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
     realtime_loader: Callable[[], tuple[pd.DataFrame, dict[str, Any]]] | None = None,
+    daily_basic_loader: Callable[[str], pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     """Fetch profile, valuation, and financial indicators with explicit provenance."""
     as_of_date = pd.to_datetime(trade_date, errors="coerce")
@@ -763,14 +773,19 @@ def huoqu_jibenmian(
         errors.append(f"Tushare 基本资料失败：{exc}")
 
     try:
-        pro = _tushare_pro()
-        basic_daily = pro.daily_basic(
-            ts_code=code,
-            trade_date=trade_date.replace("-", ""),
-            fields="ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm,pb,total_mv,circ_mv",
-        )
+        if daily_basic_loader is None:
+            basic_daily = _tushare_pro().daily_basic(
+                ts_code=code,
+                trade_date=trade_date.replace("-", ""),
+                fields="ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm,pb,total_mv,circ_mv",
+            )
+        else:
+            basic_daily = daily_basic_loader(as_of_text)
         if basic_daily is not None and not basic_daily.empty:
             dated = basic_daily.copy()
+            if "ts_code" not in dated:
+                raise ValueError("日终估值缺少证券代码，无法核验目标身份")
+            dated = dated[dated["ts_code"].astype(str).eq(code)]
             trade_dates = (
                 dated["trade_date"]
                 if "trade_date" in dated.columns
@@ -785,6 +800,9 @@ def huoqu_jibenmian(
                 if valuation_date == as_of_text:
                     valuation = {
                         "as_of": valuation_date,
+                        "valuation_trade_date": valuation_date,
+                        "valuation_source": "tushare_daily_basic",
+                        "valuation_is_complete_daily": True,
                         "pe": _round_optional(row.get("pe")),
                         "pe_definition": "来源定义为总市值/净利润，保留原始口径，不改称动态或滚动市盈率",
                         "pe_ttm": _round_optional(row.get("pe_ttm")),

@@ -106,7 +106,7 @@ def shishi_ying_guolv(
         )
     except ValueError:
         reason = "股票代码不满足程序已有的 A 股市场规则"
-    return [f"当前行情为{reason}"] if reason else []
+    return [f"已核验行情为{reason}"] if reason else []
 
 
 def jichu_ying_guolv(
@@ -293,6 +293,21 @@ def pinggu_shangzhang_tiaojian(
 ) -> dict[str, Any]:
     """逐项核验已有上涨信号；缺失不是通过，不折算命中分或概率。"""
     conditions: list[dict[str, Any]] = []
+    technical = item.get("technical") or {}
+    raw = technical.get("raw_indicators") or {}
+    conflicts: list[str] = []
+
+    def observed(group: str, feature: str) -> float | None:
+        value = _factor_value(item, group, feature)
+        if not deep_reviewed or feature == "excess_vs_csi300_ret_20":
+            return value
+        reviewed = zhuan_you_xian_shuzhi(raw.get(feature))
+        if value is None or reviewed is None:
+            conflicts.append(f"{feature} 缺少初筛或复核原始值")
+            return None
+        if not math.isclose(value, reviewed, rel_tol=1e-10, abs_tol=1e-12):
+            conflicts.append(f"{feature} 初筛值 {value:g} 与复核值 {reviewed:g} 不一致")
+        return reviewed
 
     def add(key: str, label: str, values: dict[str, Any], passed: bool, rule: str) -> None:
         missing = [field for field, value in values.items() if value is None]
@@ -300,24 +315,24 @@ def pinggu_shangzhang_tiaojian(
         conditions.append({"key": key, "label": label, "status": status, "values": values,
                            "reason": "缺少必需字段：" + "、".join(missing) if missing else rule})
 
-    ma_gap = _factor_value(item, "trend_structure", "ma_gap_20")
-    ma_trend = _factor_value(item, "trend_structure", "ma_trend_5_20")
+    ma_gap = observed("trend_structure", "ma_gap_20")
+    ma_trend = observed("trend_structure", "ma_trend_5_20")
     add("trend_alignment", "收盘价与短期均线位于20日均线上方", {"ma_gap_20": ma_gap, "ma_trend_5_20": ma_trend},
         ma_gap is not None and ma_trend is not None and ma_gap > 0 and ma_trend > 0,
         "要求收盘价高于20日均线，且5日均线高于20日均线")
-    ret5 = _factor_value(item, "momentum_reversal", "ret_5")
-    ret20 = _factor_value(item, "momentum_reversal", "ret_20")
-    macd_hist = _factor_value(item, "momentum_reversal", "macd_hist_pct")
+    ret5 = observed("momentum_reversal", "ret_5")
+    ret20 = observed("momentum_reversal", "ret_20")
+    macd_hist = observed("momentum_reversal", "macd_hist_pct")
     add("positive_momentum", "5日、20日收益及MACD柱同时为正", {"ret_5": ret5, "ret_20": ret20, "macd_hist_pct": macd_hist},
         all(value is not None and value > 0 for value in (ret5, ret20, macd_hist)),
         "要求5日收益、20日收益和MACD柱均大于0")
     excess = _factor_value(item, "relative_strength", "excess_vs_csi300_ret_20")
     add("outperform_csi300", "20日表现强于沪深300", {"excess_vs_csi300_ret_20": excess},
         excess is not None and excess > 0, "要求20日相对沪深300超额收益大于0")
-    volume_ratio = _factor_value(item, "price_volume_confirmation", "volume_ratio_5_20")
+    volume_ratio = observed("price_volume_confirmation", "volume_ratio_5_20")
     add("volume_confirmation", "5日均量不低于20日均量", {"volume_ratio_5_20": volume_ratio},
         volume_ratio is not None and volume_ratio >= 1, "要求5日/20日均量比不低于1倍")
-    volatility = _factor_value(item, "risk_liquidity", "volatility_20")
+    volatility = observed("risk_liquidity", "volatility_20")
     if volatility is not None and volatility < 0:
         volatility = None
     threshold = zhuan_you_xian_shuzhi((config.get("fenxi") or {}).get("high_volatility_threshold", 0.55))
@@ -327,13 +342,27 @@ def pinggu_shangzhang_tiaojian(
 
     technical_status, technical_outcome, technical_reason = _technical_state(item)
     if deep_reviewed:
-        reviewed_histogram = zhuan_you_xian_shuzhi(((item.get("technical") or {}).get("macd") or {}).get("histogram"))
-        technical_available = technical_status in {"ok", "partial"} and technical_outcome != "program_error" and reviewed_histogram is not None
+        reviewed_histogram = zhuan_you_xian_shuzhi((technical.get("macd") or {}).get("histogram"))
+        raw_histogram = zhuan_you_xian_shuzhi(raw.get("macd_hist"))
+        close = zhuan_you_xian_shuzhi(raw.get("close"))
+        if raw_histogram is None or reviewed_histogram is None or close is None or close <= 0 or macd_hist is None:
+            conflicts.append("MACD复核缺少原始柱值、收盘价或展示值")
+        elif not math.isclose(raw_histogram / close, macd_hist, rel_tol=1e-10, abs_tol=1e-12) or not math.isclose(raw_histogram, reviewed_histogram, rel_tol=0, abs_tol=0.000050000001):
+            conflicts.append("MACD原始柱、价格归一值与展示值不一致")
+        factor_date = pd.to_datetime((item.get("factor") or {}).get("trade_date"), errors="coerce")
+        technical_date = pd.to_datetime(technical.get("trade_date"), errors="coerce")
+        expected_date = pd.to_datetime((item.get("data_quality") or {}).get("as_of"), errors="coerce")
+        if any(pd.isna(value) or value is None for value in (factor_date, technical_date, expected_date)) or not (factor_date == technical_date == expected_date):
+            conflicts.append("初筛、技术复核与目标日线日期缺失或不一致")
+        if (item.get("factor") or {}).get("ts_code") != item.get("ts_code"):
+            conflicts.append("初筛股票身份与复核对象不一致")
+        technical_available = technical_status in {"ok", "partial"} and technical_outcome != "program_error" and not conflicts
         conditions.append({
             "key": "technical_review", "label": "技术复核已返回有效证据",
             "status": "met" if technical_available else "unavailable",
-            "values": {"status": technical_status, "outcome": technical_outcome, "macd_histogram": reviewed_histogram},
-            "reason": technical_reason or ("技术复核已完成；必需指标仍逐项核验" if technical_available else "技术复核未完成、MACD柱缺失或来源不可用"),
+            "values": {"status": technical_status, "outcome": technical_outcome, "macd_histogram": raw_histogram,
+                       "factor_date": (item.get("factor") or {}).get("trade_date"), "technical_date": technical.get("trade_date"), "conflicts": conflicts},
+            "reason": technical_reason or ("技术复核日期、身份和原始数值一致；按未舍入值重新核验条件" if technical_available else "；".join(conflicts) or "技术复核未完成或来源不可用"),
         })
     tradability = item.get("tradability") or {}
     hard_blocks = list(tradability.get("hard_blocks") or [])
@@ -349,11 +378,14 @@ def pinggu_shangzhang_tiaojian(
             reason = "；".join(hard_blocks) or "当前可交易性检查未通过"
         elif feasible is True:
             trade_status = "met"
-            reason = "当前适用的可交易性检查通过"
+            reason = (
+                "当前行情基础条件检查通过，不保证即时成交" if current_required
+                else "最近完整日线的基础成交条件检查通过，未确认当前或下次开市可成交"
+            )
         else:
             trade_status = "unavailable"
             reason = "缺少可交易性检查结果"
-        conditions.append({"key": "tradability", "label": "通过当前适用的可交易性检查", "status": trade_status,
+        conditions.append({"key": "tradability", "label": "通过本次适用的基础成交条件检查", "status": trade_status,
                            "values": {"basic_execution_feasible": feasible, "realtime_required": current_required,
                                       "current_quote_verified": current_verified, "hard_blocks": hard_blocks}, "reason": reason})
     missing = [condition["key"] for condition in conditions if condition["status"] == "unavailable"]
@@ -452,7 +484,12 @@ def goujian_kejiaoyixing_zhaiyao(
     minimum_amount: float,
     realtime_required: bool = False,
     reference_time: Any = None,
+    market_clock: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    session = str((market_clock or {}).get("session_status") or "unknown")
+    # 时段来自调用方的权威日历；不依据系统星期数猜测交易日。
+    if (market_clock or {}).get("is_trading_day") is False or session in {"non_trading_day", "pre_open", "post_close"}:
+        realtime_required = False
     latest = history.iloc[-1]
     amount = zhuan_you_xian_shuzhi(latest.get("amount_yuan"))
     amount_trade_date_raw = pd.to_datetime(latest.get("trade_date"), errors="coerce")
@@ -483,16 +520,24 @@ def goujian_kejiaoyixing_zhaiyao(
         snapshot, expected_trade_date=reference_time if realtime_required else amount_trade_date,
         reference_time=reference_time, require_timestamp=realtime_required,
     )
+    if (market_clock or {}).get("is_trading_day") is False:
+        time_check["session_phase"] = "non_trading_day"
     quote_time = pd.Timestamp(time_check["provider_quote_time"]) if time_check["provider_quote_time"] else None
     auction_pending = bool(realtime_required and (
         time_check["session_phase"] == "opening_auction"
         or (quote_time is not None and quote_time < quote_time.normalize() + pd.Timedelta(hours=9, minutes=25))
     ))
-    current_verified = bool(
+    snapshot_verified = bool(
         snapshot.get("status") == "ok"
         and all(value is not None and value > 0 for value in current_fields)
         and current_turnover_valid and not auction_pending
         and time_check["verified"]
+    )
+    current_verified = bool(realtime_required and snapshot_verified)
+    execution_note = (
+        "仅核验最近完整日线的基础成交条件；历史快照不代表当前行情或当前可交易，下次交易需重新核验"
+        if not realtime_required
+        else "仅核验当前行情时点、价格和成交字段；这些基础条件不保证即时成交"
     )
     quote_reason = (
         str(snapshot.get("error") or "实时快照不可用") if snapshot.get("status") != "ok"
@@ -520,12 +565,16 @@ def goujian_kejiaoyixing_zhaiyao(
         price_limit_pct = None
         cautions.append(f"涨跌幅规则不可用：{exc}")
     return {
-        "status": "blocked" if hard_blocks else "caution" if cautions else "tradable",
+        "status": "blocked" if hard_blocks else "historical_reference" if not realtime_required else "caution" if cautions else "conditions_verified",
         "basic_execution_feasible": not hard_blocks,
+        "execution_check_scope": "current_quote" if realtime_required else "historical_daily",
+        "execution_note": execution_note,
+        "market_session_status": session,
         "realtime_required": realtime_required,
         "current_quote_verified": current_verified,
-        "current_quote_status": "verified" if current_verified else "unavailable",
-        "current_quote_reason": quote_reason,
+        "current_quote_status": "not_required" if not realtime_required else "verified" if current_verified else "unavailable",
+        "current_quote_reason": quote_reason if realtime_required else execution_note,
+        "historical_quote_verified": bool(not realtime_required and snapshot_verified),
         "quote_time_verification": time_check,
         "current_volume": current_volume,
         "current_amount_yuan": current_amount,
@@ -640,7 +689,7 @@ def goujian_zhen_duan_shixiaoxing(
         "session_status": session,
         "result_confirmation": confirmation,
         "realtime_required": realtime_required,
-        "realtime_status": realtime_status,
+        "realtime_status": realtime_status if realtime_required else "not_required",
         "explanation": explanation,
         "reassess_when": ["出现新的完整日线后", "价格、成交状态或已列风险发生变化时", "缺失证据补齐后"],
     }
@@ -669,7 +718,6 @@ def goujian_houxuan_zhaiyao(
     evidence_gaps = goujian_zhengju_quekou(item)
     risks = list(dict.fromkeys([
         *[str(value) for value in macd_structure.get("risk_warnings", [])],
-        *[str(value) for value in pattern.get("failure_reasons", []) if pattern.get("state") == "invalidated"],
         *[str(value) for value in (item.get("tradability") or {}).get("hard_blocks", [])],
         *[str(value) for value in (item.get("tradability") or {}).get("cautions", [])],
         *[str(value) for value in item.get("risks") or []],
@@ -702,7 +750,7 @@ def goujian_houxuan_zhaiyao(
         "snapshot": item.get("snapshot"),
         "data_quality": item.get("data_quality"),
         "risks": risks,
-        "risk_reference_price": pattern.get("risk_reference_price"),
+        "risk_reference_price": pattern.get("risk_reference_price") if pattern.get("eligible") and pattern.get("state") in {"waiting_breakout", "extreme_shrink", "adjusting", "intraday_confirmed", "close_confirmed"} else None,
     }
 
 

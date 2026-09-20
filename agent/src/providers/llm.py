@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 from typing import Any, Dict, Optional
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None  # type: ignore
+from src.core.config import ensure_dotenv as _ensure_dotenv
 
 try:
     from langchain_openai import ChatOpenAI
@@ -62,40 +57,6 @@ if ChatOpenAI is not None:
 
 else:
     ChatOpenAIWithReasoning = None  # type: ignore
-
-
-AGENT_DIR = Path(__file__).resolve().parents[2]
-_ENV_CANDIDATES = [
-    Path.home() / ".gupiaoyanjiu" / ".env",
-    AGENT_DIR / ".env",
-    Path.cwd() / ".env",
-]
-
-_dotenv_loaded = False
-
-
-def _load_env_file(path: Path) -> None:
-    if load_dotenv is not None:
-        load_dotenv(dotenv_path=path, override=False)
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip():
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def _ensure_dotenv() -> None:
-    global _dotenv_loaded
-    if _dotenv_loaded:
-        return
-    for candidate in _ENV_CANDIDATES:
-        if candidate.exists():
-            _load_env_file(candidate)
-            break
-    _dotenv_loaded = True
 
 
 def _provider_name() -> str:
@@ -162,15 +123,6 @@ def resolve_provider_settings() -> Dict[str, Any]:
     raise RuntimeError("LANGCHAIN_PROVIDER must be deepseek, openai, or openai_codex")
 
 
-def _sync_provider_env() -> Dict[str, Any]:
-    """Compatibility helper used by preflight; returns resolved settings."""
-    settings = resolve_provider_settings()
-    os.environ["OPENAI_API_KEY"] = str(settings["api_key"])
-    os.environ["OPENAI_BASE_URL"] = str(settings["base_url"])
-    os.environ["OPENAI_API_BASE"] = str(settings["base_url"])
-    return settings
-
-
 def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
     """Construct the configured DeepSeek/OpenAI chat model."""
     settings = resolve_provider_settings()
@@ -211,36 +163,3 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         reasoning=reasoning,
         service_tier=service_tier,
     )
-
-
-def _extract_balanced_json(text: str) -> Optional[Dict[str, Any]]:
-    """Extract the outermost JSON object from text using bracket balancing."""
-    start = -1
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i, ch in enumerate(text):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    start = -1
-    return None

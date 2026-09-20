@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Literal, get_args
 
 from src.agent.tools import BaseTool
@@ -14,11 +15,40 @@ FenxiScope = Literal["all_market", "named_scope", "single_stock"]
 
 def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
     """去掉重复的大字段，同时保留智能体解释与审查所需的完整证据。"""
-    public = {
+    public = deepcopy({
         key: value
         for key, value in result.items()
         if key != "reviewed_candidates"
-    }
+    })
+    # 定义按字段共享一次；逐股样本数留在原位置，原始观测与缺失项不裁剪。
+    definitions: dict[str, Any] = {}
+    from src.ashare.yinzi_gongcheng import FACTOR_REGISTRY
+    known = {entry["feature"] for entry in FACTOR_REGISTRY}
+
+    def share_definitions(value: Any) -> None:
+        if isinstance(value, dict):
+            metadata = value.get("metric_definitions")
+            if isinstance(metadata, dict):
+                for feature, definition in list(metadata.items()):
+                    if feature not in known or not isinstance(definition, dict):
+                        continue
+                    shared = {key: item for key, item in definition.items() if key != "valid_observations"}
+                    if feature in definitions and definitions[feature] != shared:
+                        continue
+                    definitions[feature] = shared
+                    metadata[feature] = {"definition_ref": feature, **(
+                        {"valid_observations": definition["valid_observations"]} if "valid_observations" in definition else {}
+                    )}
+            for key, item in value.items():
+                if key != "metric_definitions":
+                    share_definitions(item)
+        elif isinstance(value, list):
+            for item in value:
+                share_definitions(item)
+
+    share_definitions(public)
+    if definitions:
+        public["indicator_definitions"] = definitions
     reviewed = result.get("reviewed_candidates")
     if isinstance(reviewed, list):
         public["reviewed_candidate_count"] = len(reviewed)
@@ -41,6 +71,9 @@ class GupiaoFenxiTool(BaseTool):
         "structure, financials and valuation context, pattern and late-session conditions, supplemental diagnostics, execution "
         "constraints and source provenance. Optional source failure yields a partial report, never a forced buy/no-buy label. "
         "Use all_market or named_scope for rule-based selection; named scopes are dynamically discovered and verified. "
+        "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
+        "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
+        "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
         "Selection filters explicit upward-signal conditions and compares five raw dimensions by non-dominated layers; "
         "same-layer ordering is stable display only. Return the exposed research candidates or explain no qualification. "
         "Do not calculate scores, weights, predicted probabilities or model forecasts."
@@ -62,28 +95,91 @@ class GupiaoFenxiTool(BaseTool):
                 "type": "string",
                 "description": "The user's complete stock name or 6 digit security code when fanwei=single_stock. Do not use it for a range request.",
             },
+            "fanwei_xuanze": {
+                "type": ["object", "null"],
+                "description": "Only after scope_review_required: select one of this request's verified candidates using its exact code/kind and a concise semantic reason. Keep all original arguments unchanged. If real ambiguity remains, use clarify. Omit or null on the initial call.",
+                "properties": {
+                    "code": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["industry", "concept"]},
+                    "reason": {"type": "string", "description": "Why this candidate fits the user's meaning better than the other verified candidates; identity verification alone does not prove semantic equivalence."},
+                },
+                "required": ["code", "kind", "reason"],
+                "additionalProperties": False,
+            },
             "shuliang": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 5,
                 "description": "Optional number of stocks the user explicitly requested for a range selection. If omitted, use the normal primary plus available alternatives; never invent a count.",
             },
+            "shizhi": {
+                "type": "object",
+                "description": "Explicit market-cap constraint. Small-cap is a numeric condition, not an industry/theme. Do not invent a threshold. Use unresolved for missing basis/limit or an unsupported percentile request; single_stock uses none.",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["none", "unresolved", "upper_limit"]},
+                    "basis": {"type": ["string", "null"], "enum": ["total", "circulating", None], "description": "total=总市值, circulating=流通市值. Required for upper_limit; omit or null for none/unresolved."},
+                    "max_yi": {"type": ["number", "null"], "exclusiveMinimum": 0, "description": "User's upper bound in 亿元. Required for upper_limit; 100 means 100亿元. Omit or null for none/unresolved."},
+                    "inclusive": {"type": ["boolean", "null"], "description": "true for 不超过/以下 (<=), false for 低于/小于 (<). Omit or null for none/unresolved."},
+                },
+                "required": ["mode"],
+                "additionalProperties": False,
+            },
         },
-        "required": [],
+        "required": ["shizhi"],
     }
     repeatable = True
     # 只保存多轮对话所需的进程内会话状态，不保存市场时间序列。
     is_readonly = False
 
+    def __init__(self) -> None:
+        self.reset_request()
+
+    def reset_request(self) -> None:
+        """只在同一智能体请求的范围审查两步之间暂存目录，不跨轮复用。"""
+        self._scope_review: tuple[Any, dict[str, Any], dict[str, Any]] | None = None
+        self._completed_analysis: tuple[dict[str, Any], Any, str] | None = None
+
     def execute(self, **kwargs: Any) -> str:
         from src.ashare.xuangu_fenxi import fenxi_xuangu
+        from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 
-        full_result = fenxi_xuangu(
+        request = dict(
             fanwei=str(kwargs.get("fanwei") or "all_market"),
             mingcheng=str(kwargs.get("mingcheng") or "").strip() or None,
             gupiao=str(kwargs.get("gupiao") or "").strip() or None,
             shuliang=kwargs.get("shuliang"),
+            shizhi=kwargs.get("shizhi") if kwargs.get("shizhi") is not None else {"mode": "unresolved"},
         )
+        request["shizhi"] = {key: value for key, value in request["shizhi"].items() if value is not None} if isinstance(request["shizhi"], dict) else request["shizhi"]
+        choice = kwargs.get("fanwei_xuanze")
+        if self._completed_analysis is not None:
+            previous_request, previous_choice, previous_output = self._completed_analysis
+            same_choice = choice is None or (isinstance(choice, dict) and isinstance(previous_choice, dict) and
+                                            all(choice.get(key) == previous_choice.get(key) for key in ("code", "kind")))
+            if request == previous_request and same_choice:
+                return previous_output
+        pending = self._scope_review
+        self.reset_request()
+        if pending is not None:
+            request_context, original_request, original_result = pending
+            if request != original_request or not isinstance(choice, dict):
+                return json.dumps({**original_result, "error": "范围仍待确认；不能在审查时改变原始范围、数量或市值条件"}, ensure_ascii=False)
+        elif choice is not None:
+            return json.dumps({"status": "clarification_required", "outcome": "clarification_required", "stage": "scope_discovery",
+                               "error": "没有本次请求的已核验范围候选，请重新说明要分析的范围"}, ensure_ascii=False)
+        else:
+            request_context = FenxiShujuShangxiawen()
+        full_result = fenxi_xuangu(**request, context=request_context, scope_choice=choice)
+        candidates = full_result.get("candidates") or []
+        if pending is None and full_result.get("status") == "clarification_required" and full_result.get("stage") == "scope_discovery" and candidates and all(
+            isinstance(candidate, dict) and (candidate.get("verification") or {}).get("verified") is True for candidate in candidates
+        ):
+            self._scope_review = (request_context, request, full_result)
+            return json.dumps({**full_result, "status": "scope_review_required", "outcome": "scope_review_required",
+                               "error": None, "error_code": None,
+                               "candidates": [{**candidate, "ambiguity_resolution": "agent_review_pending"} for candidate in candidates],
+                               "original_request": request,
+                               "next_action": "结合完整用户语义比较这些真实候选；唯一合理解释可用 fanwei_xuanze 选择并保持原条件，仍有歧义调用 clarify 一次。不得以名称相似度、身份核验或热度代替语义判断。"}, ensure_ascii=False)
         if full_result.get("status") not in {"ok", "partial"}:
             return json.dumps(full_result, ensure_ascii=False)
         stored_result = {
@@ -102,12 +198,14 @@ class GupiaoFenxiTool(BaseTool):
                     "next_step": "完整说明支持和反向证据、缺口、风险与重新评估条件",
                 },
             }
-            return json.dumps(public_result, ensure_ascii=False)
+            output = json.dumps(public_result, ensure_ascii=False, separators=(",", ":"))
+            self._completed_analysis = (request, choice, output)
+            return output
         recommendation_available = bool(stored_result.get("recommendation_available"))
         public_result = {
             **_mianxiang_zhinengti_jieguo(stored_result),
             "analysis_id": analysis_id,
-            "selected_stock": stored_result.get("primary"),
+            "selected_stock": {key: stored_result["primary"].get(key) for key in ("ts_code", "name")} if stored_result.get("primary") else None,
             "analysis_stage": {
                 "status": "partial" if stored_result.get("status") == "partial" else "completed",
                 "scope": (
@@ -122,7 +220,9 @@ class GupiaoFenxiTool(BaseTool):
                 ),
             },
         }
-        return json.dumps(public_result, ensure_ascii=False)
+        output = json.dumps(public_result, ensure_ascii=False, separators=(",", ":"))
+        self._completed_analysis = (request, choice, output)
+        return output
 
 
 __all__ = ["FenxiScope", "GupiaoFenxiTool"]

@@ -47,7 +47,10 @@ class HuimaqiangJieguo:
     evidence: tuple[str, ...]
     failure_reasons: tuple[str, ...]
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        settings = config or {}
+        shrink_window = int(settings.get("shrink_window_sessions", self.actuals.get("shrink_window_sessions", 7)))
+        breakout_deadline = int(settings.get("breakout_deadline_sessions", self.actuals.get("breakout_deadline_sessions", 14)))
         return {
             "status": "ok" if self.eligible else "not_applicable",
             "state": self.state.value,
@@ -65,6 +68,20 @@ class HuimaqiangJieguo:
                 else "not_confirmed"
             ),
             "risk_reference_price": self.risk_reference_price,
+            "rule_semantics": {
+                "baseline_date": self.baseline_date,
+                "session_origin": "基准涨停日为 D0，其后第一个交易日为 D1",
+                "shrink_window_start_session": 1,
+                "shrink_window_end_session": shrink_window,
+                "breakout_deadline_session": breakout_deadline,
+                "breakout_after_shrink_required": True,
+                "breakout_deadline_inclusive": True,
+                "explanation": (
+                    f"极致缩量须发生在基准涨停日后的第 1 至第 {shrink_window} 个交易日；"
+                    f"突破须在缩量日之后、且不晚于同一基准涨停日后的第 {breakout_deadline} 个交易日（含该日）。"
+                    "突破截止从基准涨停日计数，缩量出现不会重新开始观察期限。"
+                ),
+            },
             "actuals": self.actuals,
             "conditions": self.conditions,
             "evidence": list(self.evidence),
@@ -159,6 +176,7 @@ def _fenxi_jizhunri(
         "baseline_volume": round(baseline_volume, 2),
         "observed_sessions_after_baseline": observed_sessions,
         "shrink_volume_ratio_threshold": shrink_ratio_max,
+        "shrink_window_sessions": shrink_window,
         "breakout_volume_median_ratio_threshold": breakout_volume_ratio_min,
         "breakout_deadline_sessions": breakout_deadline,
     }
@@ -201,6 +219,7 @@ def _fenxi_jizhunri(
     if shrink_row is not None:
         shrink_ratio = float(shrink_row["volume"]) / baseline_volume if baseline_volume > 0 else np.nan
         actuals["shrink_volume_ratio"] = round(float(shrink_ratio), 4) if np.isfinite(shrink_ratio) else None
+        actuals["shrink_session_after_baseline"] = int(observations.index.get_loc(shrink_row.name)) + 1
         evidence.append(
             f"{shrink_date} 成交量为涨停日的 {float(shrink_ratio) * 100:.1f}%，满足不高于 {shrink_ratio_max * 100:.1f}% 的极致缩量"
         )
@@ -240,6 +259,7 @@ def _fenxi_jizhunri(
                 "breakout_open": round(float(breakout_row["open"]), 3),
                 "breakout_close": round(float(breakout_row["close"]), 3),
                 "breakout_volume_median_ratio": round(float(breakout_volume_ratio), 4),
+                "breakout_session_after_baseline": int(observations.index.get_loc(breakout_row.name)) + 1,
             }
         )
         evidence.append(
@@ -368,7 +388,7 @@ def fenxi_zhangting_huimaqiang(
             conditions={"normal_10pct_main_board": False},
             evidence=(),
             failure_reasons=(str(reason),),
-        ).to_dict()
+        ).to_dict(config=config)
     data = _zhengli_lishi(history)
     if len(data) < 2:
         return HuimaqiangJieguo(
@@ -383,7 +403,7 @@ def fenxi_zhangting_huimaqiang(
             conditions={"normal_10pct_main_board": True},
             evidence=(),
             failure_reasons=("完整日线不足，无法识别形态",),
-        ).to_dict()
+        ).to_dict(config=config)
     tolerance = float(config.get("limit_up_tolerance_yuan", 0.005))
     baselines: list[int] = []
     for index, row in data.iterrows():
@@ -410,7 +430,7 @@ def fenxi_zhangting_huimaqiang(
             },
             evidence=(),
             failure_reasons=("观察区间内没有合法涨停阳线基准日",),
-        ).to_dict()
+        ).to_dict(config=config)
     results = [
         _fenxi_jizhunri(
             data,
@@ -446,7 +466,7 @@ def fenxi_zhangting_huimaqiang(
         None,
     )
     selected = active or max(results, key=lambda result: priority[result.state])
-    return selected.to_dict()
+    return selected.to_dict(config=config)
 
 
 __all__ = ["HuimaqiangJieguo", "HuimaqiangZhuangtai", "fenxi_zhangting_huimaqiang"]

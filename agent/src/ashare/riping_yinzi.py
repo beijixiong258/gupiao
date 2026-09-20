@@ -249,6 +249,7 @@ def _benchmark_features(
     merged: pd.DataFrame | None = None
     details: dict[str, Any] = {}
     warnings: list[str] = []
+    source_warnings: list[str] = []
     expected_dates, _ = _benchmark_calendar_dates(start=start, end=end, calendar=calendar)
     for key in BENCHMARKS:
         source_meta: dict[str, Any] = {}
@@ -260,10 +261,13 @@ def _benchmark_features(
             calendar=calendar,
             quality=source_meta,
         )
-        warnings.extend(errors)
         if history.empty:
+            warnings.extend(errors)
             details[key] = {**source_meta, "status": "unavailable", "source": provider, "rows": 0}
             continue
+        # 已由合格备用源恢复的请求失败仅属于来源记录，不再冒充当前证据缺失。
+        source_warnings.extend(errors)
+        source_meta["source_warnings"] = list(errors)
         values = history.set_index("trade_date")[["close"]].reindex(expected_dates)
         values.index.name = "trade_date"
         values = values.reset_index()
@@ -287,6 +291,7 @@ def _benchmark_features(
         ),
         "benchmarks": details,
         "warnings": warnings,
+        "source_warnings": source_warnings,
         "frequency": "daily_k_only",
         "persistence": "none",
     }
@@ -431,7 +436,8 @@ def enrich_daily_factor_panel(
 
     if "amount_yuan" not in data.columns:
         data["amount_yuan"] = np.nan
-    data["log_amount_yuan"] = np.log1p(pd.to_numeric(data["amount_yuan"], errors="coerce").clip(lower=0))
+    amount = pd.to_numeric(data["amount_yuan"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    data["log_amount_yuan"] = np.log1p(amount.where(amount >= 0))
 
     # 分析只消费调用方已提供的日频证据；缺失估值字段留空，最新横截面
     # 的换手和市值由分析汇总层补入，不逐股下载历史估值。
@@ -511,6 +517,7 @@ def enrich_daily_factor_panel(
         "feature_coverage": feature_coverage,
         "factor_engineering": factor_engineering_meta,
         "warnings": warnings,
+        "source_warnings": list(benchmark_meta.get("source_warnings", [])),
     }
 
 
