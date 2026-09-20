@@ -28,13 +28,10 @@
   },
   "fenxi": {
     "history_calendar_days": 420,
-    "prefilter_limit": 240,
-    "factor_candidate_limit": 120,
+    "history_batch_size": 240,
     "deep_analysis_limit": 5,
     "backup_limit": 4,
-    "minimum_history_rows": 80,
     "minimum_history_session_coverage": 0.9,
-    "minimum_listing_calendar_days": 180,
     "min_amount_yuan": 50000000,
     "high_volatility_threshold": 0.55,
     "macd_structure": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from threading import Lock
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
@@ -13,6 +14,7 @@ from pydantic import Field
 from src.tools.gupiao_fenxi_tool import FenxiScope, GupiaoFenxiTool
 
 _GUPIAO_FENXI = GupiaoFenxiTool()
+_ANALYSIS_LOCK = Lock()
 _COUNT_PARAMETER = GupiaoFenxiTool.parameters["properties"]["shuliang"]
 RequestedCount = Annotated[
     int,
@@ -25,8 +27,13 @@ one business tool for unified stock analysis and diagnosis. Natural-language ass
 parameters and analysis_id from end users. When the user names a scope, pass the ordinary phrase
 unchanged as named_scope; the analysis tool dynamically downloads industry and concept catalogs
 and may return one plain-language clarification. Never guess an industry-versus-concept category.
-For a named stock use single_stock and gupiao, then explain the returned buy/no-buy assessment,
-evidence gaps, result validity and reassessment conditions. Prediction and model training are
+For a named stock use single_stock and gupiao; pass an explicit conjecture through yanjiu_wenti,
+then explain the observable claim assessment, counterevidence, gaps and reassessment conditions.
+For selection carry explicit cap restrictions in shizhi and other explicit conditions in tiaojian.
+Never add risk preferences or invent bounds. Compare returned 20-day/5-day performance and actual
+coverage; do not change the order. A verified scope_review_required can be resolved once with
+fanwei_xuanze while preserving original_request, or clarified if truly ambiguous.
+Prediction and model training are
 not available. The server never connects to brokers,
 accepts trading credentials, submits orders, controls trading terminals, or performs
 automatic trading. All outputs are research results for manual review.
@@ -42,11 +49,7 @@ mcp = FastMCP(
 
 @mcp.tool(
     name="gupiao_fenxi",
-    description=(
-        "统一分析：点名单股时复用统一量化规则给出买入建议；在全市场或用户用日常语言描述的范围中，先动态发现并核验范围，再自动执行风险过滤、八组日K因子、基本面、形态、尾盘证据和排序，"
-        "返回一只首选、最多四只备选或明确不推荐。内部analysis_id只供当前进程解释已有分析，不应向自然语言用户展示。"
-        "只做个人股票研究分析与诊断，不替用户作交易决定，不连接券商或下单。"
-    ),
+    description=GupiaoFenxiTool.description,
     annotations={
         "readOnlyHint": True,
         "destructiveHint": False,
@@ -59,14 +62,23 @@ def gupiao_fenxi(
     mingcheng: str | None = None,
     gupiao: str | None = None,
     shuliang: RequestedCount | None = None,
+    shizhi: Annotated[dict[str, Any] | None, Field(json_schema_extra=GupiaoFenxiTool.parameters["properties"]["shizhi"])] = None,
+    tiaojian: Annotated[dict[str, Any] | None, Field(json_schema_extra=GupiaoFenxiTool.parameters["properties"]["tiaojian"])] = None,
+    yanjiu_wenti: Annotated[dict[str, Any] | None, Field(json_schema_extra=GupiaoFenxiTool.parameters["properties"]["yanjiu_wenti"])] = None,
+    fanwei_xuanze: Annotated[dict[str, Any] | None, Field(json_schema_extra=GupiaoFenxiTool.parameters["properties"]["fanwei_xuanze"])] = None,
 ) -> dict[str, Any]:
     """按自然语言解析出的范围执行统一选股分析。"""
-    return json.loads(_GUPIAO_FENXI.execute(
-        fanwei=fanwei,
-        mingcheng=mingcheng,
-        gupiao=gupiao,
-        shuliang=shuliang,
-    ))
+    with _ANALYSIS_LOCK:
+        # 新调用重新取数；只有当前范围审查的第二步复用本次目录。
+        if fanwei_xuanze is None:
+            _GUPIAO_FENXI.reset_request()
+        result = json.loads(_GUPIAO_FENXI.execute(
+            fanwei=fanwei, mingcheng=mingcheng, gupiao=gupiao, shuliang=shuliang,
+            shizhi=shizhi, tiaojian=tiaojian, yanjiu_wenti=yanjiu_wenti, fanwei_xuanze=fanwei_xuanze,
+        ))
+        if result.get("status") != "scope_review_required":
+            _GUPIAO_FENXI.reset_request()
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:

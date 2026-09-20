@@ -140,8 +140,8 @@ class MingmingFanweiHouXuanChi:
             raise ValueError("命名范围尚未解析")
         members, board_meta = context.bankuai_chengfen(scope)
         # 板块成分接口已经包含本范围的实时行情、估值和市值。这里不再为了补一个
-        # 当前股票资料字段而下载全市场横截面；上市时间由随后取得的真实日线跨度
-        # 复核，深度基本面只对最终少量候选按需读取。
+        # 当前股票资料字段而下载全市场横截面；未返回上市日期时保留缺失，
+        # 不用已下载日线跨度冒充上市时长；深度基本面只对最终少量候选按需读取。
         data = members.copy()
         industry = data.get("industry", pd.Series("", index=data.index)).fillna("").astype(str).str.strip()
         missing_industry = industry.str.lower().isin({"", "unknown", "nan", "none", "未知", "未分类"})

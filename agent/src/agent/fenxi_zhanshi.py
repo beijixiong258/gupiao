@@ -80,7 +80,7 @@ _LABELS = {
     "provider_trade_date": "来源交易日期", "expected_trade_date": "待核验交易日期",
     "quote_age_seconds": "来源更新时间距核验时点（秒）", "verification_scope": "核验范围",
     "current_quote_reason": "当前行情核验说明",
-    "scope_input": "输入范围股票数", "after_hard_filter": "基础检查通过数", "after_prefilter": "抽样数量",
+    "scope_input": "输入范围股票数", "after_hard_filter": "基础检查通过数", "after_prefilter": "分批请求候选数",
     "after_market_cap_filter": "市值条件通过数", "market_cap_unverified": "市值尚未核验数",
     "market_cap_check": "市值条件核验", "condition": "指定条件", "basis_label": "市值口径",
     "maximum_yuan": "市值上限（元）", "maximum_yi": "市值上限（亿元）", "actual_yuan": "已核验市值（元）",
@@ -96,6 +96,22 @@ _LABELS = {
     "review_stop_reason": "复核停止原因", "selection_outcome": "筛选结果",
     "source_date_verified": "来源日期是否有效", "timeliness_status": "行情时效状态", "session_phase": "时段",
     "quote_active_age_seconds": "有效交易时段延迟（秒）", "maximum_active_age_seconds": "有效交易时段延迟上限（秒）",
+    "main_judgment": "主要判断", "research_question": "待验证观点", "question": "原始问题",
+    "verdict": "核验结论", "verdict_label": "结论说明", "checks": "可观测命题核验",
+    "supporting_checks": "支持的命题", "counter_checks": "存在反证的命题", "missing_checks": "缺少证据的命题",
+    "unverifiable_parts": "尚不能核验的部分", "observation": "实际观测", "reference": "参照观测",
+    "metric": "指标标识", "reference_metric": "参照指标", "value": "原始值", "threshold": "比较界限（原始单位）",
+    "display_scale": "原值到展示单位的倍数", "family": "证据来源类别", "evidence_families": "相关证据归组",
+    "intraday_effect": "盘中变化对日线判断的影响", "effect": "实际变化", "ranking_effect": "对排序的适用边界",
+    "reference_note": "价格比较口径", "ma20_reference": "已完成日线MA20参考值（元）",
+    "change_from_previous_close": "较前收盘价变化（比例，1表示100%）", "quote_time": "行情更新时间",
+    "comparison_values": "排序原始值", "comparison_rank": "比较次序", "comparison_pool_size": "合格比较样本数",
+    "comparison_to_next": "与后一候选的比较", "current_values": "本股原始值", "next_values": "后一候选原始值",
+    "next_pareto_front": "后一候选非支配层次", "absolute_performance": "绝对表现",
+    "history_requested": "请求历史行情数", "sampled": "是否抽样", "complete": "比较是否完成",
+    "technical_review_planned": "本次计划技术复核数", "limitation": "覆盖边界", "best_definition": "本次优选口径",
+    "equivalent_performance_count": "两项表现完全相同的并列对象数",
+    "size_matched_stocks": "行业与规模均可核验的同行数", "target_size_verified": "本股规模是否核验",
 }
 _STATUS = {
     "lt": "低于（不含上限）", "le": "不超过（含上限）", "not_evaluated": "尚未核验",
@@ -114,6 +130,10 @@ _STATUS = {
     "not_required": "本次不要求", "not_requested": "本次未请求",
     "non_trading_day": "休市", "pre_open": "开市前", "post_close": "收盘后",
     "latest_completed_qfq_close": "最近完整日线前复权收盘价",
+    "supported": "支持所列命题", "partly_supported": "部分支持", "not_supported": "存在直接反证",
+    "insufficient_evidence": "证据不足", "gt": "大于", "gte": "大于等于", "lte": "小于等于", "eq": "等于",
+    "all_scope_members_in_batches": "范围成分分批全量请求",
+    "comparison_reference": "比较参照对象，不增加推荐数量",
 }
 _METADATA_CONTAINERS = {"data_provenance", "data_quality", "sources", "method", "configuration"}
 _HIDDEN_KEYS = {
@@ -272,14 +292,12 @@ def _identity(candidate: dict[str, Any], default: str) -> str:
 def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: bool) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     summary = candidate.get("diagnosis_summary")
+    if candidate.get("research_question"):
+        sections.append((identity + " / 用户观点核验", "\n".join(_tree(candidate["research_question"]))))
     if isinstance(summary, dict):
-        sections.append((identity + " / 诊断概览", _text(summary.get("summary")) or "已整理当前证据，需结合支持和反向事实理解。"))
-        if summary.get("evidence_context"):
-            sections.append((identity + " / 技术证据与分歧", "\n".join(_tree({
-                "证据背景": summary["evidence_context"], "实质分歧": summary.get("evidence_conflicts") or [],
-                "支持事实": summary.get("supporting_evidence") or [], "反向事实": summary.get("counter_evidence") or [],
-                "解释口径": summary.get("interpretation_basis"),
-            }))))
+        sections.append((identity + " / 综合判断、证据与复评条件", "\n".join(_tree({
+            key: value for key, value in summary.items() if key != "research_assessment"
+        }))))
     if "selection_analysis" in candidate:
         sections.append((identity + " / 选股条件与比较依据", "\n".join(_tree(candidate["selection_analysis"]))))
     for key, title in (
@@ -301,8 +319,6 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
             sections.append((identity + " / " + title, "\n".join(_tree(candidate[key], value_kind=kind)) or "当前没有可展示的字段。"))
     if "daily_factor_analysis" in candidate:
         sections.extend((identity + " / " + title, body) for title, body in _factor_sections(candidate["daily_factor_analysis"]))
-    if isinstance(summary, dict):
-        sections.append((identity + " / 支持、反向证据与复评条件", "\n".join(_tree(summary))))
     return sections
 
 
@@ -314,6 +330,7 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     for key, title in (("scope", "选股范围及核验"), ("candidate_counts", "本次筛选与复核数量"),
                        ("market_cap_filter", "市值筛选条件及核验"),
+                       ("user_conditions", "用户明确选股条件"), ("comparison_coverage", "实际比较覆盖"),
                        ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
                        ("selection_methodology", "选股方法"), ("diagnosis_validity", "诊断时点"),
                        ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
@@ -403,7 +420,7 @@ def goujian_fenxi_anquan_huitui(payload: dict[str, Any] | None) -> str:
         if status == "partial":
             lead += "部分来源或指标缺失，以下保留可用证据和具体缺口。"
     elif payload.get("recommendation_available") is True:
-        lead = "以下为通过明确选股条件的研究候选，按原始维度比较；同层展示顺序不代表上涨概率。"
+        lead = "以下为通过用户条件和数据核验的优选候选：按20日、5日已实现表现分层，同层优先20日表现。具体比较依据与覆盖范围见报告。"
         if status == "partial":
             lead += "部分来源或补充证据缺失，报告保留具体缺口和实际复核范围。"
     else:

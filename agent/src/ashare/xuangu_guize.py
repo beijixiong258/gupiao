@@ -1,8 +1,9 @@
-"""统一分析的硬过滤、原始证据、上涨条件与 Pareto 比较规则。"""
+"""数据有效性、用户明确条件、原始证据与可解释的表现比较。"""
 
 from __future__ import annotations
 
 import math
+from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
@@ -11,6 +12,7 @@ import pandas as pd
 
 from src.ashare.fenxi_weipan import WeipanJieduan
 from src.ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
+from src.ashare.fenxi_wenti import heyan_mingque_tiaojian
 from src.ashare.shuju_yuan import heyan_kuaizhao_shidian, huoqu_zhangdieting_guize
 
 
@@ -46,17 +48,6 @@ def _limit_price(previous_close: float, rate: float) -> float:
             rounding=ROUND_HALF_UP,
         )
     )
-
-
-def _mingcheng_ying_guolv(name: str) -> str | None:
-    value = str(name).strip().upper()
-    if "ST" in value:
-        return "股票简称包含 ST 风险标记"
-    if "退" in value:
-        return "股票简称包含退市风险标记"
-    if value.startswith(("N", "C")):
-        return "新股缺少稳定历史或仍处于特殊涨跌幅阶段"
-    return None
 
 
 def shibie_yizijia_zhangting(
@@ -118,28 +109,15 @@ def jichu_ying_guolv(
 ) -> list[str]:
     reasons: list[str] = []
     name = str(row.get("name") or "")
-    name_reason = _mingcheng_ying_guolv(name)
-    if name_reason:
-        reasons.append(name_reason)
     price = zhuan_you_xian_shuzhi(row.get("latest_price"))
     volume = zhuan_you_xian_shuzhi(row.get("volume"))
     amount = zhuan_you_xian_shuzhi(row.get("amount_yuan"))
-    analysis = config.get("fenxi", {})
     if price is None or price <= 0:
         reasons.append("价格字段无效或疑似停牌")
     if quote_is_completed and (volume is None or volume <= 0):
         reasons.append("成交量字段无效或疑似停牌")
-    if quote_is_completed and (
-        amount is None or amount < float(analysis.get("min_amount_yuan", 50_000_000))
-    ):
-        reasons.append("成交额低于统一选股流动性底线")
-    list_date = pd.to_datetime(row.get("list_date"), errors="coerce")
-    # 有些实时板块接口不返回上市日期。此时不在第一层误杀，而由随后下载的
-    # 完整日线实际跨度证明上市时间；无法证明仍会在历史完整性过滤中淘汰。
-    if not pd.isna(list_date):
-        listing_days = int((analysis_date.normalize() - pd.Timestamp(list_date).normalize()).days)
-        if listing_days < int(analysis.get("minimum_listing_calendar_days", 180)):
-            reasons.append(f"上市仅约 {listing_days} 个自然日，历史不稳定")
+    if quote_is_completed and (amount is None or amount <= 0):
+        reasons.append("完整日线成交额缺失、无效或当日没有成交")
     if quote_is_completed:
         try:
             one_price_reason = shibie_yizijia_zhangting(
@@ -155,31 +133,12 @@ def jichu_ying_guolv(
     return reasons
 
 
-def choushu_liudongxing_houxuan(data: pd.DataFrame, limit: int) -> pd.DataFrame:
-    """按真实成交额排序，在行业内依次取样；轮次之间不合成流动性分数。"""
-    if len(data) <= limit:
-        return data.copy().reset_index(drop=True)
-    work = data.copy()
-    work["_amount"] = pd.to_numeric(work.get("amount_yuan"), errors="coerce")
-    work["_industry"] = work.get("industry", pd.Series("", index=work.index)).fillna("").astype(str)
-    work["_code"] = work.get("ts_code", pd.Series("", index=work.index)).astype(str)
-    work = work.sort_values(["_amount", "_code"], ascending=[False, True], na_position="last", kind="stable")
-    work["_industry_round"] = work.groupby("_industry", sort=False).cumcount()
-    return (
-        work.sort_values(["_industry_round", "_amount", "_code"], ascending=[True, False, True], na_position="last", kind="stable")
-        .head(max(0, limit))
-        .drop(columns=["_amount", "_industry", "_code", "_industry_round"])
-        .reset_index(drop=True)
-    )
-
-
 def guolv_lishi_wanzhengxing(
     histories: dict[str, pd.DataFrame],
     *,
     analysis_date: pd.Timestamp,
     minimum_rows: int,
     minimum_amount: float,
-    minimum_listing_calendar_days: int = 180,
 ) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
     accepted: dict[str, pd.DataFrame] = {}
     rejected: list[dict[str, Any]] = []
@@ -189,23 +148,12 @@ def guolv_lishi_wanzhengxing(
             rejected.append({"ts_code": code, "status": "unavailable", "reason": "没有可用历史日线"})
             continue
         data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
-        data = data.dropna(subset=["trade_date"]).sort_values("trade_date").reset_index(drop=True)
+        if data["trade_date"].isna().any() or data["trade_date"].duplicated().any():
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": "日线日期无效或重复，不能跳过坏行后比较"})
+            continue
+        data = data.sort_values("trade_date").reset_index(drop=True)
         if len(data) < minimum_rows:
             rejected.append({"ts_code": code, "status": "unavailable", "reason": f"历史只有 {len(data)} 行，少于 {minimum_rows} 行"})
-            continue
-        earliest_date = pd.Timestamp(data.iloc[0]["trade_date"]).normalize()
-        observed_calendar_days = int((analysis_date.normalize() - earliest_date).days)
-        if observed_calendar_days < minimum_listing_calendar_days:
-            rejected.append(
-                {
-                    "ts_code": code,
-                    "status": "unavailable",
-                    "reason": (
-                        f"远端日线只能证明约 {observed_calendar_days} 个自然日的上市历史，"
-                        f"不足 {minimum_listing_calendar_days} 日新股风险门槛"
-                    ),
-                }
-            )
             continue
         latest_date = pd.Timestamp(data.iloc[-1]["trade_date"]).normalize()
         if latest_date != analysis_date.normalize():
@@ -215,8 +163,12 @@ def guolv_lishi_wanzhengxing(
         if latest_amount is None or latest_amount < 0:
             rejected.append({"ts_code": code, "status": "unavailable", "reason": "最新完整日线成交额缺失或无效"})
             continue
-        if latest_amount < minimum_amount:
-            rejected.append({"ts_code": code, "status": "unmet", "reason": "最新完整日线成交额低于流动性底线"})
+        if latest_amount <= 0 or latest_amount < minimum_amount:
+            rejected.append({"ts_code": code, "status": "unmet", "reason": "最新完整日线没有有效成交或未通过明确成交额条件"})
+            continue
+        latest_volume = zhuan_you_xian_shuzhi(data.iloc[-1].get("volume"))
+        if latest_volume is None or latest_volume <= 0:
+            rejected.append({"ts_code": code, "status": "unavailable", "reason": "最新完整日线成交量缺失或与正成交额矛盾"})
             continue
         accepted[code] = data
     return accepted, rejected
@@ -291,7 +243,7 @@ def pinggu_shangzhang_tiaojian(
     config: dict[str, Any],
     deep_reviewed: bool = False,
 ) -> dict[str, Any]:
-    """逐项核验已有上涨信号；缺失不是通过，不折算命中分或概率。"""
+    """默认只核验比较基础；方向、波动等限制须由用户明确提出。"""
     conditions: list[dict[str, Any]] = []
     technical = item.get("technical") or {}
     raw = technical.get("raw_indicators") or {}
@@ -315,40 +267,31 @@ def pinggu_shangzhang_tiaojian(
         conditions.append({"key": key, "label": label, "status": status, "values": values,
                            "reason": "缺少必需字段：" + "、".join(missing) if missing else rule})
 
-    ma_gap = observed("trend_structure", "ma_gap_20")
-    ma_trend = observed("trend_structure", "ma_trend_5_20")
-    add("trend_alignment", "收盘价与短期均线位于20日均线上方", {"ma_gap_20": ma_gap, "ma_trend_5_20": ma_trend},
-        ma_gap is not None and ma_trend is not None and ma_gap > 0 and ma_trend > 0,
-        "要求收盘价高于20日均线，且5日均线高于20日均线")
     ret5 = observed("momentum_reversal", "ret_5")
     ret20 = observed("momentum_reversal", "ret_20")
-    macd_hist = observed("momentum_reversal", "macd_hist_pct")
-    add("positive_momentum", "5日、20日收益及MACD柱同时为正", {"ret_5": ret5, "ret_20": ret20, "macd_hist_pct": macd_hist},
-        all(value is not None and value > 0 for value in (ret5, ret20, macd_hist)),
-        "要求5日收益、20日收益和MACD柱均大于0")
-    excess = _factor_value(item, "relative_strength", "excess_vs_csi300_ret_20")
-    add("outperform_csi300", "20日表现强于沪深300", {"excess_vs_csi300_ret_20": excess},
-        excess is not None and excess > 0, "要求20日相对沪深300超额收益大于0")
-    volume_ratio = observed("price_volume_confirmation", "volume_ratio_5_20")
-    add("volume_confirmation", "5日均量不低于20日均量", {"volume_ratio_5_20": volume_ratio},
-        volume_ratio is not None and volume_ratio >= 1, "要求5日/20日均量比不低于1倍")
-    volatility = observed("risk_liquidity", "volatility_20")
-    if volatility is not None and volatility < 0:
-        volatility = None
-    threshold = zhuan_you_xian_shuzhi((config.get("fenxi") or {}).get("high_volatility_threshold", 0.55))
-    add("bounded_volatility", "20日年化波动未超过既有上限", {"volatility_20": volatility, "high_volatility_threshold": threshold},
-        volatility is not None and threshold is not None and volatility <= threshold,
-        "要求20日年化波动不高于配置上限")
+    add("comparison_evidence", "5日与20日表现具备有效比较基础", {"ret_5": ret5, "ret_20": ret20},
+        True, "同一完整交易日、连续窗口的原始收益；负收益仍可比较，不能称作绝对上涨")
+    conditions.extend(heyan_mingque_tiaojian(item.get("user_conditions") or [], item))
 
     technical_status, technical_outcome, technical_reason = _technical_state(item)
     if deep_reviewed:
+        # 所有双方均有的共享原始值都核对；可选长窗口缺失不阻断有效的短窗口比较。
+        for group in ((item.get("factor") or {}).get("groups") or {}).values():
+            for field, value in (group.get("values") or {}).items():
+                if field not in raw:
+                    continue
+                first, reviewed = zhuan_you_xian_shuzhi(value), zhuan_you_xian_shuzhi(raw[field])
+                if (first is None) != (reviewed is None) or (first is not None and not math.isclose(first, reviewed, rel_tol=1e-10, abs_tol=1e-12)):
+                    conflicts.append(f"{field} 初筛与技术复核的原始值或缺失状态不一致")
         reviewed_histogram = zhuan_you_xian_shuzhi((technical.get("macd") or {}).get("histogram"))
         raw_histogram = zhuan_you_xian_shuzhi(raw.get("macd_hist"))
         close = zhuan_you_xian_shuzhi(raw.get("close"))
-        if raw_histogram is None or reviewed_histogram is None or close is None or close <= 0 or macd_hist is None:
-            conflicts.append("MACD复核缺少原始柱值、收盘价或展示值")
-        elif not math.isclose(raw_histogram / close, macd_hist, rel_tol=1e-10, abs_tol=1e-12) or not math.isclose(raw_histogram, reviewed_histogram, rel_tol=0, abs_tol=0.000050000001):
-            conflicts.append("MACD原始柱、价格归一值与展示值不一致")
+        macd_hist = _factor_value(item, "momentum_reversal", "macd_hist_pct")
+        if any(value is not None for value in (raw_histogram, reviewed_histogram, macd_hist)):
+            if any(value is None for value in (raw_histogram, reviewed_histogram, macd_hist, close)) or close <= 0:
+                conflicts.append("已有MACD证据的原始柱值、收盘价或展示值不完整")
+            elif not math.isclose(raw_histogram / close, macd_hist, rel_tol=1e-10, abs_tol=1e-12) or not math.isclose(raw_histogram, reviewed_histogram, rel_tol=0, abs_tol=0.000050000001):
+                conflicts.append("MACD原始柱、价格归一值与展示值不一致")
         factor_date = pd.to_datetime((item.get("factor") or {}).get("trade_date"), errors="coerce")
         technical_date = pd.to_datetime(technical.get("trade_date"), errors="coerce")
         expected_date = pd.to_datetime((item.get("data_quality") or {}).get("as_of"), errors="coerce")
@@ -366,7 +309,7 @@ def pinggu_shangzhang_tiaojian(
         })
     tradability = item.get("tradability") or {}
     hard_blocks = list(tradability.get("hard_blocks") or [])
-    if deep_reviewed or hard_blocks or tradability.get("basic_execution_feasible") is False:
+    if tradability or deep_reviewed:
         current_required = bool(tradability.get("realtime_required"))
         current_verified = tradability.get("current_quote_verified") is True
         feasible = tradability.get("basic_execution_feasible")
@@ -400,79 +343,86 @@ def pinggu_shangzhang_tiaojian(
     }
 
 
-def _real_amount(item: dict[str, Any]) -> tuple[float | None, str | None]:
-    history = item.get("history")
-    if isinstance(history, pd.DataFrame) and not history.empty:
-        amount = zhuan_you_xian_shuzhi(history.iloc[-1].get("amount_yuan"))
-        if amount is not None and amount > 0:
-            return amount, "latest_completed_daily_bar"
-    tradability = item.get("tradability") or {}
-    if tradability.get("amount_basis") == "latest_completed_daily_bar":
-        amount = zhuan_you_xian_shuzhi(tradability.get("amount_yuan"))
-        if amount is not None and amount > 0:
-            return amount, "latest_completed_daily_bar"
-    return None, None
-
-
 def paixu_shangzhang_houxuan(
     items: list[dict[str, Any]],
     *,
     config: dict[str, Any],
     deep_reviewed: bool = False,
 ) -> list[dict[str, Any]]:
-    """满足条件者优先，再做完整五维非支配分层；不合成标量排序分。"""
+    """先比较20日与5日表现，再按公开的20日优先次序解开同层取舍。"""
     prepared: list[dict[str, Any]] = []
     for item in items:
         result = dict(item)
         selection = pinggu_shangzhang_tiaojian(item, config=config, deep_reviewed=deep_reviewed)
-        amount, amount_basis = _real_amount(item)
         dimensions = {
-            "excess_vs_csi300_ret_20": _factor_value(item, "relative_strength", "excess_vs_csi300_ret_20"),
-            "ret_5": _factor_value(item, "momentum_reversal", "ret_5"),
             "ret_20": _factor_value(item, "momentum_reversal", "ret_20"),
-            "volatility_20": _factor_value(item, "risk_liquidity", "volatility_20"),
-            "amount_yuan": amount,
+            "ret_5": _factor_value(item, "momentum_reversal", "ret_5"),
         }
-        if dimensions["volatility_20"] is not None and dimensions["volatility_20"] < 0:
-            dimensions["volatility_20"] = None
         missing = [field for field, value in dimensions.items() if value is None]
         selection.update({
             "comparison_values": dimensions,
             "comparison_missing_fields": missing,
             "comparison_status": "unavailable" if missing else "complete",
-            "amount_basis": amount_basis,
             "pareto_front": None,
-            "ranking_basis": "先列出满足全部上涨条件且比较数据完整者；完整五维按非支配层排列，波动越低、其余四维越高越优。同层仅按真实成交额和代码稳定展示，不代表上涨概率优劣。缺比较字段者列为观察对象并排后。",
+            "ranking_basis": "在用户明确条件与数据核验通过者中，以20日和5日收益越高越优做非支配分层；同层先20日收益、再5日收益降序。两项完全相同才按代码稳定显示，此时没有优劣证据。两个窗口相关，不视为独立投票；同日同基准的20日超额不重复参与排序。",
+            "preference_order": ["pareto_front_ascending", "ret_20_descending", "ret_5_descending", "code_for_exact_ties"],
         })
         result["selection"] = selection
         prepared.append(result)
 
-    def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
-        lv, rv = left["selection"]["comparison_values"], right["selection"]["comparison_values"]
-        left_values = [value if key != "volatility_20" else -value for key, value in lv.items()]
-        right_values = [value if key != "volatility_20" else -value for key, value in rv.items()]
-        return all(a >= b for a, b in zip(left_values, right_values)) and any(a > b for a, b in zip(left_values, right_values))
-
     for eligible in (True, False):
-        remaining = [i for i, item in enumerate(prepared) if item["selection"]["eligible"] is eligible and not item["selection"]["comparison_missing_fields"]]
-        front = 1
-        while remaining:
-            current = [i for i in remaining if not any(dominates(prepared[j], prepared[i]) for j in remaining if j != i)]
-            for index in current:
-                prepared[index]["selection"]["pareto_front"] = front
-            chosen = set(current)
-            remaining = [index for index in remaining if index not in chosen]
-            front += 1
+        pool = [item for item in prepared if item["selection"]["eligible"] is eligible and not item["selection"]["comparison_missing_fields"]]
+        pool.sort(key=lambda item: (-item["selection"]["comparison_values"]["ret_20"], -item["selection"]["comparison_values"]["ret_5"]))
+        # 二维前沿深度用前缀最大值计算，避免全市场逐层全对全的三次复杂度。
+        positions = {value: index for index, value in enumerate(sorted({item["selection"]["comparison_values"]["ret_5"] for item in pool}, reverse=True), 1)}
+        tree = [0] * (len(positions) + 1)
+        previous_pair, previous_front = None, 0
+        for item in pool:
+            values = item["selection"]["comparison_values"]
+            pair = (values["ret_20"], values["ret_5"])
+            position = positions[pair[1]]
+            if pair == previous_pair:
+                front = previous_front  # 完全相同的观测不相互支配。
+            else:
+                cursor, depth = position, 0
+                while cursor > 0:
+                    depth = max(depth, tree[cursor])
+                    cursor -= cursor & -cursor
+                front = depth + 1
+            item["selection"]["pareto_front"] = front
+            cursor = position
+            while cursor < len(tree):
+                tree[cursor] = max(tree[cursor], front)
+                cursor += cursor & -cursor
+            previous_pair, previous_front = pair, front
 
     def display_order(item: dict[str, Any]) -> tuple[Any, ...]:
         selection = item["selection"]
         complete = not selection["comparison_missing_fields"]
         category = 0 if complete and selection["eligible"] else 1 if complete else 2
-        amount = selection["comparison_values"]["amount_yuan"]
-        return (category, selection["pareto_front"] or math.inf, amount is None,
-                -amount if amount is not None else 0, str(item.get("ts_code") or ""))
+        values = selection["comparison_values"]
+        return (category, selection["pareto_front"] or math.inf,
+                -(values["ret_20"] if values["ret_20"] is not None else -math.inf),
+                -(values["ret_5"] if values["ret_5"] is not None else -math.inf), str(item.get("ts_code") or ""))
 
-    return sorted(prepared, key=display_order)
+    ordered = sorted(prepared, key=display_order)
+    eligible_pool = [item for item in ordered if item["selection"]["eligible"]]
+    equivalent_counts = Counter(tuple(item["selection"]["comparison_values"].values()) for item in eligible_pool)
+    for index, item in enumerate(eligible_pool):
+        selection = item["selection"]
+        selection["comparison_rank"] = index + 1
+        selection["comparison_pool_size"] = len(eligible_pool)
+        selection["equivalent_performance_count"] = equivalent_counts[tuple(selection["comparison_values"].values())]
+        selection["absolute_performance"] = "两个窗口均上涨" if all(value > 0 for value in selection["comparison_values"].values()) else "至少一个窗口未上涨；相对优选不等于绝对走强"
+        other = eligible_pool[index + 1] if index + 1 < len(eligible_pool) else None
+        if other is not None:
+            right = other["selection"]
+            reason = "非支配层次更靠前" if selection["pareto_front"] < right["pareto_front"] else "同层按公开的20日表现优先规则取舍" if selection["comparison_values"] != right["comparison_values"] else "表现完全相同，仅按代码稳定显示，没有优劣证据"
+            selection["comparison_to_next"] = {"ts_code": other["ts_code"], "name": other.get("name"), "reason": reason,
+                                                "role": "comparison_reference",
+                                                "current_values": selection["comparison_values"], "next_values": right["comparison_values"],
+                                                "next_pareto_front": right["pareto_front"]}
+    return ordered
 
 
 def goujian_kejiaoyixing_zhaiyao(
@@ -500,8 +450,13 @@ def goujian_kejiaoyixing_zhaiyao(
     )
     hard_blocks: list[str] = []
     cautions: list[str] = []
-    if amount is None or amount < minimum_amount:
-        hard_blocks.append("最新完整日线成交额低于统一流动性底线")
+    if amount is None or amount <= 0:
+        hard_blocks.append("最新完整日线成交额缺失、无效或没有成交")
+    elif amount < minimum_amount:
+        cautions.append("最新完整日线成交额低于流动性观察基准；该基准不是默认选股限制")
+    completed_volume = zhuan_you_xian_shuzhi(latest.get("volume"))
+    if completed_volume is None or completed_volume <= 0:
+        hard_blocks.append("最新完整日线成交量缺失、无效或没有成交")
     if snapshot.get("status") != "ok":
         cautions.append("实时快照不可用，完整日线只能提供历史成交参考")
     current_price = zhuan_you_xian_shuzhi(
@@ -722,11 +677,17 @@ def goujian_houxuan_zhaiyao(
         *[str(value) for value in (item.get("tradability") or {}).get("cautions", [])],
         *[str(value) for value in item.get("risks") or []],
     ]))
+    name = str(item.get("name") or "")
+    if "ST" in name.upper():
+        risks.append("本次股票简称含ST标记；保留事实，不作为未提出的选股排除条件")
+    if "退" in name:
+        risks.append("本次股票简称含退市标记，须结合有来源的退市安排解释")
     diagnosis = goujian_dangu_zhaiyao(
         technical=technical, fundamentals=item.get("fundamental") or {}, risks=risks,
         evidence_gaps=evidence_gaps, as_of=str((item.get("data_quality") or {}).get("as_of") or technical.get("trade_date") or "未取得日期"),
         factor_analysis=item.get("factor"), pattern=pattern, late=late,
         supplemental=item.get("supplemental_diagnostics"),
+        snapshot=item.get("snapshot"), tradability=item.get("tradability"),
     )
     return {
         "rank": rank,
@@ -755,7 +716,6 @@ def goujian_houxuan_zhaiyao(
 
 
 __all__ = [
-    "choushu_liudongxing_houxuan",
     "goujian_houxuan_zhaiyao",
     "goujian_kejiaoyixing_zhaiyao",
     "goujian_kuaizhao_jilu",

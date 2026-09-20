@@ -12,6 +12,7 @@ import pandas as pd
 from src.ashare.dangu_lianghua import yunxing_dangu_tongyi_lianghua
 from src.ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
 from src.ashare.gupiao_yanjiu import zongjie_jishu
+from src.ashare.fenxi_wenti import pinggu_yanjiu_wenti
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 from src.ashare.xuangu_guize import goujian_kejiaoyixing_zhaiyao
 
@@ -125,7 +126,8 @@ def _collect_gaps(technical, fundamentals, snapshot, unified) -> list[dict[str, 
     return result
 
 
-def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShangxiawen) -> dict[str, Any]:
+def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShangxiawen,
+                research_question: dict[str, Any] | None = None) -> dict[str, Any]:
     query = " ".join(str(gupiao or "").split())
     if not query:
         return _failure(query, status="clarification_required", outcome="clarification_required", code="stock_query_missing", stage="request_validation", error="请提供股票名称或代码")
@@ -221,10 +223,16 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         risks.append("股票简称含ST风险标记，需结合风险警示说明理解；本次仍保留完整分析")
     if "退" in name:
         risks.append("股票简称含退市风险标记，需核对退市安排")
+    question_assessment = pinggu_yanjiu_wenti(research_question, {
+        "name": name, "profile": unified.get("comparison_profile") or stock, "history": history,
+        "factor": unified.get("factor_analysis"), "technical": technical, "fundamental": fundamentals,
+        "pattern": unified.get("limit_up_pullback_pattern"), "data_quality": {"as_of": as_of},
+    })
     summary = goujian_dangu_zhaiyao(
         technical=technical, fundamentals=fundamentals, risks=risks, evidence_gaps=gaps, as_of=as_of,
         factor_analysis=unified.get("factor_analysis"), pattern=unified.get("limit_up_pullback_pattern"),
         late=unified.get("late_session_analysis"), supplemental=unified.get("supplemental_diagnostics"),
+        research_assessment=question_assessment, snapshot=snapshot, tradability=tradability,
     )
     status = "error" if technical.get("status") == "error" else "partial" if gaps else "ok"
     confirmation = "intraday_provisional" if clock.get("session_status") in {"opening_auction", "trading", "midday_break"} else "close_pending" if clock.get("session_status") == "close_pending" else "completed_daily_close"
@@ -237,6 +245,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         "result_confirmation": confirmation, "recommendation_available": False,
         "primary": None, "alternatives": [],
         "diagnosis_summary": summary, "plain_language_summary": summary["summary"],
+        "research_question": question_assessment,
         "reassessment_conditions": summary["reassessment_conditions"],
         "technical_summary": technical, "daily_factor_analysis": unified.get("factor_analysis"),
         "fundamental_analysis": fundamentals,

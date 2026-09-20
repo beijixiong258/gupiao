@@ -1193,20 +1193,21 @@ class AgentLoop:
             anchor = {key: payload[key] for key in (
                 "status", "outcome", "selection_outcome", "analysis_type", "analysis_id", "as_of", "generated_at",
                 "scope", "candidate_counts", "selection_limits", "recommendation_available", "no_recommendation_reason",
+                "comparison_coverage", "selection_methodology", "user_conditions", "market_cap_filter",
                 "indicator_definitions",
             ) if key in payload}
             candidates = [payload] if payload.get("analysis_type") == "single_stock_analysis" else [
                 payload.get("primary"), *(payload.get("alternatives") or []), *(payload.get("diagnostic_candidates") or []),
             ]
             anchor["completed_reports"] = [{
-                **{key: item[key] for key in ("stock", "name", "ts_code", "diagnosis_summary", "selection_analysis", "risks", "evidence_gaps", "data_quality", "reassessment_conditions") if key in item},
+                **{key: item[key] for key in ("stock", "name", "ts_code", "diagnosis_summary", "research_question", "selection_analysis", "market_cap_check", "risks", "evidence_gaps", "data_quality", "reassessment_conditions") if key in item},
                 "raw_factor_groups": {key: {field: value for field, value in group.items() if field != "metric_definitions"}
                                       for key, group in (item.get("daily_factor_analysis") or {}).get("groups", {}).items()},
             } for item in candidates if isinstance(item, dict)]
             messages.append(_TransientMessage(role="user", content=(
                 "本轮分析已完成，以下是程序保留的当前结果，优先于可能遗漏状态的对话摘要。直接解释结果和缺口；"
                 "不要重新选范围、重复分析或再确认。按所附指标定义解释，不能根据英文缩写猜测含义。"
-                "合格数量仅针对已复核对象，达到目标数量而停止不代表范围内只有这些股票合格。"
+                "合格数量统计全部已复核对象，与展示数不同；按实际覆盖说明优选依据和局限，不能遗漏用户明确条件。"
                 "正文简洁归纳支持、反证、缺口和复评条件；完整指标公式及组件将由展示层补齐。\n" + json.dumps(anchor, ensure_ascii=False)
             )))
 

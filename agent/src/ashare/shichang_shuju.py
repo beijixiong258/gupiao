@@ -1431,9 +1431,15 @@ def _jiancha_qfq_lishi_zhiliang(
         reasons.append("insufficient_session_coverage")
     if required_latest is None or latest != required_latest:
         reasons.append("latest_session_missing")
+    observed_rows = int(len(data))
+    missing_sessions = sorted(relevant - actual_dates)
+    if missing_sessions and not reasons:
+        # 质量可接受的局部缺口也必须进入时间轴；不能把两侧价格拼成连续收益/EMA窗口。
+        data = data.set_index("trade_date").reindex(sorted(relevant)).rename_axis("trade_date").reset_index()
     return data, {
         "accepted": not reasons,
-        "rows": int(len(data)),
+        "rows": observed_rows,
+        "missing_sessions_inserted": len(missing_sessions) if not reasons else 0,
         "session_coverage": round(float(coverage), 4),
         "latest_date": latest.strftime("%Y-%m-%d") if latest is not None else None,
         "required_latest_date": required_latest.strftime("%Y-%m-%d") if required_latest is not None else None,
@@ -1601,6 +1607,7 @@ def huoqu_piliang_qfq_lishi(
         "quality_failures": quality_failures[:20],
         "quality_failure_count": len(quality_failures),
         "source_counts": source_counts,
+        "source_by_code": source_by_code,
         "primary_source": primary_meta,
         "secondary_source": secondary_meta,
         "fallback_attempted_stocks": len(secondary_codes),

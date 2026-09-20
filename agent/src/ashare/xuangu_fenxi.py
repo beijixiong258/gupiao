@@ -10,6 +10,7 @@ from src.ashare.buchong_zhenduan import goujian_buchong_zhenduan
 from src.ashare.fanwei_faxian import shencha_fanwei_houxuan
 from src.ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from src.ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
+from src.ashare.fenxi_wenti import jiexi_xuangu_tiaojian, jiexi_yanjiu_wenti
 from src.ashare.dangu_fenxi import DANGU_ANALYSIS_TYPE, fenxi_dangu
 from src.ashare.fenxi_yinzi import (
     goujian_fenxi_yinzi_mianban,
@@ -29,7 +30,6 @@ from src.ashare.xuangu_fanwei import (
     huoqu_houxuanchi_celue,
 )
 from src.ashare.xuangu_guize import (
-    choushu_liudongxing_houxuan,
     goujian_houxuan_zhaiyao,
     goujian_kejiaoyixing_zhaiyao,
     goujian_kuaizhao_jilu,
@@ -102,12 +102,15 @@ class XuanguFenxiFuWu:
         self, fanwei: FenxiFanwei, *, requested_count: int | None = None,
         market_cap_condition: dict[str, Any] | None = None,
         scope_choice: dict[str, Any] | None = None,
+        user_conditions: list[dict[str, Any]] | None = None,
+        research_question: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if fanwei.leixing is FanweiLeixing.DANGU_GUPIAO:
             return fenxi_dangu(
                 gupiao=str(fanwei.gupiao or ""),
                 config=self._config,
                 context=self._context,
+                research_question=research_question,
             )
         settings = self._config["fenxi"]
         requested_count = _normalize_requested_count(requested_count)
@@ -207,7 +210,7 @@ class XuanguFenxiFuWu:
                 "no_recommendation_reason": (
                     "候选的基础价量或市值证据存在缺失，暂时无法完整确认是否合格"
                     if incomplete else "通过基础检查的候选均未满足指定市值条件"
-                    if market_cap_condition and base_filtered_count else "全部候选都触发了风险硬过滤"
+                    if market_cap_condition and base_filtered_count else "全部候选均未通过数据或基础成交核验"
                 ),
                 "primary": None,
                 "alternatives": [],
@@ -219,22 +222,66 @@ class XuanguFenxiFuWu:
                                      "technical_reviewed": 0, "deep_reviewed": 0, "qualified": 0, "displayed": 0},
                 "filter_summary": {"input_count": len(data), "rejected_count": len(rejected), "examples": rejected[:20]},
             }
-        prefiltered = choushu_liudongxing_houxuan(filtered, int(settings["prefilter_limit"]))
+        # 尽早获取本次快照，避免全范围历史计算后才取盘中证据，偏离请求时点。
+        clock = self._context.shichang_shizhong()
+        late_stage = panduan_weipan_jieduan(clock, self._config["weipan"])
+        realtime_table = pd.DataFrame()
+        realtime_meta: dict[str, Any] = {"status": "not_requested", "source": None}
+        realtime_required = xuyao_shishi_kuaizhao(clock, late_stage)
+        if realtime_required:
+            has_scope_snapshot = bool(
+                pool.metadata.get("constituent_source")
+                and {"ts_code", "latest_price", "amount_yuan"}.issubset(filtered.columns)
+            )
+            if has_scope_snapshot:
+                realtime_table = filtered.copy()
+                realtime_meta = {
+                    "status": "ok",
+                    "source": pool.metadata.get("constituent_source"),
+                    "captured_at": pool.metadata.get("constituent_fetched_at"),
+                    "rows": int(len(realtime_table)),
+                    "timeliness": "命名范围成分接口与候选池同次获取，未重复下载全市场快照",
+                    "persistence": "none",
+                }
+            else:
+                try:
+                    realtime_table, realtime_meta = self._context.shishi_kuaizhao()
+                except Exception as exc:
+                    realtime_table, realtime_meta = pd.DataFrame(), {
+                        "status": "unavailable", "source": "remote_realtime_snapshot", "error": str(exc),
+                    }
+            if not realtime_table.empty:
+                realtime_table = realtime_table.set_index("ts_code", drop=False)
+        # 批大小只控制一次取数规模，不再按成交额抽样或截断范围。
+        prefiltered = filtered.sort_values("ts_code", kind="stable").reset_index(drop=True)
         start_date = (analysis_date - pd.Timedelta(days=int(settings["history_calendar_days"]))).strftime("%Y%m%d")
         end_date = analysis_date.strftime("%Y%m%d")
-        histories, history_meta = self._context.piliang_lishi(
-            prefiltered["ts_code"].tolist(),
-            start_date=start_date,
-            end_date=end_date,
-            minimum_rows=int(settings["minimum_history_rows"]),
-        )
+        histories: dict[str, pd.DataFrame] = {}
+        history_batches: list[dict[str, Any]] = []
+        batch_size = int(settings.get("history_batch_size", settings.get("prefilter_limit", 240)))
+        codes = prefiltered["ts_code"].tolist()
+        for offset in range(0, len(codes), batch_size):
+            batch_codes = codes[offset:offset + batch_size]
+            try:
+                batch, metadata = self._context.piliang_lishi(
+                    batch_codes, start_date=start_date, end_date=end_date, minimum_rows=1,
+                )
+                histories.update({code: frame for code, frame in batch.items() if code in batch_codes})
+            except Exception as exc:
+                metadata = {"status": "unavailable", "error": str(exc), "requested_stocks": len(batch_codes), "loaded_stocks": 0}
+            history_batches.append(metadata)
+        history_meta = {
+            "status": "ok" if len(histories) == len(codes) else "partial" if histories else "unavailable",
+            "source": "+".join(dict.fromkeys(str(batch["source"]) for batch in history_batches if batch.get("source"))),
+            "requested_stocks": len(codes), "loaded_stocks": len(histories), "batch_size": batch_size,
+            "batches": history_batches, "persistence": "none",
+        }
         history_loaded_count = len(histories)
         histories, history_rejected = guolv_lishi_wanzhengxing(
             histories,
             analysis_date=analysis_date,
-            minimum_rows=int(settings["minimum_history_rows"]),
-            minimum_amount=float(settings["min_amount_yuan"]),
-            minimum_listing_calendar_days=int(settings["minimum_listing_calendar_days"]),
+            minimum_rows=21,  # 20日已实现收益需要21条价格；与上市时长偏好无关。
+            minimum_amount=0,
         )
         rejected.extend(history_rejected)
         if not histories:
@@ -287,6 +334,7 @@ class XuanguFenxiFuWu:
             ready_profiles,
             source="auto",
             calendar=self._context.jiaoyi_rili(start_date=start_date, end_date=end_date),
+            latest_only=True,
         )
         if panel.empty:
             raise RuntimeError("候选日 K 因子面板为空")
@@ -299,42 +347,13 @@ class XuanguFenxiFuWu:
         factor_map = huizong_houxuan_yinzi(latest_panel, config=settings)
         profile_subset = ready_profiles[ready_profiles["ts_code"].isin(factor_map)].copy().reset_index(drop=True)
         fundamental_map = jisuan_hengjiemian_jibenmian(profile_subset)
-        clock = self._context.shichang_shizhong()
-        late_stage = panduan_weipan_jieduan(clock, self._config["weipan"])
-        realtime_table = pd.DataFrame()
-        realtime_meta: dict[str, Any] = {"status": "not_requested", "source": None}
-        realtime_required = xuyao_shishi_kuaizhao(clock, late_stage)
-        if realtime_required:
-            has_scope_snapshot = bool(
-                pool.metadata.get("constituent_source")
-                and {"ts_code", "latest_price", "amount_yuan"}.issubset(profile_subset.columns)
-            )
-            if has_scope_snapshot:
-                realtime_table = profile_subset.copy()
-                realtime_meta = {
-                    "status": "ok",
-                    "source": pool.metadata.get("constituent_source"),
-                    "captured_at": pool.metadata.get("constituent_fetched_at"),
-                    "rows": int(len(realtime_table)),
-                    "timeliness": "命名范围成分接口与候选池同次获取，未重复下载全市场快照",
-                    "persistence": "none",
-                }
-            else:
-                try:
-                    realtime_table, realtime_meta = self._context.shishi_kuaizhao()
-                except Exception as exc:
-                    realtime_table, realtime_meta = pd.DataFrame(), {
-                        "status": "unavailable", "source": "remote_realtime_snapshot", "error": str(exc),
-                    }
-            if not realtime_table.empty:
-                realtime_table = realtime_table.set_index("ts_code", drop=False)
         completed_quote_is_current = bool(
             quote_is_completed
             and analysis_date.normalize() == pd.Timestamp(self._context.reference.date())
         )
         profiles_by_code = profile_subset.set_index("ts_code", drop=False)
         preliminary: list[dict[str, Any]] = []
-        factor_limit = int(settings["factor_candidate_limit"])
+        factor_limit = len(factor_map)
         factor_order = sorted(factor_map)
         for code in factor_order:
             if code not in profiles_by_code.index or code not in histories:
@@ -377,14 +396,8 @@ class XuanguFenxiFuWu:
                 config=self._config,
             )
             if realtime_blocks:
-                rejected.append(
-                    {
-                        "ts_code": code,
-                        "name": name,
-                        "reasons": realtime_blocks,
-                    }
-                )
-                continue
+                quote_check["hard_blocks"].extend(realtime_blocks)
+                quote_check.update(status="blocked", basic_execution_feasible=False)
             pattern = fenxi_zhangting_huimaqiang(
                 histories[code],
                 code=code,
@@ -412,23 +425,22 @@ class XuanguFenxiFuWu:
                 "pattern": pattern,
                 "late": late,
                 "technical": {},
+                "user_conditions": user_conditions or [],
                 "tradability": quote_check,
                 "data_quality": {
-                    "history_source": history_meta.get("source"),
+                    "history_source": next((batch.get("source_by_code", {}).get(code) or batch.get("source") for batch in history_batches if code in (batch.get("source_by_code") or {})), history_meta.get("source")),
                     "history_rows": int(len(histories[code])),
                     "as_of": analysis_date.strftime("%Y-%m-%d"),
                     "realtime_source": snapshot.get("source"),
                 },
             }
             preliminary.append(item)
-        preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config)[:factor_limit]
-        # 本地技术复核可继续检查后续候选；远端财务和分钟请求仍受原上限约束。
-        # 已明确未满足基础条件者不消耗补充来源请求，仅在没有合格者时保留一个观察报告。
+        preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config)
+        # 完整比较与技术核验先完成；展示数量只限制昂贵的财务和分钟补充报告。
         review_pool = [item for item in preliminary if item["selection"]["eligible"]]
         if not review_pool:
             review_pool = preliminary[:1]
         technical_reviewed: list[dict[str, Any]] = []
-        deep_candidates: list[dict[str, Any]] = []
         review_stop_reason = "candidate_pool_exhausted"
         for item in review_pool:
             try:
@@ -460,13 +472,9 @@ class XuanguFenxiFuWu:
             if item["selection"]["outcome"] == "program_error":
                 review_stop_reason = "program_error"
                 break
-            if item["selection"]["eligible"]:
-                deep_candidates.append(item)
-                if len(deep_candidates) >= display_target:
-                    review_stop_reason = "display_target_reached"
-                    break
-        if not deep_candidates and technical_reviewed:
-            deep_candidates = technical_reviewed[:1]
+        technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True)
+        qualified_reviewed = [item for item in technical_reviewed if item["selection"]["eligible"]]
+        deep_candidates = qualified_reviewed[:display_target] or technical_reviewed[:1]
         technical_errors = [
             {"ts_code": item["ts_code"], "reason": item["technical"].get("error") or item["technical"].get("reason")}
             for item in technical_reviewed if item["selection"]["outcome"] == "program_error"
@@ -502,19 +510,7 @@ class XuanguFenxiFuWu:
                 as_of_date=analysis_date.strftime("%Y-%m-%d"),
                 minimum_amount_yuan=float(settings["min_amount_yuan"]),
             )
-            item["tradability"] = goujian_kejiaoyixing_zhaiyao(
-                code=item["ts_code"],
-                name=item["name"],
-                snapshot=item["snapshot"],
-                history=item["history"],
-                minimum_amount=float(settings["min_amount_yuan"]),
-                realtime_required=str(clock.get("session_status")) in {
-                    "opening_auction", "trading", "midday_break", "close_pending",
-                },
-                reference_time=self._context.reference,
-                market_clock=clock,
-            )
-        deep_candidates = paixu_shangzhang_houxuan(deep_candidates, config=self._config, deep_reviewed=True)
+            item["selection"].update(pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True))
         summaries = [
             goujian_houxuan_zhaiyao(
                 item,
@@ -530,6 +526,8 @@ class XuanguFenxiFuWu:
         alternatives = qualified[1 : 1 + int(settings["backup_limit"])]
         recommendation_available = primary is not None
         reviewed_codes = {item["ts_code"] for item in technical_reviewed}
+        reviewed_by_code = {item["ts_code"]: item for item in technical_reviewed}
+        preliminary = [reviewed_by_code.get(item["ts_code"], item) for item in preliminary]
         condition_checks = [
             {
                 "ts_code": item["ts_code"], "name": item["name"],
@@ -611,7 +609,7 @@ class XuanguFenxiFuWu:
                 if technical_errors
                 else "部分候选的必需证据尚未取得或核验，当前无法完整确认是否合格；不能将数据不足解释为全部股票不满足条件"
                 if selection_outcome == "evidence_unavailable"
-                else "当前样本中没有股票同时满足趋势、动量、相对强弱、量能、波动和可交易性条件；具体缺项与反证已保留"
+                else "当前范围中没有股票同时通过用户明确条件、比较数据和适用的成交核验；具体缺项与反证已保留"
             ),
             "selection_limits": {
                 "maximum_alternatives": int(settings["backup_limit"]),
@@ -622,6 +620,14 @@ class XuanguFenxiFuWu:
                 "review_stop_reason": review_stop_reason,
             },
             "displayed_candidate_count": int(bool(primary)) + len(alternatives),
+            "user_conditions": user_conditions or [],
+            "comparison_coverage": {
+                "method": "all_scope_members_in_batches", "sampled": False,
+                "scope_input": len(data), "history_requested": len(codes), "factor_ready": len(factor_map),
+                "technical_review_planned": len(review_pool), "technical_reviewed": len(technical_reviewed),
+                "complete": not source_partial and not undecided_count and not technical_errors,
+                "limitation": "覆盖只指本次已核验范围；数据失败与条件缺失逐项保留，未取得者不能视为已比较。",
+            },
             "candidate_condition_checks": condition_checks,
             "candidate_counts": {
                 "scope_input": int(len(data)),
@@ -634,7 +640,7 @@ class XuanguFenxiFuWu:
                 "after_factor_limit": int(len(preliminary)),
                 "technical_reviewed": int(len(technical_reviewed)),
                 "deep_reviewed": int(len(deep_candidates)),
-                "qualified": int(len(qualified)),
+                "qualified": 0 if technical_errors else int(len(qualified_reviewed)),
                 "unverified": int(undecided_count),
                 "displayed": int(bool(primary)) + len(alternatives),
             },
@@ -642,9 +648,9 @@ class XuanguFenxiFuWu:
                 "rejected_count": int(len(rejected)),
                 "rejected_examples": rejected[:20],
                 "rules": [
-                    "ST、退市风险和不稳定新股不进入排序",
-                    "无有效价格、成交量、成交额或完整分析日的股票不进入排序",
-                    "一字涨停、历史不足和低于流动性底线的股票不进入排序",
+                    "默认不按ST、上市时长、波动率或成交额大小施加风险偏好",
+                    "完整分析日、有效价量和20日比较窗口必须可核验；缺失不是通过",
+                    "保留适用的当前成交及一字涨停核验；额外限制仅来自用户明确条件",
                 ],
             },
             "data_provenance": {
@@ -654,11 +660,12 @@ class XuanguFenxiFuWu:
                 "realtime_snapshot": realtime_meta,
             },
             "selection_methodology": {
-                "method": "explicit_conditions_then_pareto_fronts",
-                "conditions": "价格和短均线高于MA20、5/20日收益为正且MACD柱为正、20日跑赢沪深300、5/20日量比不低于1、波动未超过上限、深度复核与可交易性通过",
-                "comparison_dimensions": ["20日相对沪深300超额", "5日收益", "20日收益", "20日波动（越低越好）", "完整日线真实成交额"],
-                "ranking_basis": "满足条件后按多维不劣且至少一维更优的关系分层；同层按成交额和代码稳定展示，不代表上涨概率高低",
-                "sampling_limit": "只比较本次抽样取得并完成复核的候选；本地技术复核顺序补位，达到展示目标或候选上限即停止，完整报告和分钟请求各有上限，不等于已经遍历全市场所有机会",
+                "method": "user_constraints_then_performance_pareto_and_explicit_priority",
+                "conditions": "用户明确条件、有效比较窗口、技术一致性及本次适用的成交核验；未指定时不追加风险或全部看涨条件",
+                "comparison_dimensions": ["20日已实现收益", "5日已实现收益"],
+                "ranking_basis": "先按两窗口表现非支配分层，同层优先20日表现、再5日表现；完全相同按代码展示并标明并列。20日与5日有重叠，不能作独立确认。均线、MACD、量价和形态解释优势与反证，不假定越大越好。",
+                "best_definition": "最优指在本次实际可核验候选中，按公开技术表现比较规则排在前面的个股；不以财务或未来收益的综合优劣替代这个定义",
+                "sampling_limit": "范围成分分批全量请求，完整比较并复核潜在合格者后才裁剪展示。财务与分钟补充仅服务最终候选，各守既有上限；来源失败时明确覆盖缺口。",
                 "missing_evidence": "必需条件缺失不能视为通过，保留原因供复核",
                 "llm_boundary": "解释实际指标与证据冲突，不生成分数、权重或上涨概率，不将候选排序说成经验证的概率排名",
             },
@@ -687,6 +694,8 @@ def fenxi_xuangu(
     shizhi: dict[str, Any] | None = None,
     context: FenxiShujuShangxiawen | None = None,
     scope_choice: dict[str, Any] | None = None,
+    tiaojian: dict[str, Any] | None = None,
+    yanjiu_wenti: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """自然语言智能体调用的统一分析入口。"""
     analysis_type = DANGU_ANALYSIS_TYPE if str(fanwei or "").strip().lower() in {
@@ -700,6 +709,8 @@ def fenxi_xuangu(
     try:
         resolved_scope = FenxiFanwei.create(fanwei, mingcheng, gupiao)
         market_cap_condition = None
+        user_conditions = []
+        research_question = jiexi_yanjiu_wenti(yanjiu_wenti)
         if resolved_scope.leixing is not FanweiLeixing.DANGU_GUPIAO:
             try:
                 market_cap_condition = jiexi_shizhi_tiaojian(shizhi)
@@ -715,12 +726,28 @@ def fenxi_xuangu(
                     "recommendation_available": False, "primary": None, "alternatives": [],
                     "displayed_candidate_count": 0,
                 }
+            try:
+                user_conditions = jiexi_xuangu_tiaojian(tiaojian)
+            except ValueError as exc:
+                question = str(exc)
+                return {
+                    "status": "clarification_required", "outcome": "clarification_required",
+                    "tool_contract_version": XUANGU_TOOL_CONTRACT_VERSION,
+                    "analysis_type": analysis_type, "stage": "request_validation",
+                    "error_code": "selection_condition_required", "error": question,
+                    "clarification": {"kind": "selection_condition", "title": "确认选股条件", "question": question},
+                    "requested_candidate_count": _normalize_requested_count(shuliang),
+                    "recommendation_available": False, "primary": None, "alternatives": [],
+                    "displayed_candidate_count": 0,
+                }
         config, _ = jiazai_lianghua_peizhi()
         request_context = context or FenxiShujuShangxiawen()
         result = XuanguFenxiFuWu(config=config, context=request_context).fenxi(
             resolved_scope, requested_count=_normalize_requested_count(shuliang),
             market_cap_condition=market_cap_condition,
             scope_choice=scope_choice,
+            user_conditions=user_conditions,
+            research_question=research_question,
         )
         return xianzhi_xuangu_jieguo(result, shuliang)
     except WangluoQingqiuYichang as exc:

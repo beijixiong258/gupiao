@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -39,6 +40,7 @@ def _code(value: Any) -> str | None:
 def _comparison_pool(
     universe: pd.DataFrame, *, code: str, name: str, industry: str,
     target_profile: dict[str, Any], config: dict[str, Any],
+    analysis_date: pd.Timestamp,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """有界同行参照只用于比较，不把选股过滤器套在被点名股票上。"""
     if universe is None or universe.empty or "ts_code" not in universe:
@@ -49,11 +51,10 @@ def _comparison_pool(
     for column in ("name", "industry"):
         if column not in data:
             data[column] = ""
-        data[column] = data[column].fillna("").astype(str)
-    amount = pd.to_numeric(data.get("amount_yuan", pd.Series(index=data.index, dtype=float)), errors="coerce")
-    data = data.assign(_amount_order=amount).sort_values("_amount_order", ascending=False, na_position="last")
+        data[column] = data[column].fillna("").astype(str).str.strip()
+    data.loc[data["industry"].str.lower().isin({"unknown", "nan", "none", "未知", "未分类"}), "industry"] = ""
     found = data[data["ts_code"].eq(code)]
-    current = {**target_profile, **(found.iloc[0].drop(labels=["_amount_order"]).to_dict() if not found.empty else {})}
+    current = {**target_profile, **(found.iloc[0].to_dict() if not found.empty else {})}
     if target_profile.get("valuation_is_complete_daily") is True:
         # 目标日终估值已经核验；比较池的空字段或未核验快照不得覆盖它。
         for field in (
@@ -63,25 +64,48 @@ def _comparison_pool(
         ):
             current[field] = target_profile.get(field)
     current["name"] = name if name and name != code else current.get("name") or code
-    current["industry"] = industry or current.get("industry") or ""
+    verified_industry = str(industry or "").strip()
+    current["industry"] = (verified_industry if verified_industry.lower() not in {"", "unknown", "nan", "none", "未知", "未分类"}
+                           else current.get("industry") or "")
     current["peer_role"] = "target"
     peers = data[data["ts_code"].ne(code)].copy()
+    def verified_size(row: dict[str, Any] | pd.Series) -> float | None:
+        dates = pd.to_datetime([row.get("trade_date"), row.get("valuation_trade_date")], errors="coerce")
+        value = pd.to_numeric(row.get("total_market_value_yuan"), errors="coerce")
+        if (row.get("valuation_is_complete_daily") is True and row.get("valuation_source") == "tushare_daily_basic"
+                and dates.notna().all() and (dates.normalize() == analysis_date.normalize()).all()
+                and pd.notna(value) and math.isfinite(float(value)) and value > 0):
+            return float(value)
+        return None
+    target_size = verified_size(current)
+    peers["_size_distance"] = [
+        abs(math.log(size / target_size)) if target_size is not None and (size := verified_size(row)) is not None else math.inf
+        for _, row in peers.iterrows()
+    ]
+    peers = peers.sort_values(["_size_distance", "ts_code"], kind="stable")
     settings = config.get("dangu") or {}
     maximum = max(1, int(settings.get("max_peer_stocks", 20)))
     same_limit = max(0, min(maximum - 1, int(settings.get("same_industry_stocks", 16))))
-    same = peers[peers["industry"].eq(current["industry"])].head(same_limit) if current["industry"] else peers.iloc[:0]
-    other = peers[~peers["ts_code"].isin(same["ts_code"])].head(maximum - 1 - len(same))
+    same_pool = peers[peers["industry"].eq(current["industry"])] if current["industry"] else peers.iloc[:0]
+    same = same_pool.head(same_limit)
+    other = peers[~peers["ts_code"].isin(same_pool["ts_code"])].copy()
+    other["_industry_round"] = other.groupby("industry", sort=False).cumcount()
+    other = other.sort_values(["_industry_round", "_size_distance", "ts_code"], kind="stable").head(maximum - 1 - len(same))
     selected = pd.concat([
         pd.DataFrame([current]), same.assign(peer_role="same_industry"),
         other.assign(peer_role="market_reference"),
-    ], ignore_index=True, sort=False).drop(columns=["_amount_order"], errors="ignore")
+    ], ignore_index=True, sort=False).drop(columns=["_size_distance", "_industry_round"], errors="ignore")
     return selected, {
         "status": "ok" if len(selected) > 1 else "partial",
         "selected_stocks": len(selected),
         "configured_peer_limit": maximum,
         "same_industry_stocks": len(same),
-        "selection_method": "优先本次真实行业标签一致的股票，再按成交额补足有界市场参照",
-        "known_bias": "本次横截面及有界参照，不是历史完整行业成分或全市场统计",
+        "available_same_industry_stocks": len(same_pool),
+        "size_matched_stocks": int(same["_size_distance"].map(math.isfinite).sum()),
+        "target_size_verified": target_size is not None,
+        "size_basis": "同一完整交易日日终总市值；按总市值比值的绝对对数距离由近及远取样",
+        "selection_method": "先取真实行业相同且已核验总市值相近的同行；规模缺失者按代码稳定补位，其他行业按轮次补足市场参照",
+        "known_bias": "本次有界同行及市场参照，不是全行业或全市场统计；仅有行业标签时不能声称已核验主营业务完全可比。市值缺失不假装匹配成功。",
     }
 
 
@@ -120,6 +144,7 @@ def yunxing_dangu_tongyi_lianghua(
         profiles, pool_meta = _comparison_pool(
             universe, code=code, name=name, industry=industry,
             target_profile=target_profile, config=config,
+            analysis_date=analysis_date,
         )
         profiles.attrs.update({key: universe_meta[key] for key in ("source", "as_of", "captured_at") if key in universe_meta})
         if pool_meta["status"] != "ok":

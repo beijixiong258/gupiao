@@ -33,7 +33,7 @@ def _number(value: Any, digits: int | None = None) -> float | None:
     return (round(number, digits) if digits is not None else number) if np.isfinite(number) else None
 
 
-def zengjia_hengjiemian_yinzi(panel: pd.DataFrame) -> pd.DataFrame:
+def zengjia_hengjiemian_yinzi(panel: pd.DataFrame, *, time_series_ready: bool = False) -> pd.DataFrame:
     data = panel.copy().sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     if not set(RAW_PRICE_VOLUME_FEATURE_COLUMNS).issubset(data.columns):
         data = add_price_volume_factors(data)
@@ -42,13 +42,12 @@ def zengjia_hengjiemian_yinzi(panel: pd.DataFrame) -> pd.DataFrame:
     amount = pd.to_numeric(data["amount_yuan"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     data["amount_yuan"] = amount.where(amount >= 0)
     data["log_amount_yuan"] = np.log1p(data["amount_yuan"])
-    data["amount_mean_5"] = data.groupby("ts_code")["amount_yuan"].transform(
-        lambda values: pd.to_numeric(values, errors="coerce").rolling(5, min_periods=5).mean()
-    )
-    data["amount_mean_20"] = data.groupby("ts_code")["amount_yuan"].transform(
-        lambda values: pd.to_numeric(values, errors="coerce").rolling(20, min_periods=20).mean()
-    )
-    data["amount_ratio_5_20"] = data["amount_mean_5"] / data["amount_mean_20"].replace(0, np.nan)
+    if not time_series_ready:
+        for period in (5, 20):
+            data[f"amount_mean_{period}"] = data.groupby("ts_code")["amount_yuan"].transform(
+                lambda values: pd.to_numeric(values, errors="coerce").rolling(period, min_periods=period).mean()
+            )
+        data["amount_ratio_5_20"] = data["amount_mean_5"] / data["amount_mean_20"].replace(0, np.nan)
     by_date = data.groupby("trade_date", group_keys=False)
     for period in (1, 5, 20):
         data[f"peer_mean_ret_{period}"] = by_date[f"ret_{period}"].transform("mean").where(
@@ -79,6 +78,7 @@ def goujian_fenxi_yinzi_mianban(
     *,
     source: str,
     calendar: Any | None = None,
+    latest_only: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """从批量前复权日线构造不含未来标签的分析因子面板。"""
     profile_by_code = (
@@ -103,11 +103,18 @@ def goujian_fenxi_yinzi_mianban(
         features["industry"] = str(profile.get("industry") or "")
         if profile.get("peer_role") is not None:
             features["peer_role"] = str(profile.get("peer_role") or "market_reference")
+        if latest_only:
+            # 先计算每股完整时间窗口，再只合并末日横截面；不把全市场多年宽表留在内存。
+            amount = pd.to_numeric(features["amount_yuan"], errors="coerce").where(lambda values: values.ge(0))
+            for period in (5, 20):
+                features[f"amount_mean_{period}"] = amount.rolling(period, min_periods=period).mean()
+            features["amount_ratio_5_20"] = features["amount_mean_5"] / features["amount_mean_20"].replace(0, np.nan)
+            features = features.tail(1).copy()
         frames.append(features)
     if not frames:
         return pd.DataFrame(), {"status": "unavailable", "warnings": warnings or ["没有可构造因子面板的历史行情"]}
     panel = pd.concat(frames, ignore_index=True, sort=False)
-    panel = zengjia_hengjiemian_yinzi(panel)
+    panel = zengjia_hengjiemian_yinzi(panel, time_series_ready=latest_only)
     try:
         panel, factor_meta = enrich_daily_factor_panel(
             panel,
@@ -119,6 +126,7 @@ def goujian_fenxi_yinzi_mianban(
     factor_meta = dict(factor_meta)
     factor_meta["warnings"] = warnings + [str(value) for value in factor_meta.get("warnings", [])]
     factor_meta["future_labels_created"] = False
+    factor_meta["panel_scope"] = "latest_completed_cross_section" if latest_only else "historical_daily_panel"
     return panel, factor_meta
 
 

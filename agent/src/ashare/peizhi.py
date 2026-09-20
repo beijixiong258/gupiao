@@ -41,14 +41,13 @@ def _jiaoyishijian(value: Any, label: str) -> int:
 
 def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
     analysis = _peizhi_duixiang(value, "fenxi")
+    # 旧显式配置的抽样上限仅兼容为取数批大小，不再截断候选或追加旧风险过滤。
+    analysis.setdefault("history_batch_size", analysis.get("prefilter_limit", 240))
     positive_integer_bounds = {
         "history_calendar_days": (180, 1800),
-        "prefilter_limit": (20, 1000),
-        "factor_candidate_limit": (10, 500),
+        "history_batch_size": (1, 1000),
         "deep_analysis_limit": (1, 10),
         "backup_limit": (0, 10),
-        "minimum_history_rows": (60, 500),
-        "minimum_listing_calendar_days": (0, 3650),
     }
     integers: dict[str, int] = {}
     for key, (minimum, maximum) in positive_integer_bounds.items():
@@ -57,10 +56,6 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
         if number != integer or not minimum <= integer <= maximum:
             raise ValueError(f"fenxi.{key} 必须是 {minimum} 到 {maximum} 之间的整数")
         integers[key] = integer
-    if integers["factor_candidate_limit"] > integers["prefilter_limit"]:
-        raise ValueError("fenxi.factor_candidate_limit 不能大于 prefilter_limit")
-    if integers["deep_analysis_limit"] > integers["factor_candidate_limit"]:
-        raise ValueError("fenxi.deep_analysis_limit 不能大于 factor_candidate_limit")
     for key in ("min_amount_yuan",):
         if _youxian_shuzhi(analysis, key, "fenxi") < 0:
             raise ValueError(f"fenxi.{key} 不能小于 0")
@@ -177,7 +172,7 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
     if _youxian_shuzhi(late_session, "max_pullback_from_high_pct", "weipan") < 0:
         raise ValueError("weipan.max_pullback_from_high_pct 不能小于 0")
     minute_limit = _youxian_shuzhi(late_session, "minute_candidate_limit", "weipan")
-    if minute_limit != int(minute_limit) or not 1 <= int(minute_limit) <= integers["factor_candidate_limit"]:
+    if minute_limit != int(minute_limit) or not 1 <= int(minute_limit) <= 500:
         raise ValueError("weipan.minute_candidate_limit 必须是有效的候选数量上限")
 
 

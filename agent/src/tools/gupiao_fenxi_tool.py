@@ -12,6 +12,19 @@ from src.tools.gupiao_analysis_state import analysis_session_store
 
 FenxiScope = Literal["all_market", "named_scope", "single_stock"]
 
+_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {"type": "string", "description": "Exact raw metric from the returned registry, e.g. ma_gap_20, ma_trend_5_20, ret_5, ret_20, macd_hist_pct, volume_ratio_5_20, excess_vs_csi300_ret_20, volatility_20. Selection also supports is_st/is_delisting (0/1), listing_days and amount_yuan. Research additionally supports roe_pct, net_profit_yoy_pct, revenue_yoy_pct, debt_to_assets_pct and pattern_close_confirmed (only the specific limit-up pullback pattern)."},
+        "operator": {"type": "string", "enum": ["gt", "gte", "lt", "lte", "eq"]},
+        "value": {"type": "number", "description": "Raw units: returns/volatility use fractions (5%=0.05), volume ratio uses times, amount uses yuan, financial *_pct uses percentage points. Supply exactly one of value/reference_metric."},
+        "reference_metric": {"type": "string", "description": "Another supported observable in the same units instead of a numeric threshold."},
+        "label": {"type": "string", "description": "Plain Chinese description of this observable assertion, faithful to the user's condition or research question."},
+    },
+    "required": ["metric", "operator", "label"],
+    "additionalProperties": False,
+}
+
 
 def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
     """去掉重复的大字段，同时保留智能体解释与审查所需的完整证据。"""
@@ -54,12 +67,25 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
         public["reviewed_candidate_count"] = len(reviewed)
         public["displayed_candidate_count"] = int(bool(result.get("primary"))) + len(result.get("alternatives") or [])
 
+    checks = public.get("candidate_condition_checks")
+    if isinstance(checks, list):
+        unresolved = [item for item in checks if item.get("missing_conditions") or item.get("unmet_conditions")]
+        public["candidate_check_summary"] = {
+            "checked_candidates": len(checks), "with_missing_conditions": sum(bool(item.get("missing_conditions")) for item in checks),
+            "with_unmet_conditions": sum(bool(item.get("unmet_conditions")) for item in checks),
+            "examples_shown": min(20, len(unresolved)), "scope": "公开汇总与最多20个异常示例；完整逐股核验保留于本次内存结果，未因此缩小比较范围",
+        }
+        public["candidate_condition_checks"] = unresolved[:20]
+
     provenance = public.get("data_provenance")
     if isinstance(provenance, dict):
         # 顶层 scope 已包含同一份已核验信息；不在工具消息中重复一遍。
         public["data_provenance"] = {
             key: value for key, value in provenance.items() if key != "scope"
         }
+        for batch in (public["data_provenance"].get("history") or {}).get("batches", []):
+            # 返回候选保有逐股实际来源；全范围来源数量已经在每批source_counts中记录。
+            batch.pop("source_by_code", None)
     return public
 
 
@@ -74,13 +100,30 @@ class GupiaoFenxiTool(BaseTool):
         "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
         "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
         "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
-        "Selection filters explicit upward-signal conditions and compares five raw dimensions by non-dominated layers; "
-        "same-layer ordering is stable display only. Return the exposed research candidates or explain no qualification. "
+        "Selection compares all obtainable scope members by 20-day/5-day realized performance Pareto fronts, then prefers "
+        "20-day performance within a front. No default ST, age, volatility or amount preference. Only user-requested extra "
+        "conditions belong in tiaojian; never invent risk constraints. Pass a stated stock conjecture in yanjiu_wenti with "
+        "faithful observable checks and explicitly untestable parts. Do not equate an arbitrary proxy with the whole claim. "
         "Do not calculate scores, weights, predicted probabilities or model forecasts."
     )
     parameters = {
         "type": "object",
         "properties": {
+            "tiaojian": {
+                "type": "object",
+                "description": "Only explicit selection restrictions beyond scope/count/market cap. Use none when none were requested; never ask risk tolerance unprompted. For a user-requested but undefined restriction use unresolved. E.g. user's uptrend means ma_gap_20>0 AND ma_trend_5_20>0, explicitly disclose this operational definition; do not invent a numeric volatility ceiling for 'low risk'.",
+                "properties": {"mode": {"type": "string", "enum": ["none", "rules", "unresolved"]},
+                               "rules": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA}},
+                "required": ["mode"], "additionalProperties": False,
+            },
+            "yanjiu_wenti": {
+                "type": ["object", "null"],
+                "description": "single_stock only. Preserve an explicit user conjecture/question. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. Future probability, causality and undefined claims cannot be established by substituting indicator signs. Omit for a general stock analysis; do not force a clarification.",
+                "properties": {"question": {"type": "string"},
+                               "checks": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA},
+                               "unverifiable_parts": {"type": "array", "items": {"type": "string"}}},
+                "required": ["question", "checks", "unverifiable_parts"], "additionalProperties": False,
+            },
             "fanwei": {
                 "type": "string",
                 "enum": list(get_args(FenxiScope)),
@@ -149,6 +192,8 @@ class GupiaoFenxiTool(BaseTool):
             gupiao=str(kwargs.get("gupiao") or "").strip() or None,
             shuliang=kwargs.get("shuliang"),
             shizhi=kwargs.get("shizhi") if kwargs.get("shizhi") is not None else {"mode": "unresolved"},
+            tiaojian=kwargs.get("tiaojian") if kwargs.get("tiaojian") is not None else {"mode": "none"},
+            yanjiu_wenti=kwargs.get("yanjiu_wenti"),
         )
         request["shizhi"] = {key: value for key, value in request["shizhi"].items() if value is not None} if isinstance(request["shizhi"], dict) else request["shizhi"]
         choice = kwargs.get("fanwei_xuanze")
@@ -163,7 +208,7 @@ class GupiaoFenxiTool(BaseTool):
         if pending is not None:
             request_context, original_request, original_result = pending
             if request != original_request or not isinstance(choice, dict):
-                return json.dumps({**original_result, "error": "范围仍待确认；不能在审查时改变原始范围、数量或市值条件"}, ensure_ascii=False)
+                return json.dumps({**original_result, "error": "范围仍待确认；不能在审查时改变原始范围、数量或用户条件"}, ensure_ascii=False)
         elif choice is not None:
             return json.dumps({"status": "clarification_required", "outcome": "clarification_required", "stage": "scope_discovery",
                                "error": "没有本次请求的已核验范围候选，请重新说明要分析的范围"}, ensure_ascii=False)

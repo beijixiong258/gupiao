@@ -18,11 +18,44 @@ def _texts(values: Any) -> list[str]:
     return list(dict.fromkeys(str(value) for value in values if value)) if isinstance(values, (list, tuple)) else []
 
 
+def _intraday_effect(snapshot: dict[str, Any], tradability: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+    if not tradability.get("realtime_required"):
+        return {"status": "not_applicable", "reason": "本次处于非盘中核验时段，完整日线仍为比较依据"}
+    if tradability.get("current_quote_verified") is not True:
+        return {"status": "unavailable", "reason": tradability.get("current_quote_reason") or "当前快照未通过时点与成交核验"}
+    price = _number(snapshot.get("last_price", snapshot.get("latest_price")))
+    previous = _number(snapshot.get("previous_close"))
+    if price is None or previous is None or previous <= 0:
+        return {"status": "unavailable", "reason": "缺少可比较的现价或前收盘价"}
+    change = price / previous - 1
+    result = {"status": "intraday_provisional", "source": snapshot.get("source"),
+              "quote_time": snapshot.get("provider_quote_time"), "captured_at": snapshot.get("captured_at"),
+              "price": price, "change_from_previous_close": change,
+              "effect": "盘中较前收盘价走高" if change > 0 else "盘中较前收盘价走低" if change < 0 else "盘中价格与前收盘价相同",
+              "ranking_effect": "当前变化补充解释日线优选理由，未完成的盘中收益不替换完整日线排序"}
+    close, ma20 = _number(raw.get("close")), _number(raw.get("ma_20"))
+    # 实时未复权价不能直接与历史前复权均线比较；先确认前收盘口径确实对齐。
+    if close is not None and ma20 is not None and math.isclose(close, previous, rel_tol=0, abs_tol=0.005):
+        result["ma20_reference"] = ma20
+        if close > ma20 and price <= ma20:
+            result["effect"] += "；价格已回落至本次日线MA20参考值附近或下方，原有均线上方依据减弱，需收盘复核"
+        elif close <= ma20 < price:
+            result["effect"] += "；价格越过本次日线MA20参考值，出现暂定改善，需收盘复核"
+        else:
+            result["effect"] += "；相对本次日线MA20的上下方关系暂未改变"
+        result["reference_note"] = "沿用已完成日线MA20作观察参考，并非当日最终MA20"
+    else:
+        result["reference_note"] = "实时前收盘价与历史复权口径未对齐或MA20缺失，不作跨口径价格比较"
+    return result
+
+
 def goujian_dangu_zhaiyao(
     *, technical: dict[str, Any], fundamentals: dict[str, Any],
     risks: list[str], evidence_gaps: list[dict[str, Any]], as_of: str,
     factor_analysis: dict[str, Any] | None = None, pattern: dict[str, Any] | None = None,
     late: dict[str, Any] | None = None, supplemental: dict[str, Any] | None = None,
+    research_assessment: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None, tradability: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     structure = technical.get("macd_structure") or {}
     usable_structure = structure.get("status") == "ok"
@@ -54,6 +87,9 @@ def goujian_dangu_zhaiyao(
             if close != value:
                 (supporting if close > value else counter).append(fact)
     ma20, ma60 = _number(averages.get("ma20")), _number(averages.get("ma60"))
+    for period, average in ((20, ma20), (60, ma60)):
+        if close is not None and average is not None:
+            reassessment.append(f"后续完整收盘价与{period}日均线的上下方关系改变时复评；本次均线为 {average:.3f}，新日线需重算，不把该数值固定为未来支撑或阻力")
     if close is not None and ma20 is not None and ma60 is not None and close > ma20 and close < ma60:
         conflicts.append("价格站上20日均线但仍低于60日均线；短期改善与中期位置偏弱并存，不能称为趋势全面转强")
     context["价格与趋势"] = price_facts
@@ -120,18 +156,42 @@ def goujian_dangu_zhaiyao(
         if (late or {}).get("confirmation_level") in {"intraday_provisional", "pending", "not_confirmed"}:
             reassessment.append("取得当日完整收盘与所需分钟证据后复核尾盘状态")
     financials = fundamentals.get("financials") or {}
+    financial_facts = []
     for field, label in (("roe_pct", "净资产收益率"), ("net_profit_yoy_pct", "净利润同比")):
         value = _number(financials.get(field))
-        if value is not None and value != 0:
-            (supporting if value > 0 else counter).append(f"本次财报{label} {value:.6g}%")
+        if value is not None:
+            financial_facts.append(f"本次财报{label} {value:.6g}%；仅据正负不能判断水平高低或确认价格趋势")
+    context["财务背景"] = financial_facts or ["财务证据缺失，不能据此判断公司优劣"]
+    intraday = _intraday_effect(snapshot or {}, tradability or {}, raw)
+    context["盘中变化"] = _texts([intraday.get("effect") or intraday.get("reason"), intraday.get("reference_note")])
+    if intraday.get("status") == "intraday_provisional":
+        reassessment.append("取得本交易日完整收盘数据后重算收益、均线与候选比较；盘中变化仍属暂定")
     counter.extend([*conflicts, *risks])
     supporting, counter = _texts(supporting), _texts(counter)
     reassessment.append("新的完整日线、财报或当前成交状态出现变化后重新分析")
-    summary = f"本次日线证据截至 {as_of}。"
-    summary += "；".join(price_facts) + "。" if price_facts else "价格趋势证据不足。"
+    ret20 = _number(returns.get("20d"))
+    if close is None or ma20 is None or ret20 is None:
+        judgment = "20日表现或均线位置证据不足，暂不能形成完整趋势判断"
+    elif ret20 > 0 and close > ma20:
+        judgment = "20日已实现表现与均线位置同向偏强"
+        if ret5 is not None and ret5 < 0:
+            judgment += "，但近5日正在回撤"
+    elif ret20 < 0 and close < ma20:
+        judgment = "20日已实现表现与均线位置同向偏弱"
+        if ret5 is not None and ret5 > 0:
+            judgment += "，近5日反弹尚未改变这一背景"
+    else:
+        judgment = "20日收益与均线位置未形成同向强弱，现有证据有分歧"
+    if research_assessment:
+        judgment = str(research_assessment["verdict_label"]) + "。总体背景：" + judgment
+        reassessment.extend(research_assessment.get("reassessment_conditions") or [])
+    summary = f"{judgment}。本次完整日线截至 {as_of}。"
+    summary += "；".join(price_facts[:2]) + "。" if price_facts else "价格趋势证据不足。"
     if conflicts:
         summary += "证据分歧：" + "；".join(conflicts) + "。"
-    summary += "量价与背景：" + "；".join([*context["量价配合"], *context["相对表现"], *context["市场背景"]]) + "。"
+    summary += "量价：" + "；".join(context["量价配合"]) + "。"
+    if intraday.get("effect"):
+        summary += str(intraday["effect"]) + "。"
     if risks:
         summary += "已知风险与限制：" + "；".join(_texts(risks)) + "。"
     if not supporting and not counter:
@@ -141,10 +201,19 @@ def goujian_dangu_zhaiyao(
         summary += "仍有待补齐或核验的部分：" + "、".join(components) + "；这些缺口不能当作利好或利空。"
     return {
         "summary": summary,
+        "main_judgment": judgment,
+        "research_assessment": research_assessment,
+        "intraday_effect": intraday,
         "supporting_evidence": supporting,
         "counter_evidence": counter,
         "evidence_context": context,
         "evidence_conflicts": _texts(conflicts),
+        "evidence_families": [
+            {"family": "price", "contexts": ["价格与趋势", "动能结构", "相对表现", "形态适用状态"],
+             "role": "相关价格观测及其比较；不同窗口、变换和形态不作为多个独立票数"},
+            {"family": "price_volume", "contexts": ["量价配合"], "role": "检验价格变化的量能背景；放量本身不等于利好"},
+            {"family": "financial", "contexts": ["财务背景"], "role": "公司经营背景；只有与待验证命题直接相关时才成为直接证据"},
+        ],
         "interpretation_basis": "关系判断优先采用未舍入原值，文字数值按展示精度舍入；同源价格指标不作独立投票，未计算综合分或上涨概率",
         "reassessment_conditions": _texts(reassessment),
     }
