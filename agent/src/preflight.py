@@ -45,15 +45,28 @@ def _check_llm_provider() -> CheckResult:
     provider = str(settings["provider"])
     model = str(settings["model"])
     base_url = str(settings["base_url"])
-    if provider == "openai_codex":
-        return CheckResult(
-            name="LLM (openai_codex)",
-            status="ready",
-            message=f"{model} via ChatGPT OAuth",
-            impact="",
-        )
-
     try:
+        if provider == "openai_codex":
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from src.providers.llm import build_llm
+
+            # 使用正式模型适配器验证认证、模型权限和流式响应；不只检查凭据存在。
+            response = build_llm(timeout_seconds=15.0, max_retries=0).invoke([
+                SystemMessage(content="This is a connectivity check. Reply with OK only."),
+                HumanMessage(content="Reply with OK."),
+            ])
+            content = response.content
+            text = content if isinstance(content, str) else "".join(
+                str(block.get("text") or "") for block in content
+                if isinstance(block, dict) and block.get("type") in {"text", "output_text"}
+            )
+            if not text.strip():
+                raise RuntimeError("模型连通性检查未返回有效文本")
+            return CheckResult(
+                name="LLM (openai_codex)", status="ready",
+                message=f"{model} via ChatGPT OAuth; inference verified", impact="",
+            )
+
         import httpx
 
         response = httpx.get(
@@ -117,7 +130,7 @@ def _check_tushare() -> CheckResult:
             name="Tushare",
             status="not_configured",
             message="TUSHARE_TOKEN not set (optional)",
-            impact="部分基本面、宽基指数和备用数据不可用；动态范围与主日线仍可工作",
+            impact="Tushare备用及部分指数数据不可用；公开目录、财务、日终估值和主日线仍有独立来源",
         )
 
     try:
@@ -127,10 +140,10 @@ def _check_tushare() -> CheckResult:
             name="Tushare",
             status="skipped",
             message="package not installed",
-            impact="部分基本面、宽基指数和备用数据不可用",
+            impact="Tushare备用及部分指数数据不可用；公开财务不依赖该SDK",
         )
 
-    return CheckResult(name="Tushare", status="ready", message="token configured", impact="")
+    return CheckResult(name="Tushare", status="ready", message="Token已配置；接口权限和限频仍以实际请求为准", impact="")
 
 
 def _check_akshare() -> CheckResult:

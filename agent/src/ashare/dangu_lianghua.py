@@ -11,6 +11,7 @@ from src.ashare.buchong_zhenduan import goujian_buchong_zhenduan
 from src.ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from src.ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
 from src.ashare.fenxi_yinzi import (
+    FenxiJisuanYichang,
     goujian_fenxi_yinzi_mianban,
     huizong_houxuan_yinzi,
     jisuan_hengjiemian_jibenmian,
@@ -18,6 +19,8 @@ from src.ashare.fenxi_yinzi import (
 )
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 from src.ashare.shuju_yuan import biaozhunhua_gupiao_daima
+from src.ashare.shuju_zhiliang import VERIFIED_DAILY_VALUATION_SOURCES
+from src.ashare.tongdaxin_chicang import fenxi_kongpan_shuju
 
 
 def _gap(code: str, component: str, reason: Any) -> dict[str, str]:
@@ -72,7 +75,7 @@ def _comparison_pool(
     def verified_size(row: dict[str, Any] | pd.Series) -> float | None:
         dates = pd.to_datetime([row.get("trade_date"), row.get("valuation_trade_date")], errors="coerce")
         value = pd.to_numeric(row.get("total_market_value_yuan"), errors="coerce")
-        if (row.get("valuation_is_complete_daily") is True and row.get("valuation_source") == "tushare_daily_basic"
+        if (row.get("valuation_is_complete_daily") is True and row.get("valuation_source") in VERIFIED_DAILY_VALUATION_SOURCES
                 and dates.notna().all() and (dates.normalize() == analysis_date.normalize()).all()
                 and pd.notna(value) and math.isfinite(float(value)) and value > 0):
             return float(value)
@@ -116,7 +119,11 @@ def yunxing_dangu_tongyi_lianghua(
     config: dict[str, Any], context: FenxiShujuShangxiawen,
 ) -> dict[str, Any]:
     """保留已有函数入口，返回原始诊断证据，不计算综合分或买入结论。"""
-    del technical
+    if technical.get("status") == "error" or technical.get("outcome") == "program_error":
+        reason = (technical.get("error") or technical.get("reason")
+                  or (technical.get("macd_structure") or {}).get("reason")
+                  or "技术结构研判发生程序错误")
+        raise FenxiJisuanYichang(f"{code} 技术摘要计算失败：{reason}")
     gaps: list[dict[str, Any]] = []
     target_profile = {
         **(fundamentals.get("profile") or {}),
@@ -129,7 +136,7 @@ def yunxing_dangu_tongyi_lianghua(
     )
     target_profile["valuation_is_complete_daily"] = bool(
         valuation.get("valuation_is_complete_daily") is True
-        and valuation.get("valuation_source") == "tushare_daily_basic"
+        and valuation.get("valuation_source") in VERIFIED_DAILY_VALUATION_SOURCES
         and valuation_dates.notna().all()
         and (valuation_dates.normalize() == analysis_date.normalize()).all()
     )
@@ -201,9 +208,10 @@ def yunxing_dangu_tongyi_lianghua(
             fundamentals = {**fundamentals, "cross_section_analysis": cross_section}
         for warning in panel_meta.get("warnings") or []:
             gaps.append(_gap("factor_source_partial", "市场背景与因子来源", warning))
+    except FenxiJisuanYichang:
+        raise
     except Exception as exc:
-        factor = {"status": "unavailable", "groups": {}, "reason": str(exc)}
-        gaps.append(_gap("factor_evidence_unavailable", "八组日线指标", exc))
+        raise FenxiJisuanYichang(f"{code} 因子证据汇总失败：{exc}") from exc
 
     try:
         pattern = fenxi_zhangting_huimaqiang(
@@ -240,6 +248,13 @@ def yunxing_dangu_tongyi_lianghua(
     except Exception as exc:
         supplemental = {"status": "unavailable", "error": str(exc), "blocks": []}
         gaps.append(_gap("supplemental_unavailable", "补充指标", exc))
+    try:
+        ownership = fenxi_kongpan_shuju(
+            context.kongpan_shuju(code), history, analysis_date=analysis_date,
+        )
+    except Exception as exc:
+        raise FenxiJisuanYichang(f"{code} 持仓控盘证据计算失败：{exc}") from exc
+    gaps.extend(ownership.get("evidence_gaps") or [])
     return {
         "status": "partial" if gaps else "ok",
         "stock_identity": {"ts_code": code, "name": resolved.get("name"), "industry": resolved.get("industry")},
@@ -249,10 +264,15 @@ def yunxing_dangu_tongyi_lianghua(
         "limit_up_pullback_pattern": pattern,
         "late_session_analysis": late,
         "supplemental_diagnostics": supplemental,
+        "ownership_analysis": ownership,
         "evidence_gaps": gaps,
         "data_provenance": {
             "comparison_pool": {**universe_meta, **pool_meta, "usable_history_stocks": len(histories), "persistence": "none"},
             "comparison_history": peer_meta, "factor_panel": panel_meta,
+            "ownership": {key: (ownership.get("source_data") or {}).get(key) for key in (
+                "source", "as_of", "requested_at", "fetched_at", "provider_server_time",
+                "date_verified", "realtime_verified", "attempted_providers", "missing_reason",
+            )},
         },
     }
 

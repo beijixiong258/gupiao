@@ -7,8 +7,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.ashare.gupiao_yanjiu import jisuan_tezheng_biao
+from src.ashare.gupiao_yanjiu import jisuan_tezheng_biao, zongjie_jishu_tezheng
 from src.ashare.riping_yinzi import enrich_daily_factor_panel
+from src.ashare.shuju_zhiliang import VERIFIED_DAILY_VALUATION_SOURCES
 from src.ashare.yinzi_gongcheng import FACTOR_GROUPS, FACTOR_REGISTRY, RAW_PRICE_VOLUME_FEATURE_COLUMNS, add_price_volume_factors
 
 
@@ -23,6 +24,10 @@ YINZI_ZU_MINGCHENG: dict[str, tuple[str, str]] = {
     "risk_liquidity": ("风险与流动性", "波动、回撤、成交额、换手和市值流动性"),
     "market_context": ("市场背景", "当前比较池与真实行业分组的收益、广度、离散度和状态"),
 }
+
+
+class FenxiJisuanYichang(Exception):
+    """已核验数据进入计算后发生的程序错误，不作为来源缺失降级。"""
 
 
 def _number(value: Any, digits: int | None = None) -> float | None:
@@ -79,8 +84,31 @@ def goujian_fenxi_yinzi_mianban(
     source: str,
     calendar: Any | None = None,
     latest_only: bool = False,
+    technical_summaries: dict[str, dict[str, Any]] | None = None,
+    macd_structure_config: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """从批量前复权日线构造不含未来标签的分析因子面板。"""
+    try:
+        return _goujian_fenxi_yinzi_mianban(
+            histories, profiles, source=source, calendar=calendar, latest_only=latest_only,
+            technical_summaries=technical_summaries, macd_structure_config=macd_structure_config,
+        )
+    except FenxiJisuanYichang:
+        raise
+    except Exception as exc:
+        raise FenxiJisuanYichang(f"分析因子面板计算失败：{exc}") from exc
+
+
+def _goujian_fenxi_yinzi_mianban(
+    histories: dict[str, pd.DataFrame],
+    profiles: pd.DataFrame,
+    *,
+    source: str,
+    calendar: Any | None,
+    latest_only: bool,
+    technical_summaries: dict[str, dict[str, Any]] | None,
+    macd_structure_config: dict[str, Any] | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     profile_by_code = (
         profiles.drop_duplicates("ts_code").set_index("ts_code").to_dict("index")
         if profiles is not None and not profiles.empty and "ts_code" in profiles.columns
@@ -94,8 +122,21 @@ def goujian_fenxi_yinzi_mianban(
         try:
             features = jisuan_tezheng_biao(history)
         except Exception as exc:
-            warnings.append(f"{code} 技术因子构造失败：{exc}")
-            continue
+            raise FenxiJisuanYichang(f"{code} 技术因子构造失败：{exc}") from exc
+        if technical_summaries is not None:
+            # 就地复用特征，仅留下技术摘要；不缓存全市场多年宽表。
+            try:
+                summary = zongjie_jishu_tezheng(
+                    features, macd_structure_config=macd_structure_config,
+                )
+            except Exception as exc:
+                raise FenxiJisuanYichang(f"{code} 技术摘要计算失败：{exc}") from exc
+            if summary.get("status") == "error" or summary.get("outcome") == "program_error":
+                reason = (summary.get("error") or summary.get("reason")
+                          or (summary.get("macd_structure") or {}).get("reason")
+                          or "技术结构研判发生程序错误")
+                raise FenxiJisuanYichang(f"{code} 技术摘要计算失败：{reason}")
+            technical_summaries[str(code)] = summary
         features["trade_date"] = pd.to_datetime(features["trade_date"], errors="coerce").dt.normalize()
         features["ts_code"] = str(code)
         profile = profile_by_code.get(str(code), {})
@@ -115,14 +156,12 @@ def goujian_fenxi_yinzi_mianban(
         return pd.DataFrame(), {"status": "unavailable", "warnings": warnings or ["没有可构造因子面板的历史行情"]}
     panel = pd.concat(frames, ignore_index=True, sort=False)
     panel = zengjia_hengjiemian_yinzi(panel, time_series_ready=latest_only)
-    try:
-        panel, factor_meta = enrich_daily_factor_panel(
-            panel,
-            source=source,
-            calendar=calendar,
-        )
-    except Exception as exc:
-        factor_meta = {"status": "degraded", "warnings": [f"市场背景增强失败：{exc}"]}
+    # 来源不可用由增强层返回缺失元数据；意外计算异常交给公开入口终止本轮。
+    panel, factor_meta = enrich_daily_factor_panel(
+        panel,
+        source=source,
+        calendar=calendar,
+    )
     factor_meta = dict(factor_meta)
     factor_meta["warnings"] = warnings + [str(value) for value in factor_meta.get("warnings", [])]
     factor_meta["future_labels_created"] = False
@@ -136,7 +175,7 @@ def _daily_valuation_dates(data: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd
     valuation_dates = pd.to_datetime(data.get("valuation_trade_date", missing_dates), errors="coerce").dt.normalize()
     verified = (
         data.get("valuation_is_complete_daily", pd.Series(False, index=data.index)).eq(True)
-        & data.get("valuation_source", pd.Series("", index=data.index)).eq("tushare_daily_basic")
+        & data.get("valuation_source", pd.Series("", index=data.index)).isin(VERIFIED_DAILY_VALUATION_SOURCES)
         & trade_dates.notna() & valuation_dates.eq(trade_dates)
     ).fillna(False)
     return trade_dates, valuation_dates, verified
@@ -220,7 +259,7 @@ def huizong_houxuan_yinzi(
     *,
     config: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """逐项保留八组原始因子及缺失；config 仅保留调用兼容，不用于合成分数。"""
+    """逐项保留八组原始因子及缺失；config 仅保留调用兼容，本函数不合成推荐指数。"""
     if latest_panel is None or latest_panel.empty or "ts_code" not in latest_panel.columns:
         return {}
     definitions = {
@@ -295,7 +334,7 @@ def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, 
             else "估值日期缺失，无法核验同日估值" if pd.isna(valuation_dates.loc[index])
             else f"估值日期 {valuation_dates.loc[index]:%Y-%m-%d} 与行情日期 {trade_dates.loc[index]:%Y-%m-%d} 不一致"
             if valuation_dates.loc[index] != trade_dates.loc[index]
-            else "估值来源未核验为日终来源" if str(row.get("valuation_source")) != "tushare_daily_basic"
+            else "估值来源未核验为日终来源" if str(row.get("valuation_source")) not in VERIFIED_DAILY_VALUATION_SOURCES
             else "估值尚未确认为完整日终数据"
         )
         same_day_verified = verified & valuation_dates.eq(trade_dates.loc[index])
@@ -363,6 +402,7 @@ def jisuan_hengjiemian_jibenmian(snapshot: pd.DataFrame) -> dict[str, dict[str, 
 
 
 __all__ = [
+    "FenxiJisuanYichang",
     "YINZI_ZU_MINGCHENG",
     "goujian_fenxi_yinzi_mianban",
     "huizong_houxuan_yinzi",

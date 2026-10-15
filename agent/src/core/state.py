@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,9 +13,13 @@ from src.core.run_policy import (
     RunLogPolicy,
     create_ephemeral_run_dir,
     prune_run_directories,
+    recycle_run_directory,
     redact_for_log,
     response_for_policy,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class RunStateStore:
@@ -47,10 +51,14 @@ class RunStateStore:
         return str(run_dir), run_dir.name
 
     def cleanup_ephemeral(self, run_dir: Path) -> None:
-        resolved = run_dir.resolve()
-        if resolved not in self._ephemeral_paths:
+        try:
+            resolved = run_dir.resolve()
+            if resolved not in self._ephemeral_paths:
+                return
+            recycle_run_directory(run_dir, workspace=resolved.parent)
+        except (OSError, ValueError) as exc:
+            logger.warning("临时运行目录回收失败，原目录保留于 %s：%s", run_dir, exc)
             return
-        shutil.rmtree(resolved, ignore_errors=True)
         self._ephemeral_paths.discard(resolved)
 
     def save_request(self, run_dir: Path, prompt: str, context: Dict[str, Any]) -> Dict[str, Any]:

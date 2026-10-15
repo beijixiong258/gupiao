@@ -10,7 +10,7 @@ from src.agent.tools import BaseTool
 from src.tools.gupiao_analysis_state import analysis_session_store
 
 
-FenxiScope = Literal["all_market", "named_scope", "single_stock"]
+FenxiScope = Literal["all_market", "main_board", "named_scope", "single_stock"]
 
 _CHECK_SCHEMA = {
     "type": "object",
@@ -96,15 +96,22 @@ class GupiaoFenxiTool(BaseTool):
         "to retrieve all currently analyzable stock evidence, including every raw daily-factor value and missing field, technical "
         "structure, financials and valuation context, pattern and late-session conditions, supplemental diagnostics, execution "
         "constraints and source provenance. Optional source failure yields a partial report, never a forced buy/no-buy label. "
-        "Use all_market or named_scope for rule-based selection; named scopes are dynamically discovered and verified. "
+        "Use all_market, main_board (all Shanghai/Shenzhen main-board A-shares), or named_scope for rule-based selection; "
+        "main_board is a listing-market scope, not an industry/concept catalog entry. Named scopes are dynamically discovered and verified. "
         "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
         "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
         "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
-        "Selection compares all obtainable scope members by 20-day/5-day realized performance Pareto fronts, then prefers "
-        "20-day performance within a front. No default ST, age, volatility or amount preference. Only user-requested extra "
-        "conditions belong in tiaojian; never invent risk constraints. Pass a stated stock conjecture in yanjiu_wenti with "
+        "Selection compares all obtainable scope members by the user-approved fixed current-price/turnover recommendation index. "
+        "It uses 20-day return, signed path efficiency and up-day turnover balance in one common valid date/scope/window pool. "
+        "Read returned raw values, rank percentiles, components, pool size and unrounded index order; never recompute or change it. "
+        "Exact equal indices are tied. The old 20/5-day Pareto rule is a research comparator only. "
+        "No default ST, age, volatility or amount preference. Only user-requested extra "
+        "conditions belong in tiaojian; never invent risk constraints. Future holding horizons or maximum expected returns "
+        "are not historical-return filters: preserve the original objective in yanjiu_wenti.question and its untestable "
+        "requirements in unverifiable_parts. Never substitute ret_5 for a future one-week return. Pass a stated stock conjecture in yanjiu_wenti with "
         "faithful observable checks and explicitly untestable parts. Do not equate an arbitrary proxy with the whole claim. "
-        "Do not calculate scores, weights, predicted probabilities or model forecasts."
+        "The fixed index weights are a disclosed product choice, not trained parameters. The index is not an expected return, "
+        "upside probability or confidence. Do not invent extra scores, weights, risk deductions, predicted probabilities or model forecasts."
     )
     parameters = {
         "type": "object",
@@ -118,7 +125,7 @@ class GupiaoFenxiTool(BaseTool):
             },
             "yanjiu_wenti": {
                 "type": ["object", "null"],
-                "description": "single_stock only. Preserve an explicit user conjecture/question. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. Future probability, causality and undefined claims cannot be established by substituting indicator signs. Omit for a general stock analysis; do not force a clarification.",
+                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. Future probability, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
                 "properties": {"question": {"type": "string"},
                                "checks": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA},
                                "unverifiable_parts": {"type": "array", "items": {"type": "string"}}},
@@ -128,7 +135,7 @@ class GupiaoFenxiTool(BaseTool):
                 "type": "string",
                 "enum": list(get_args(FenxiScope)),
                 "default": "all_market",
-                "description": "Use single_stock for one stock, all_market for the whole market, or named_scope whenever the user says an ordinary industry/board/theme phrase. Never classify a named scope yourself.",
+                "description": "Use single_stock for one stock, all_market when no narrower scope was requested, main_board for the entire Shanghai/Shenzhen main-board A-share market, or named_scope for an ordinary industry/theme phrase. main_board bypasses industry/concept discovery; preserve the user's wording in mingcheng. Never broaden a requested listing-market scope.",
             },
             "mingcheng": {
                 "type": "string",
@@ -150,10 +157,10 @@ class GupiaoFenxiTool(BaseTool):
                 "additionalProperties": False,
             },
             "shuliang": {
-                "type": "integer",
+                "type": ["integer", "null"],
                 "minimum": 1,
                 "maximum": 5,
-                "description": "Optional number of stocks the user explicitly requested for a range selection. If omitted, use the normal primary plus available alternatives; never invent a count.",
+                "description": "Number of stocks only when explicitly requested. For vague wording such as some/a few use null or omit, keeping the normal primary plus available alternatives; never invent 1.",
             },
             "shizhi": {
                 "type": "object",
@@ -256,7 +263,7 @@ class GupiaoFenxiTool(BaseTool):
                 "scope": (
                     "已整理当前可取得的候选证据；部分来源或条件尚未完成核验"
                     if stored_result.get("status") == "partial"
-                    else "候选范围核验、原始证据、显式选股条件与非支配比较已完成"
+                    else "候选范围核验、原始证据、显式选股条件与推荐指数比较已完成"
                 ),
                 "next_step": (
                     "说明候选的量化依据、证据缺口、主要风险与重新评估条件"

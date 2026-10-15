@@ -8,6 +8,9 @@ from typing import Any, Iterable
 import pandas as pd
 
 
+VERIFIED_DAILY_VALUATION_SOURCES = frozenset({"tushare_daily_basic", "eastmoney_daily_valuation"})
+
+
 def classify_failure(value: Any) -> str:
     text = str(value or "").lower()
     if any(token in text for token in ["429", "rate limit", "限流", "频率", "too many"]):

@@ -15,6 +15,33 @@ except ImportError:
 
 if ChatOpenAI is not None:
 
+    class ChatOpenAICodex(ChatOpenAI):  # type: ignore[misc,valid-type]
+        """将应用系统提示映射到 Codex Responses 的 instructions 字段。"""
+
+        def _get_request_payload(self, input_: Any, *, stop: Optional[list[str]] = None, **kwargs: Any) -> dict:  # type: ignore[override]
+            payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            instructions: list[str] = []
+            messages = []
+            for item in payload.get("input", []):
+                if item.get("role") != "system":
+                    messages.append(item)
+                    continue
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    instructions.append(content)
+                else:
+                    for block in content:
+                        if block.get("type") not in {"text", "input_text"}:
+                            raise ValueError("Codex 系统提示只支持文本，不能静默丢弃其他内容")
+                        instructions.append(str(block.get("text") or ""))
+            existing = payload.get("instructions")
+            if existing:
+                instructions.append(str(existing))
+            payload["instructions"] = "\n\n".join(instructions)
+            payload["input"] = messages
+            return payload
+
+
     class ChatOpenAIWithReasoning(ChatOpenAI):  # type: ignore[misc,valid-type]
         """OpenAI-compatible client that preserves DeepSeek reasoning fields."""
 
@@ -56,6 +83,7 @@ if ChatOpenAI is not None:
             return payload
 
 else:
+    ChatOpenAICodex = None  # type: ignore
     ChatOpenAIWithReasoning = None  # type: ignore
 
 
@@ -123,7 +151,10 @@ def resolve_provider_settings() -> Dict[str, Any]:
     raise RuntimeError("LANGCHAIN_PROVIDER must be deepseek, openai, or openai_codex")
 
 
-def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
+def build_llm(
+    *, model_name: Optional[str] = None, callbacks: Any = None,
+    timeout_seconds: float | None = None, max_retries: int | None = None,
+) -> Any:
     """Construct the configured DeepSeek/OpenAI chat model."""
     settings = resolve_provider_settings()
     name = model_name or settings["model"]
@@ -139,8 +170,8 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "model": name,
         "api_key": settings["api_key"],
         "base_url": settings["base_url"],
-        "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
-        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "timeout": timeout_seconds if timeout_seconds is not None else int(os.getenv("TIMEOUT_SECONDS", "120")),
+        "max_retries": max_retries if max_retries is not None else int(os.getenv("MAX_RETRIES", "2")),
         "callbacks": callbacks,
     }
 
@@ -152,7 +183,8 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         )
 
     reasoning = {"effort": effort, "summary": "auto"} if effort else None
-    return ChatOpenAI(
+    client_class = ChatOpenAICodex if settings["provider"] == "openai_codex" else ChatOpenAI
+    return client_class(
         **common,
         default_headers=settings.get("default_headers"),
         use_responses_api=bool(settings.get("use_responses_api")),

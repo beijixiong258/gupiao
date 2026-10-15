@@ -25,11 +25,14 @@ MCP_INSTRUCTIONS = """
 Only provide personal-use research on mainland China A-share stocks. The server has exactly
 one business tool for unified stock analysis and diagnosis. Natural-language assistants must hide tool
 parameters and analysis_id from end users. When the user names a scope, pass the ordinary phrase
-unchanged as named_scope; the analysis tool dynamically downloads industry and concept catalogs
+unchanged as named_scope; the entire Shanghai/Shenzhen main-board market uses main_board instead,
+with its original wording in mingcheng. The analysis tool dynamically downloads industry and concept catalogs
 and may return one plain-language clarification. Never guess an industry-versus-concept category.
 For a named stock use single_stock and gupiao; pass an explicit conjecture through yanjiu_wenti,
 then explain the observable claim assessment, counterevidence, gaps and reassessment conditions.
 For selection carry explicit cap restrictions in shizhi and other explicit conditions in tiaojian.
+Use null/omit shuliang for vague quantities. Preserve future holding/return objectives in yanjiu_wenti,
+listing their untestable requirements without equating historical return rankings with expected future returns.
 Never add risk preferences or invent bounds. Compare returned 20-day/5-day performance and actual
 coverage; do not change the order. A verified scope_review_required can be resolved once with
 fanwei_xuanze while preserving original_request, or clarified if truly ambiguous.

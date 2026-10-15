@@ -38,6 +38,7 @@ from src.ashare.shuju_yuan import (
     _latest_tushare_daily,
     _normalize_code,
     _tushare_pro,
+    guolv_a_gu_jilu as _guolv_a_gu_jilu,
     huoqu_gupiao_jichu_ziliao,
 )
 from src.ashare.tengxun_api import tengxun_qfq_rili_duqu
@@ -132,8 +133,29 @@ class FenxiShujuShangxiawen:
         """股票身份、候选横截面和深度基本面共用本次资料表，包括失败结果。"""
         if "gupiao_ziliao" not in self._memo:
             quality: dict[str, Any] = {}
+
+            def public_directory_loader() -> tuple[pd.DataFrame, dict[str, Any]]:
+                # 数据中心与push2是独立端点；日终表已取得时直接复用代码和名称。
+                try:
+                    target = self.zuixin_wanzheng_jiaoyiri().strftime("%Y-%m-%d")
+                    valuation = self.rizhong_guzhi(target)
+                    if valuation.empty or "name" not in valuation.columns:
+                        valuation, _ = _huoqu_dongcai_rizhong_guzhi(target)
+                    meta = copy.deepcopy(valuation.attrs)
+                    meta["captured_at"] = meta.get("fetched_at")
+                    return valuation, meta
+                except (RuntimeError, ValueError, WangluoQingqiuYichang) as exc:
+                    directory_error = " ".join(str(exc).split())[:180]
+                frame, meta = self.shishi_kuaizhao()
+                meta = copy.deepcopy(meta)
+                meta["attempted_providers"] = [
+                    {"provider": "daily_valuation_directory", "outcome": "failed", "detail": directory_error},
+                    *meta.get("attempted_providers", []),
+                ]
+                return frame, meta
+
             try:
-                frame = huoqu_gupiao_jichu_ziliao(_tushare_pro(), quality)
+                frame = huoqu_gupiao_jichu_ziliao(None, quality, public_loader=public_directory_loader)
                 self._memo["gupiao_ziliao"] = (frame, quality, None)
             except Exception as exc:
                 self._memo["gupiao_ziliao"] = (pd.DataFrame(), quality, str(exc))
@@ -163,11 +185,41 @@ class FenxiShujuShangxiawen:
             )
         return copy.deepcopy(self._memo[key])
 
+    def kongpan_shuju(self, code: str, *, observation_count: int = 30) -> dict[str, Any]:
+        """控盘观测只在本次请求内复用；日历失败不阻断已有分析。"""
+        from src.ashare.tongdaxin_chicang import huoqu_kongpan_shuju
+
+        normalized = _normalize_code(code)
+        key = f"kongpan_shuju:{normalized}:{observation_count}"
+        if key not in self._memo:
+            calendar = self.jiaoyi_rili()
+            if not calendar.open_dates:
+                self._memo[key] = {
+                    "status": "unavailable",
+                    "source": "tongdaxin_f10_200745",
+                    "stock_code": normalized,
+                    "series": [],
+                    "latest": None,
+                    "date_verified": False,
+                    "realtime_verified": False,
+                    "missing_reason": "权威交易日历不可用，不能核验控盘观测日期",
+                    "attempted_providers": list(calendar.attempted_providers),
+                }
+            else:
+                self._memo[key] = huoqu_kongpan_shuju(
+                    normalized,
+                    trade_calendar=calendar,
+                    now=self.reference,
+                    observation_count=observation_count,
+                )
+        return copy.deepcopy(self._memo[key])
+
     def rizhong_guzhi(self, trade_date: str, *, metadata: dict[str, Any] | None = None) -> pd.DataFrame:
         """同一次分析按交易日复用日终估值，单股和比较池不重复请求同一接口。"""
         date_text = pd.Timestamp(trade_date).strftime("%Y%m%d")
         key = f"rizhong_guzhi:{date_text}"
         if key not in self._memo:
+            attempts: list[dict[str, Any]] = []
             try:
                 frame = _tushare_pro().daily_basic(
                     trade_date=date_text,
@@ -175,13 +227,51 @@ class FenxiShujuShangxiawen:
                 )
                 if frame is None or frame.empty:
                     raise RuntimeError(f"{date_text} 的日终估值为空")
-                self._memo[key] = (frame.copy(), None)
+                if not {"ts_code", "trade_date", "total_mv", "circ_mv"}.issubset(frame.columns):
+                    raise ValueError("Tushare 日终估值缺少身份、日期或市值字段")
+                frame = _guolv_a_gu_jilu(frame, source="tushare_daily_basic")
+                if frame.empty:
+                    raise ValueError("Tushare 日终估值排除非A股证券后没有有效记录")
+                dates = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
+                if not dates.eq(pd.Timestamp(trade_date).normalize()).all() or frame["ts_code"].duplicated().any():
+                    raise ValueError("Tushare 日终估值日期不一致或证券代码重复")
+                frame["valuation_source"] = "tushare_daily_basic"
+                frame["valuation_trade_date"] = dates
+                frame["valuation_is_complete_daily"] = True
+                attempts.append({"provider": "tushare_daily_basic", "outcome": "ok"})
+                meta = {
+                    "source": "tushare_daily_basic",
+                    "fetched_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "attempted_providers": attempts,
+                    "persistence": "none",
+                    "security_scope": copy.deepcopy(frame.attrs.get("security_scope", {})),
+                }
+                frame.attrs.update(meta)
+                self._memo[key] = (frame, None, meta)
             except Exception as exc:
-                self._memo[key] = (pd.DataFrame(), str(exc))
-            self._memo[f"{key}:fetched_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
-        frame, error = self._memo[key]
+                error_code, _ = _tushare_error_code(exc)
+                attempts.append({
+                    "provider": "tushare_daily_basic", "outcome": "failed",
+                    "error_code": error_code, "detail": " ".join(str(exc).split())[:180],
+                })
+                try:
+                    frame, meta = _huoqu_dongcai_rizhong_guzhi(trade_date)
+                    meta["attempted_providers"] = attempts + meta.get("attempted_providers", [])
+                    frame.attrs.update(meta)
+                    self._memo[key] = (frame, None, meta)
+                except (WangluoQingqiuYichang, ValueError, RuntimeError) as fallback_exc:
+                    attempts.extend(item.to_dict() for item in getattr(fallback_exc, "attempts", []))
+                    meta = {
+                        "source": "unavailable",
+                        "fetched_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "attempted_providers": attempts,
+                        "persistence": "none",
+                    }
+                    error = f"Tushare 日终估值失败：{exc}；公开日终估值备用失败：{fallback_exc}"
+                    self._memo[key] = (pd.DataFrame(), error, meta)
+        frame, error, meta = self._memo[key]
         if metadata is not None:
-            metadata.update(source="tushare_daily_basic", fetched_at=self._memo[f"{key}:fetched_at"])
+            metadata.update(copy.deepcopy(meta))
         if error is not None:
             raise RuntimeError(error)
         return frame.copy()
@@ -290,6 +380,90 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) else None
+
+
+def _huoqu_dongcai_rizhong_guzhi(trade_date: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """公开历史日终估值备用；日期明确，不从实时快照推定日终市值。"""
+    target = pd.Timestamp(trade_date).normalize()
+    if pd.isna(target) or target > pd.Timestamp(_beijing_now().date()):
+        raise ValueError("公开日终估值请求日期无效或晚于当前日期")
+    endpoint = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    rows: list[dict[str, Any]] = []
+    expected_count: int | None = None
+    expected_pages: int | None = None
+    with GongkaiShujuHTTPKehu("eastmoney_daily_valuation") as client:
+        for page in range(1, 21):
+            payload, _ = client.qingqiu_json((endpoint,), params={
+                "sortColumns": "SECURITY_CODE", "sortTypes": "1",
+                "pageSize": "5000", "pageNumber": str(page),
+                "reportName": "RPT_VALUEANALYSIS_DET",
+                "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,TRADE_MARKET,TRADE_DATE,CLOSE_PRICE,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,PE_TTM,PE_LAR,PB_MRQ",
+                "source": "WEB", "client": "WEB",
+                "filter": f"(TRADE_DATE='{target:%Y-%m-%d}')",
+            })
+            result = payload.get("result")
+            if payload.get("success") is not True or not isinstance(result, dict):
+                raise ValueError(f"东方财富日终估值业务响应失败：{payload.get('message') or '无有效结果'}")
+            try:
+                count, pages = int(result.get("count", 0)), int(result.get("pages", 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("东方财富日终估值分页计数无效") from exc
+            page_rows = result.get("data")
+            if not isinstance(page_rows, list) or not page_rows or count <= 0 or not 1 <= pages <= 20:
+                raise ValueError("东方财富日终估值为空或分页范围无效")
+            if expected_count is None:
+                expected_count, expected_pages = count, pages
+            elif count != expected_count or pages != expected_pages:
+                raise ValueError("东方财富日终估值分页总量发生变化，不能保证完整覆盖")
+            if not all(isinstance(row, dict) for row in page_rows):
+                raise ValueError("东方财富日终估值行结构无效")
+            rows.extend(page_rows)
+            if page == expected_pages:
+                break
+        attempts = [attempt.to_dict() for attempt in client.attempts]
+    if len(rows) != expected_count:
+        raise ValueError(f"东方财富日终估值分页不完整：应有{expected_count}行，实际{len(rows)}行")
+    raw = pd.DataFrame(rows)
+    if not {"SECUCODE", "TRADE_DATE", "CLOSE_PRICE", "TOTAL_MARKET_CAP", "NOTLIMITED_MARKETCAP_A"}.issubset(raw.columns):
+        raise ValueError("东方财富日终估值缺少身份、日期、收盘价或市值字段")
+    raw = _guolv_a_gu_jilu(raw, source="eastmoney_daily_valuation", code_column="SECUCODE")
+    if raw.empty:
+        raise ValueError("东方财富日终估值排除非A股证券后没有可用股票记录")
+    frame = pd.DataFrame({
+        "ts_code": raw["SECUCODE"].map(_normalize_code),
+        "trade_date": pd.to_datetime(raw["TRADE_DATE"], errors="coerce").dt.normalize(),
+        "name": raw.get("SECURITY_NAME_ABBR", pd.Series(None, index=raw.index)),
+    })
+    if frame["ts_code"].duplicated().any() or not frame["trade_date"].eq(target).all():
+        raise ValueError("东方财富日终估值代码重复或日期与分析日不一致")
+    for source, destination in (
+        ("TOTAL_MARKET_CAP", "total_mv"), ("NOTLIMITED_MARKETCAP_A", "circ_mv"),
+        ("PE_TTM", "pe_ttm"), ("PE_LAR", "pe_static"), ("PB_MRQ", "pb"),
+        ("CLOSE_PRICE", "valuation_close"),
+    ):
+        frame[destination] = pd.to_numeric(raw.get(source, pd.Series(np.nan, index=raw.index)), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    # 保持 daily_basic 的万元接口形状；上游原始市值是元。
+    frame[["total_mv", "circ_mv"]] /= 10_000.0
+    for column in ("turnover_rate", "volume_ratio", "pe"):
+        frame[column] = np.nan
+    frame["valuation_source"] = "eastmoney_daily_valuation"
+    frame["valuation_trade_date"] = frame["trade_date"]
+    frame["valuation_is_complete_daily"] = frame["valuation_close"].gt(0)
+    frame["listing_market_code"] = raw.get("TRADE_MARKET", pd.Series(None, index=raw.index)).astype("string").str.strip()
+    frame["listing_market_source"] = "eastmoney_daily_valuation"
+    frame["listing_market_as_of"] = frame["trade_date"]
+    meta = {
+        "source": "eastmoney_daily_valuation", "as_of": target.strftime("%Y-%m-%d"),
+        "fetched_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "rows": len(frame), "reported_rows": expected_count,
+        "attempted_providers": attempts, "persistence": "none",
+        "market_value_unit": "万元（来源原值元除以10000，兼容日终估值统一接口）",
+        "pe_static_definition": "来源PE_LAR静态市盈率，与动态、滚动市盈率分开",
+        "listing_market_definition": "来源TRADE_MARKET原值；可能包含跨原上市板的特殊类别，不能据沪深A股分类集合差推定主板身份",
+        "security_scope": copy.deepcopy(raw.attrs.get("security_scope", {})),
+    }
+    frame.attrs.update(meta)
+    return frame, meta
 
 
 def _json_safe_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -663,9 +837,7 @@ def _normalize_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
     data = frame.rename(columns={key: value for key, value in rename.items() if key in frame.columns}).copy()
     if "ts_code" not in data.columns:
         raise RuntimeError("全市场快照缺少股票代码")
-    data["ts_code"] = data["ts_code"].astype(str).str.extract(r"(\d+)", expand=False).str.zfill(6)
-    data = data[data["ts_code"].map(_shi_a_gu)].copy()
-    data["ts_code"] = data["ts_code"].map(_normalize_code)
+    data = _guolv_a_gu_jilu(data, source="public_a_share_snapshot")
     if "name" not in data.columns:
         data["name"] = ""
     data["name"] = data["name"].fillna("").astype(str)
@@ -712,7 +884,7 @@ def _huoqu_dongcai_shishi_kuaizhao(
                 "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
                 "fields": (
                     "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,"
-                    "f20,f21,f23,f124"
+                    "f20,f21,f23,f26,f100,f102,f124"
                 ),
             },
         )
@@ -735,6 +907,9 @@ def _huoqu_dongcai_shishi_kuaizhao(
             "f20": "总市值",
             "f21": "流通市值",
             "f23": "市净率",
+            "f26": "list_date",
+            "f100": "industry",
+            "f102": "area",
         }
     )
     data = _normalize_snapshot(raw)
@@ -759,6 +934,7 @@ def _huoqu_dongcai_shishi_kuaizhao(
         "provider_trade_date": None,
         "timeliness": "逐只保留来源更新时间；按待核验交易日检查，盘中证据仍为暂定",
         "persistence": "none",
+        "security_scope": copy.deepcopy(data.attrs.get("security_scope", {})),
     }
 
 
@@ -786,6 +962,7 @@ def huoqu_shishi_kuaizhao(reference: datetime | None = None) -> tuple[pd.DataFra
             "provider_trade_date": None,
             "timeliness": "接口不返回逐行交易日期，盘中证据均标记为暂定",
             "warnings": [f"东方财富直连接口失败后使用 AKShare 适配器：{' '.join(str(direct_error).split())[:160]}"],
+            "security_scope": copy.deepcopy(data.attrs.get("security_scope", {})),
             **capability,
         }
     except Exception as exc:
@@ -850,12 +1027,13 @@ def huoqu_zuixin_hengjiemian(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """读取一个完整交易日的全市场行情、估值和股票资料横截面。"""
     warnings: list[str] = []
+    valuation_meta: dict[str, Any] = {}
     date_text = pd.Timestamp(trade_date).strftime("%Y%m%d")
     try:
         pro = _tushare_pro()
         actual_date, daily = _latest_tushare_daily(pro, date_text)
-        daily = daily.copy()
-        daily["ts_code"] = daily["ts_code"].map(_normalize_code)
+        daily = _guolv_a_gu_jilu(daily, source="tushare_daily")
+        daily_security_scope = copy.deepcopy(daily.attrs.get("security_scope", {}))
         daily["trade_date"] = pd.to_datetime(
             daily.get("trade_date", pd.Series(pd.NaT, index=daily.index)), errors="coerce",
         ).dt.normalize()
@@ -873,8 +1051,8 @@ def huoqu_zuixin_hengjiemian(
         else:
             basic, basic_quality = stock_basic_loader()
         warnings.extend(str(value) for value in basic_quality.get("warnings", []))
-        basic = basic.copy()
-        basic["ts_code"] = basic["ts_code"].map(_normalize_code)
+        basic = _guolv_a_gu_jilu(basic, source=str((basic_quality.get("stock_basic") or {}).get("source") or "stock_directory"))
+        basic_security_scope = copy.deepcopy(basic.attrs.get("security_scope", {}))
         try:
             valuation = (
                 daily_basic_loader(actual_date) if daily_basic_loader is not None
@@ -884,12 +1062,14 @@ def huoqu_zuixin_hengjiemian(
                 )
             )
             if valuation is not None and not valuation.empty:
-                valuation = valuation.copy()
-                valuation["ts_code"] = valuation["ts_code"].map(_normalize_code)
+                valuation_meta = copy.deepcopy(valuation.attrs)
+                valuation = _guolv_a_gu_jilu(valuation, source=str(valuation_meta.get("source") or "tushare_daily_basic"))
+                valuation_meta["cross_section_security_scope"] = copy.deepcopy(valuation.attrs.get("security_scope", {}))
                 valuation["valuation_trade_date"] = pd.to_datetime(
                     valuation.get("trade_date", pd.Series(pd.NaT, index=valuation.index)), errors="coerce",
                 ).dt.normalize()
-                valuation["valuation_source"] = "tushare_daily_basic"
+                if "valuation_source" not in valuation.columns:
+                    valuation["valuation_source"] = str(valuation_meta.get("source") or "tushare_daily_basic")
                 for column in ("turnover_rate", "volume_ratio", "pe", "pe_ttm", "pb", "total_mv", "circ_mv"):
                     valuation[column] = pd.to_numeric(valuation.get(column), errors="coerce")
                 valuation["total_market_value_yuan"] = valuation["total_mv"] * 10_000.0
@@ -906,12 +1086,22 @@ def huoqu_zuixin_hengjiemian(
                     "total_market_value_yuan",
                     "circulating_market_value_yuan",
                 ]
+                keep.extend(column for column in ("pe_static", "valuation_close", "valuation_is_complete_daily") if column in valuation.columns)
                 daily = daily.merge(valuation[keep], on="ts_code", how="left")
+                completed = daily.get("valuation_is_complete_daily", pd.Series(True, index=daily.index)).eq(True)
                 daily["valuation_is_complete_daily"] = (
                     daily["trade_date"].eq(pd.Timestamp(actual_date).normalize())
                     & daily["valuation_trade_date"].notna()
                     & daily["valuation_trade_date"].eq(daily["trade_date"])
+                    & completed
                 )
+                if "valuation_close" in daily.columns:
+                    public_rows = daily["valuation_source"].eq("eastmoney_daily_valuation")
+                    close_matches = np.isclose(
+                        pd.to_numeric(daily["valuation_close"], errors="coerce"), daily["latest_price"],
+                        rtol=0.0, atol=0.005, equal_nan=False,
+                    )
+                    daily.loc[public_rows & ~close_matches, "valuation_is_complete_daily"] = False
                 unverified_count = int((
                     daily["valuation_source"].notna() & ~daily["valuation_is_complete_daily"]
                 ).sum())
@@ -941,19 +1131,61 @@ def huoqu_zuixin_hengjiemian(
                 "volume_ratio",
                 "pe",
                 "pe_ttm",
+                "pe_static",
                 "pb",
+                "valuation_close",
                 "total_market_value_yuan",
                 "circulating_market_value_yuan",
             )
             if column in daily.columns
         ]
-        data = basic.merge(daily[keep_daily].drop_duplicates("ts_code"), on="ts_code", how="inner")
+        daily_rows = daily[keep_daily].drop_duplicates("ts_code")
+        basic_codes = set(basic["ts_code"])
+        daily_codes = set(daily_rows["ts_code"])
+        unmatched_daily_codes = sorted(daily_codes - basic_codes)
+        basic_without_daily_codes = sorted(basic_codes - daily_codes)
+        # 身份目录降级时，估值表完整分页不等于上市证券名单完整；并集保留
+        # 未匹配者，由后续必要数据核验记录缺口，不能在合并阶段悄悄删掉。
+        data = basic.merge(daily_rows, on="ts_code", how="outer", validate="one_to_one")
+        if "name" not in data:
+            data["name"] = None
+        data["name"] = data["name"].astype(object).where(data["name"].notna(), None)
+        missing_identity = data["name"].isna() | data["name"].fillna("").astype(str).str.strip().eq("")
+        missing_identity_codes = sorted(data.loc[missing_identity, "ts_code"].astype(str))
+        identity_provenance = copy.deepcopy(basic_quality.get("stock_basic") or basic_quality)
+        directory_source = str(identity_provenance.get("source") or "unverified")
+        directory_coverage_verified = directory_source == "tushare_live"
+        if unmatched_daily_codes:
+            warnings.append(
+                f"{len(unmatched_daily_codes)} 只有效日线证券未匹配本次身份目录；保留日线原值与代码，名称及目录身份信息尚未核验"
+            )
+        if basic_without_daily_codes:
+            warnings.append(
+                f"{len(basic_without_daily_codes)} 只目录证券没有本次完整日线；保留候选记录，后续按必要价量缺失核验，不能视为已比较"
+            )
+        if not directory_coverage_verified:
+            warnings.append(
+                "本次身份目录采用公开来源或来源尚未核验；已完成该来源返回记录的处理，但未与完整上市名单交叉核验，不能声称全市场覆盖完整"
+            )
+        coverage_partial = bool(missing_identity_codes or basic_without_daily_codes or not directory_coverage_verified)
         return data.reset_index(drop=True), {
-            "status": "ok",
+            "status": "partial" if coverage_partial else "ok",
             "source": "tushare_daily_cross_section",
             "as_of": pd.Timestamp(actual_date).strftime("%Y-%m-%d"),
             "rows": int(len(data)),
             "warnings": warnings,
+            "valuation_provenance": valuation_meta,
+            "stock_basic_provenance": identity_provenance,
+            "identity_directory_coverage_verified": directory_coverage_verified,
+            "identity_directory_rows": len(basic_codes),
+            "complete_daily_rows": len(daily_codes),
+            "unmatched_daily_identity_count": len(unmatched_daily_codes),
+            "unmatched_daily_identities": [{"ts_code": code, "name": None} for code in unmatched_daily_codes],
+            "missing_identity_count": len(missing_identity_codes),
+            "missing_identity_codes": missing_identity_codes,
+            "directory_without_daily_count": len(basic_without_daily_codes),
+            "directory_without_daily_codes": basic_without_daily_codes,
+            "security_scope": {"directory": basic_security_scope, "daily": daily_security_scope},
         }
     except Exception as exc:
         warnings.append(f"Tushare 完整交易日横截面不可用：{exc}")
@@ -1009,9 +1241,7 @@ def _normalize_constituents(frame: pd.DataFrame) -> pd.DataFrame:
     data = frame.rename(columns={key: value for key, value in rename.items() if key in frame.columns}).copy()
     if not {"ts_code", "name"}.issubset(data.columns):
         raise ValueError("板块成分接口缺少代码或名称列")
-    data["ts_code"] = data["ts_code"].astype(str).str.extract(r"(\d+)", expand=False).str.zfill(6)
-    data = data[data["ts_code"].map(_shi_a_gu)].copy()
-    data["ts_code"] = data["ts_code"].map(_normalize_code)
+    data = _guolv_a_gu_jilu(data, source="eastmoney_a_share_constituents")
     data["name"] = data["name"].fillna("").astype(str)
     for column in (
         "latest_price",
@@ -1083,6 +1313,7 @@ def huoqu_bankuai_chengfen(
         "board_type": resolved_scope.kind.value,
         "name_similarity": round(resolved_scope.match_score, 4),
         "warnings": [],
+        "security_scope": copy.deepcopy(data.attrs.get("security_scope", {})),
     }
 
 
@@ -1101,6 +1332,15 @@ _DONGCAI_KLINE_COLUMNS = (
 )
 
 
+def _zhengli_qfq_rili_riqi(data: pd.DataFrame) -> pd.DataFrame:
+    """来源日期必须有效且唯一；保留价量缺失，交由各指标窗口核验。"""
+    if data["trade_date"].isna().any():
+        raise ValueError("前复权日线包含无效交易日期")
+    if data["trade_date"].duplicated().any():
+        raise ValueError("前复权日线包含重复交易日期，不能任意保留一条")
+    return data.sort_values("trade_date").reset_index(drop=True)
+
+
 def _jiexi_dongcai_rili(rows: list[str]) -> pd.DataFrame:
     """把东方财富日 K 文本转换为统一的前复权日线口径。"""
     records: list[list[str]] = []
@@ -1115,12 +1355,7 @@ def _jiexi_dongcai_rili(rows: list[str]) -> pd.DataFrame:
         data[column] = pd.to_numeric(data[column], errors="coerce")
     # 东方财富日 K 成交量以手为单位；统一为股。成交额本身即为元。
     data["volume"] = data["volume"] * 100.0
-    data = (
-        data.dropna(subset=["trade_date", "open", "high", "low", "close"])
-        .drop_duplicates("trade_date", keep="last")
-        .sort_values("trade_date")
-        .reset_index(drop=True)
-    )
+    data = _zhengli_qfq_rili_riqi(data)
     data["pre_close"] = data["close"].shift(1)
     return data.replace([np.inf, -np.inf], np.nan)
 
@@ -1154,12 +1389,7 @@ def _jiexi_tengxun_rili(
     # 成交口径，不能再用前复权价格乘成交量估算。
     data["amount_yuan"] = data["amount_10k_yuan"] * 10_000.0
     data = data.drop(columns=["amount_10k_yuan"])
-    data = (
-        data.dropna(subset=["trade_date", "open", "high", "low", "close"])
-        .drop_duplicates("trade_date", keep="last")
-        .sort_values("trade_date")
-        .reset_index(drop=True)
-    )
+    data = _zhengli_qfq_rili_riqi(data)
     if data.empty:
         return data
     data["pre_close"] = data["close"].shift(1)
@@ -1403,18 +1633,21 @@ def _jiancha_qfq_lishi_zhiliang(
     *,
     expected_dates: frozenset[pd.Timestamp],
     minimum_rows: int,
-    minimum_coverage: float,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """各来源共用交易日、样本数量和末日检查；不混合不同源的复权价格。"""
+    """核验来源日期和末端必要价格窗口；整段历史覆盖率仅披露。"""
     data = frame.copy()
     dates = pd.to_datetime(
         data.get("trade_date", pd.Series(index=data.index, dtype="datetime64[ns]")),
         errors="coerce",
     ).dt.normalize()
     data["trade_date"] = dates
+    reasons: list[str] = []
+    if dates.isna().any():
+        reasons.append("invalid_trade_dates")
+    if dates.duplicated().any():
+        reasons.append("duplicate_trade_dates")
     data = (
         data.loc[dates.isin(expected_dates)]
-        .drop_duplicates("trade_date", keep="last")
         .sort_values("trade_date")
         .reset_index(drop=True)
     )
@@ -1424,17 +1657,27 @@ def _jiancha_qfq_lishi_zhiliang(
     coverage = len(actual_dates & relevant) / len(relevant) if relevant else 0.0
     latest = max(actual_dates, default=None)
     required_latest = max(expected_dates, default=None)
-    reasons: list[str] = []
     if len(data) < minimum_rows:
         reasons.append("insufficient_rows")
-    if coverage < minimum_coverage:
-        reasons.append("insufficient_session_coverage")
     if required_latest is None or latest != required_latest:
         reasons.append("latest_session_missing")
+    required_window = sorted(expected_dates)[-minimum_rows:]
+    if not reasons:
+        prices = data.set_index("trade_date")
+        closes = pd.to_numeric(
+            prices.get("close", pd.Series(np.nan, index=prices.index)), errors="coerce",
+        ).reindex(required_window)
+        if len(required_window) < minimum_rows or not (np.isfinite(closes) & closes.gt(0)).all():
+            reasons.append("required_price_window_incomplete")
+        latest_prices = pd.to_numeric(
+            prices.loc[required_latest].reindex(["open", "high", "low", "close"]), errors="coerce",
+        )
+        if not (np.isfinite(latest_prices) & latest_prices.gt(0)).all():
+            reasons.append("latest_price_fields_invalid")
     observed_rows = int(len(data))
     missing_sessions = sorted(relevant - actual_dates)
     if missing_sessions and not reasons:
-        # 质量可接受的局部缺口也必须进入时间轴；不能把两侧价格拼成连续收益/EMA窗口。
+        # 所有历史缺口都进入时间轴；不能把缺口两侧价格拼成连续收益/EMA窗口。
         data = data.set_index("trade_date").reindex(sorted(relevant)).rename_axis("trade_date").reset_index()
     return data, {
         "accepted": not reasons,
@@ -1443,6 +1686,7 @@ def _jiancha_qfq_lishi_zhiliang(
         "session_coverage": round(float(coverage), 4),
         "latest_date": latest.strftime("%Y-%m-%d") if latest is not None else None,
         "required_latest_date": required_latest.strftime("%Y-%m-%d") if required_latest is not None else None,
+        "required_continuous_prices": minimum_rows,
         "reasons": reasons,
     }
 
@@ -1484,7 +1728,6 @@ def huoqu_piliang_qfq_lishi(
         else {}
     )
     expected_dates = frozenset(day for day in resolved_calendar.open_dates if start <= day <= end)
-    minimum_coverage = float(config.get("fenxi", {}).get("minimum_history_session_coverage", 0.9))
     ready: dict[str, pd.DataFrame] = {}
     source_by_code: dict[str, str] = {}
     quality_by_code: dict[str, dict[str, Any]] = {}
@@ -1498,7 +1741,6 @@ def huoqu_piliang_qfq_lishi(
                 frame,
                 expected_dates=expected_dates,
                 minimum_rows=minimum_rows,
-                minimum_coverage=minimum_coverage,
             )
             quality_by_code[code] = {"ts_code": code, "source": source, **quality}
             if quality["accepted"]:
@@ -1592,7 +1834,7 @@ def huoqu_piliang_qfq_lishi(
             actual_max.strftime("%Y-%m-%d") if actual_max is not None else None,
         ],
         "expected_open_sessions": len(expected_dates),
-        "minimum_session_coverage": minimum_coverage,
+        "session_coverage_policy": "informational_only; each_indicator_requires_its_own_continuous_window",
         "session_coverage": {
             "minimum": min(coverage_by_code.values(), default=None),
             "median": (

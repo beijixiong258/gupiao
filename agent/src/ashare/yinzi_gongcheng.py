@@ -14,6 +14,8 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from src.ashare.tuijian_zhishu import jisuan_tuijian_yuanzhi
+
 
 FACTOR_ENGINEERING_VERSION = "daily-factor-engineering-v2"
 
@@ -33,6 +35,7 @@ FACTOR_GROUPS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
                 "ma_trend_5_20",
                 "trend_slope_20",
                 "trend_fit_quality_20",
+                "directional_efficiency_20",
                 "ma_5_20_gap_change",
             ),
         ),
@@ -65,6 +68,7 @@ FACTOR_GROUPS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
                 "wvma_20",
                 "volume_price_residual_20",
                 "overnight_intraday_corr_20",
+                "up_amount_dominance_20",
             ),
         ),
         (
@@ -165,6 +169,8 @@ RAW_PRICE_VOLUME_FEATURE_COLUMNS: tuple[str, ...] = (
     "overnight_intraday_corr_20",
     "trend_slope_20",
     "trend_fit_quality_20",
+    "directional_efficiency_20",
+    "up_amount_dominance_20",
     "breakout_distance_20",
     "breakout_volume_confirmation",
     "pullback_quality_20",
@@ -199,7 +205,7 @@ FACTOR_INPUT_REQUIREMENTS: dict[str, str] = {
 
 
 def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
-    """返回非别名指标；所有字段仅用于证据展示，不产生分数。"""
+    """返回非别名原始指标；本函数不合成推荐指数。"""
     return tuple(
         feature for feature in members
         if feature not in FACTOR_ALIASES and feature not in FACTOR_DIAGNOSTIC_ONLY
@@ -207,11 +213,45 @@ def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
 
 def factor_definition(feature: str) -> dict[str, Any]:
     """指标名称和单位的唯一说明，数值仍完全由量化程序计算。"""
+    if feature == "recommendation_index":
+        return {
+            "label": "推荐指数（当前量价状态）", "unit": "指数点", "display_scale": 1,
+            "meaning": "本次共同有效比较池内的相对量价状态；不是收益率、上涨概率、置信度或未来收益预测，跨日期及不同范围不能直接比较",
+            "formula": "p(x)=(升序平均名次(x)-0.5)/N; P=(p(ret_20)+p(directional_efficiency_20))/2; V=p(up_amount_dominance_20); I=100*sqrt(P*V)",
+            "window": "同一分析日、同一资格范围的完整三原值共同池；原值使用20个连续交易间隔",
+            "minimum_observations": "共同池至少2只三原值全部有效的股票；两组几何等权，价格组内部等权，不按历史结果调整权重",
+            "missing_rule": "任一原值缺失或共同池不足2只时不产生指数；不填中性值、不重分权重、不舍入后排序；完全相同明确并列",
+            "source_basis": "本次权威日历对齐并核验的真实收盘价、成交额及全量资格核验后共同池；不训练模型",
+        }
+    if feature == "tdx_control_raw" or feature == "tdx_control_range_position" or feature in {
+        "tdx_control_change_1d", "tdx_control_change_5d", "tdx_control_change_20d",
+    }:
+        if feature == "tdx_control_raw":
+            label, unit, scale = "通达信每日主力控盘指标原值", "原值点", 1
+            meaning = "200745接口N002原值；百分比单位、分母和算法尚未核实，不代表机构或个人实际持股比例"
+            formula, window, minimum = "保留来源N002，不缩放或倒推持股数量", "来源观测日", "至少1条经权威交易日历核验的有限数观测"
+        elif feature == "tdx_control_range_position":
+            label, unit, scale = "控盘指标在本次样本区间的位置", "%", 100
+            meaning = "最新值在本次实际取得样本最小值与最大值之间的位置；不是持股比例、全历史分位或评分"
+            formula, window, minimum = "(latest-min(sample))/(max(sample)-min(sample))", "本次实际取得的至多30条有效来源观测", "至少2条有效观测且最大值大于最小值；样本数及起止日另列"
+        else:
+            period = int(feature.removeprefix("tdx_control_change_").removesuffix("d"))
+            label, unit, scale = f"控盘指标{period}个交易间隔变化", "原值点", 1
+            meaning = "同股同源指标原值相减；不改称百分点、机构增减仓或独立资金流确认"
+            formula, window, minimum = f"raw[t]-raw[t-{period}]", f"{period}个连续交易间隔", f"{period + 1}条权威日历上连续有效观测；缺口不能跨越"
+        return {
+            "label": label, "unit": unit, "display_scale": scale, "meaning": meaning,
+            "formula": formula, "window": window, "minimum_observations": minimum,
+            "missing_rule": "空值、非有限数、日期未核验、窗口不足或全零未核实的来源序列不参与变化解读；不补零、不插值",
+            "source_basis": "本次直连通达信TQLEX的200745来源序列；服务端时钟不是指标更新时间，盘中实时性尚未核验",
+        }
     fixed = {
         "ma_trend_5_20": ("MA5相对MA20偏离", "%", 100, "短均线相对中期均线的距离"),
         "ma_5_20_gap_change": ("价格对MA5与MA20偏离差的变化", "百分点", 100, "价格相对MA5偏离减相对MA20偏离，再取日变化"),
         "trend_slope_20": ("20日对数价格日均变化", "%", 100, "20日对数收盘价变化除以20，不是回归预测斜率"),
         "trend_fit_quality_20": ("20日趋势变化与波动比", "倍", 1, "绝对价格变化相对波动的比值，不是回归拟合优度，也不表示上涨方向"),
+        "directional_efficiency_20": ("20日带方向价格路径效率", "", 1, "净价格变化占绝对价格行进路径的比例，范围-1至1；保留涨跌方向，不代表未来收益"),
+        "up_amount_dominance_20": ("20日上涨成交额占优度", "", 1, "上涨日与下跌日真实成交额之差除以总成交额，范围-1至1；平盘进入分母，不代表主动买入或主力净流入"),
         "rsi_14": ("14日相对强弱指标RSI", "", 1, "上涨与下跌幅度的相对强弱，范围0至100，不是股票评分"),
         "macd_dif_pct": ("MACD快线相对价格", "%", 100, "DIF除以当前收盘价"),
         "macd_hist_pct": ("MACD柱相对价格", "%", 100, "MACD柱除以当前收盘价"),
@@ -294,6 +334,8 @@ def _calculation_definition(feature: str, meaning: str) -> dict[str, Any]:
         "ma_5_20_gap_change": ("diff(close/MA5-close/MA20)", "连续两日的5和20日均线", "21条连续有效收盘价"),
         "trend_slope_20": ("ln(close/close[-20])/20", "20个收益间隔", "21条连续有效收盘价"),
         "trend_fit_quality_20": ("abs(ln(close/close[-20]))/(std(ret1,ddof=1)*sqrt(20))", "20个收益间隔", "21条连续收盘价且收益标准差大于零"),
+        "directional_efficiency_20": ("(close-close[-20])/sum(abs(diff(close)),20)", "20个连续交易间隔", "21条经权威日历对齐的连续有效正收盘价且绝对路径大于零；全平窗口留空"),
+        "up_amount_dominance_20": ("sum(amount_yuan*sign(diff(close)),20)/sum(amount_yuan,20)", "20个连续交易间隔及其后20日成交额", "21条经权威日历对齐的连续有效正收盘价、20条真实非负成交额且总额大于零；平盘方向贡献为零"),
         "rsi_14": ("100-100/(1+EWM(涨幅)/EWM(跌幅)); alpha=1/14, adjust=False, 首个有效差分作种子", "14期递推，沿用全部连续有效历史", "14个连续差分；全平=50、仅涨=100、仅跌=0；缺失后重新预热"),
         "macd_dif_pct": ("(EMA12-EMA26)/close; alpha=2/(N+1), adjust=False, 首价作种子", "12和26期递推", "26条连续有效收盘价；缺失后重新预热"),
         "macd_hist_pct": ("2*(DIF-DEA)/close; DIF=EMA12-EMA26; DEA=EMA9(DIF); adjust=False", "12/26/9期递推，沿用全部连续有效历史", "34条连续有效收盘价；价格与DIF分别以首个有效值作种子；缺失后重新预热"),
@@ -518,7 +560,10 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         stalling = position20 * anomaly.clip(lower=0.0) * (1.0 - location)
         ma_gap_change = (_numeric(local, "ma_gap_5") - ma_gap20).diff()
         low_volume_shadow = (1.0 - position20).clip(lower=0.0, upper=1.0) * lower.clip(lower=0.0) / (1.0 + ratio.clip(lower=0.0))
+        recommendation_raw = jisuan_tuijian_yuanzhi(local)
         values = {
+            "directional_efficiency_20": recommendation_raw["directional_efficiency_20"],
+            "up_amount_dominance_20": recommendation_raw["up_amount_dominance_20"],
             "gap_open": gap,
             "intraday_return": intraday,
             "close_location": location,
@@ -549,6 +594,8 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         for column, series in values.items():
             data.loc[local.index, column] = pd.to_numeric(series, errors="coerce").to_numpy()
         paired_samples = {
+            "directional_efficiency_20": c.diff(),
+            "up_amount_dominance_20": c.diff().where(a.notna()),
             "amount_anomaly_20": a,
             "return_amount_corr_20": ret1.where(amount_change.notna()),
             "price_turnover_corr_20": ret1.where(turnover.diff().notna()),

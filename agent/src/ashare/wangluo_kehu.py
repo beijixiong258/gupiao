@@ -149,10 +149,17 @@ class GongkaiShujuHTTPKehu:
         self,
         endpoints: Iterable[str],
         *,
-        params: dict[str, Any],
+        params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        method: str = "GET",
+        json_body: Any = None,
     ) -> tuple[dict[str, Any], str]:
-        """依次尝试候选端点，返回 JSON 对象和实际端点。"""
+        """依次尝试候选端点；POST 与 GET 共用连接策略、重试和来源记录。"""
+        method = str(method).upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError("公开数据 JSON 请求仅支持 GET 或 POST")
+        if method == "GET" and json_body is not None:
+            raise ValueError("GET 请求不能带 JSON 请求体")
         candidates = tuple(dict.fromkeys(str(value).strip() for value in endpoints if str(value).strip()))
         if not candidates:
             raise ValueError("远端端点不能为空")
@@ -165,7 +172,11 @@ class GongkaiShujuHTTPKehu:
             host = urlsplit(endpoint).hostname or "unknown"
             for attempt in range(1, maximum_attempts + 1):
                 try:
-                    response = self._client.get(endpoint, params=params, headers=headers)
+                    response = (
+                        self._client.post(endpoint, params=params, headers=headers, json=json_body)
+                        if method == "POST"
+                        else self._client.get(endpoint, params=params, headers=headers)
+                    )
                     response.raise_for_status()
                     payload = response.json()
                     if not isinstance(payload, dict):

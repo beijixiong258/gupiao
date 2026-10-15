@@ -59,8 +59,8 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
     for key in ("min_amount_yuan",):
         if _youxian_shuzhi(analysis, key, "fenxi") < 0:
             raise ValueError(f"fenxi.{key} 不能小于 0")
-    if not 0.5 <= _youxian_shuzhi(analysis, "minimum_history_session_coverage", "fenxi") <= 1:
-        raise ValueError("fenxi.minimum_history_session_coverage 必须在 0.5 到 1 之间")
+    # 兼容旧配置，但整段历史覆盖率不再是候选或单股报告的硬门槛。
+    analysis.pop("minimum_history_session_coverage", None)
     if _youxian_shuzhi(analysis, "high_volatility_threshold", "fenxi") <= 0:
         raise ValueError("fenxi.high_volatility_threshold 必须大于 0")
     macd_structure = analysis.get("macd_structure")

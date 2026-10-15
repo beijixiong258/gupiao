@@ -56,6 +56,7 @@ def goujian_dangu_zhaiyao(
     late: dict[str, Any] | None = None, supplemental: dict[str, Any] | None = None,
     research_assessment: dict[str, Any] | None = None,
     snapshot: dict[str, Any] | None = None, tradability: dict[str, Any] | None = None,
+    ownership_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     structure = technical.get("macd_structure") or {}
     usable_structure = structure.get("status") == "ok"
@@ -77,14 +78,14 @@ def goujian_dangu_zhaiyao(
             elif value < 0:
                 counter.append(fact)
     close = _number(raw.get("close", technical.get("close")))
-    averages = {**(technical.get("moving_averages") or {}), **{f"ma{period}": raw[f"ma_{period}"] for period in (20, 60) if f"ma_{period}" in raw}}
-    for period in (20, 60):
+    averages = {**(technical.get("moving_averages") or {}), **{f"ma{period}": raw[f"ma_{period}"] for period in (5, 10, 20, 60) if f"ma_{period}" in raw}}
+    for period in (5, 10, 20, 60):
         value = _number(averages.get(f"ma{period}"))
         if close is not None and value is not None:
             relation = "高于" if close > value else "低于" if close < value else "等于"
             fact = f"收盘价 {close:.3f} {relation}{period}日均线 {value:.3f}"
             price_facts.append(fact)
-            if close != value:
+            if period in (20, 60) and close != value:
                 (supporting if close > value else counter).append(fact)
     ma20, ma60 = _number(averages.get("ma20")), _number(averages.get("ma60"))
     for period, average in ((20, ma20), (60, ma60)):
@@ -95,8 +96,28 @@ def goujian_dangu_zhaiyao(
     context["价格与趋势"] = price_facts
     context["动能结构"] = _texts([
         (structure.get("structure_classification") or {}).get("label") if usable_structure else structure.get("reason"),
+        (structure.get("zero_axis") or {}).get("label") if usable_structure else None,
+        (structure.get("momentum") or {}).get("label") if usable_structure else None,
         *(structure.get("warnings") or []),
     ])
+    macd = technical.get("macd") or {}
+    macd_values = [
+        f"{label} {value:.6g}"
+        for field, label in (("dif", "DIF"), ("dea", "DEA"), ("histogram", "柱值"))
+        if (value := _number(macd.get(field))) is not None
+    ]
+    if macd_values:
+        context["动能结构"].append("MACD原值：" + "，".join(macd_values) + "；柱值描述快慢线差，不能单独确认趋势反转")
+    cross = structure.get("latest_cross") or {}
+    if cross.get("event_date"):
+        cross_state = {
+            "active": "处于程序有效期内" if usable_structure else "结构未完整核验，当前适用性仍受限",
+            "expired": "已过期，仅保留历史观察", "invalidated": "已失效，仅保留历史观察",
+        }.get(cross.get("status"), "当前有效性未确认")
+        cross_note = cross.get("invalidation_reason") or "交叉本身不能单独作为买卖依据"
+        context["动能结构"].append(f"最近一次{cross.get('label') or '交叉'}发生于 {cross['event_date']}：{cross_state}；{cross_note}")
+    if not usable_structure and macd_values:
+        context["动能结构"].append("MACD结构未完整核验，所列数值不代表结构信号已确认")
     groups = (factor_analysis or {}).get("groups") or {}
 
     def factor(group: str, field: str) -> float | None:
@@ -106,6 +127,17 @@ def goujian_dangu_zhaiyao(
     if volume_ratio is None:
         volume_ratio = factor("price_volume_confirmation", "volume_ratio_5_20")
     context["量价配合"] = [f"5日与20日均量比为 {volume_ratio:.3f}；仅描述量能变化"] if volume_ratio is not None else ["均量比较证据缺失"]
+    amount_ratio = factor("price_volume_confirmation", "amount_ratio_5_20")
+    if amount_ratio is not None:
+        context["量价配合"].append(f"5日与20日均成交额比为 {amount_ratio:.3f}；与均量比共同描述同一量价背景，不作为独立票数")
+    context["量价配合"].append("5日与20日均值比较不能代替当日相对前一日是否放量的核验")
+    breakout = factor("breakout_pullback_quality", "breakout_distance_20")
+    context["价格位置与突破"] = [
+        f"收盘价相对此前20条日线最高价的距离为 {breakout:.2%}（参照窗口不含当日）；只说明价格位置，未包含持续站稳和量能确认"
+        if breakout is not None else "此前20条日线高点比较缺失，不能确认是否越过该历史高点"
+    ]
+    if breakout is not None:
+        reassessment.append("新完整日线到达后重算相对此前20日高点的位置，并结合量价复核；本次距离不保证后续站稳")
     ret5 = _number(returns.get("5d"))
     if ret5 is not None and ret5 > 0 and volume_ratio is not None and volume_ratio < 1:
         conflicts.append("近5日上涨，但5日均量低于20日均量；没有同时获得均量放大的确认")
@@ -118,6 +150,7 @@ def goujian_dangu_zhaiyao(
             if value != 0:
                 (supporting if value > 0 else counter).append(fact)
     context["相对表现"] = relative_facts or ["指数或真实同行比较证据不足"]
+    context["相对表现"].append("超额收益是本股与参照对象的收益差，不能当作指数本身收益；同行结论只适用于本次实际取得的样本")
     market_facts: list[str] = []
     for field, text in (
         ("market_regime_strong", "沪深300方向与本次比较池广度同时偏强"),
@@ -129,12 +162,22 @@ def goujian_dangu_zhaiyao(
     context["市场背景"] = market_facts or ["市场方向与比较池广度证据不足"]
     if ret5 is not None and ret5 > 0 and factor("market_context", "market_regime_weak") == 1:
         conflicts.append("本股近5日上涨，但指数与比较池背景偏弱；个股改善不能替代市场环境核验")
-    context["下行风险与流动性"] = _texts([
-        block.get("summary") for block in (supplemental or {}).get("blocks", [])
-        if block.get("key") in {"downside_risk", "atr_distance", "liquidity_stability"}
-        and block.get("status") in {"ok", "partial"}
-    ]) or ["下行风险、均线偏离或流动性稳定性证据不足"]
-    cross = structure.get("latest_cross") or {}
+
+    def supplemental_facts(keys: set[str]) -> list[str]:
+        facts = []
+        for block in (supplemental or {}).get("blocks") or []:
+            if block.get("key") not in keys:
+                continue
+            label = block.get("label") or "补充证据"
+            if block.get("status") in {"ok", "partial"} and block.get("summary"):
+                facts.append(f"{label}：{block['summary']}")
+            if block.get("missing_reason") or block.get("status") not in {"ok", "partial"}:
+                facts.append(f"{label}缺口：{block.get('missing_reason') or block.get('summary') or '该项证据未核验'}")
+        return _texts(facts)
+
+    context["量价配合"].extend(supplemental_facts({"volume_pressure"}))
+    context["下行风险与流动性"] = supplemental_facts({"downside_risk", "atr_distance", "liquidity_stability"}) or ["下行风险、均线偏离或流动性稳定性证据不足"]
+    context["下行风险与流动性"].append("历史回撤、波动和成交额描述已经发生的幅度与成交背景，不是未来最大亏损或即时成交保证")
     if usable_structure:
         reassessment.extend(_texts(structure.get("invalidation_conditions")))
         if cross.get("status") == "active" and cross.get("invalidation_condition"):
@@ -161,7 +204,26 @@ def goujian_dangu_zhaiyao(
         value = _number(financials.get(field))
         if value is not None:
             financial_facts.append(f"本次财报{label} {value:.6g}%；仅据正负不能判断水平高低或确认价格趋势")
-    context["财务背景"] = financial_facts or ["财务证据缺失，不能据此判断公司优劣"]
+    financial_facts.extend(supplemental_facts({"financial_growth", "cashflow_quality", "report_timeliness"}))
+    context["财务背景"] = _texts(financial_facts) or ["财务证据缺失，不能据此判断公司优劣"]
+    ownership = ownership_analysis or {}
+    interpretation = ownership.get("interpretation")
+    holding_facts = _texts(interpretation) if isinstance(interpretation, list) else [interpretation] if isinstance(interpretation, str) else []
+    if not holding_facts:
+        latest_control = ownership.get("latest") or {}
+        control_value = _number(latest_control.get("raw_value"))
+        if control_value is not None:
+            holding_facts.append(f"通达信控盘指标在 {latest_control.get('trade_date') or ownership.get('as_of') or '来源观测日'} 的原值为 {control_value:.6g}")
+    if ownership:
+        holding_facts.append("控盘原值的公式、分母和账户身份尚未核实；只用于观察变化，不能换算机构、个人持股比例或直接判定加仓出货")
+        reassessment.append("取得新的同源控盘观测并核验其日期、公式、单位及实际更新时间后复评，与共同交易日的价量证据对照")
+    context["持仓与控盘观察"] = _texts(holding_facts) or ["本次未取得可核验的控盘指标，不能判断其变化"]
+    context["证据缺口与影响"] = _texts([
+        f"{gap.get('component') or '该项证据'}：{gap.get('reason') or '所需信息尚未核验'}；"
+        f"影响：{gap.get('impact') or '该项不能支持方向判断，其他已核验证据继续保留'}；"
+        f"补齐条件：{gap.get('reassessment_condition') or '补齐相应来源和时点核验后复评'}"
+        for gap in evidence_gaps
+    ]) or ["本次未报告证据缺口；这不代表已经验证未来收益"]
     intraday = _intraday_effect(snapshot or {}, tradability or {}, raw)
     context["盘中变化"] = _texts([intraday.get("effect") or intraday.get("reason"), intraday.get("reference_note")])
     if intraday.get("status") == "intraday_provisional":
@@ -180,8 +242,14 @@ def goujian_dangu_zhaiyao(
         judgment = "20日已实现表现与均线位置同向偏弱"
         if ret5 is not None and ret5 > 0:
             judgment += "，近5日反弹尚未改变这一背景"
+    elif ret20 > 0 and close < ma20:
+        judgment = "近20日累计仍上涨，但收盘价已低于20日均线；区间收益与当前位置存在分歧"
+    elif ret20 < 0 and close > ma20:
+        judgment = "近20日累计仍下跌，但收盘价已高于20日均线；当前位置改善尚未改变区间下跌背景"
     else:
-        judgment = "20日收益与均线位置未形成同向强弱，现有证据有分歧"
+        return_state = "上涨" if ret20 > 0 else "下跌" if ret20 < 0 else "持平"
+        position = "高于" if close > ma20 else "低于" if close < ma20 else "等于"
+        judgment = f"近20日累计收益{return_state}，收盘价{position}20日均线；尚未同时满足收益与均线位置同向偏强或偏弱"
     if research_assessment:
         judgment = str(research_assessment["verdict_label"]) + "。总体背景：" + judgment
         reassessment.extend(research_assessment.get("reassessment_conditions") or [])
@@ -209,12 +277,13 @@ def goujian_dangu_zhaiyao(
         "evidence_context": context,
         "evidence_conflicts": _texts(conflicts),
         "evidence_families": [
-            {"family": "price", "contexts": ["价格与趋势", "动能结构", "相对表现", "形态适用状态"],
+            {"family": "price", "contexts": ["价格与趋势", "价格位置与突破", "动能结构", "相对表现", "形态适用状态"],
              "role": "相关价格观测及其比较；不同窗口、变换和形态不作为多个独立票数"},
             {"family": "price_volume", "contexts": ["量价配合"], "role": "检验价格变化的量能背景；放量本身不等于利好"},
             {"family": "financial", "contexts": ["财务背景"], "role": "公司经营背景；只有与待验证命题直接相关时才成为直接证据"},
+            {"family": "ownership_proxy", "contexts": ["持仓与控盘观察"], "role": "来源控盘指标及其变化；算法未知，可能与价量观测相关，不作为独立确认或实际账户持仓"},
         ],
-        "interpretation_basis": "关系判断优先采用未舍入原值，文字数值按展示精度舍入；同源价格指标不作独立投票，未计算综合分或上涨概率",
+        "interpretation_basis": "主要判断概括20日收益与20日均线位置，完整评价还需结合各项证据、反证和缺口；关系判断优先采用未舍入原值，文字数值按展示精度舍入；同源价格指标不作独立投票，未计算综合分或上涨概率",
         "reassessment_conditions": _texts(reassessment),
     }
 

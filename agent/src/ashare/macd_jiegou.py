@@ -369,26 +369,27 @@ def _find_pivots(
     pivots: list[MacdGuaiDian] = []
     left_count = settings.pivot_left_sessions
     right_count = settings.pivot_right_sessions
-    for index in range(left_count, len(data) - right_count):
-        window = values[index - left_count : index + right_count + 1]
-        if not np.isfinite(window).all():
-            continue
+    width = left_count + right_count + 1
+    if len(values) < width:
+        return pivots
+    windows = np.lib.stride_tricks.sliding_window_view(values, width)
+    centers = windows[:, left_count]
+    tolerance = np.maximum(np.abs(centers) * 1e-10, 1e-12)
+    left, right = windows[:, :left_count], windows[:, left_count + 1:]
+    if mode == "low":
+        extrema = (centers < left.min(axis=1) - tolerance) & (centers < right.min(axis=1) - tolerance)
+    else:
+        extrema = (centers > left.max(axis=1) + tolerance) & (centers > right.max(axis=1) + tolerance)
+    indices = np.flatnonzero(np.isfinite(windows).all(axis=1) & extrema) + left_count
+    dates = data["trade_date"].to_numpy()
+    for position in indices:
+        index = int(position)
         center = float(values[index])
-        left = window[:left_count]
-        right = window[left_count + 1 :]
-        tolerance = max(abs(center) * 1e-10, 1e-12)
-        is_pivot = (
-            center < float(left.min()) - tolerance and center < float(right.min()) - tolerance
-            if mode == "low"
-            else center > float(left.max()) + tolerance and center > float(right.max()) + tolerance
-        )
-        if not is_pivot:
-            continue
         confirmation_index = index + right_count
         pivots.append(
             MacdGuaiDian(
-                date=_date(data.iloc[index]["trade_date"]),
-                confirmation_date=_date(data.iloc[confirmation_index]["trade_date"]),
+                date=_date(dates[index]),
+                confirmation_date=_date(dates[confirmation_index]),
                 value=center,
                 index=index,
                 confirmation_index=confirmation_index,

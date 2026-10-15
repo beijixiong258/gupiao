@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.ashare.dangu_lianghua import yunxing_dangu_tongyi_lianghua
+from src.ashare.fenxi_yinzi import FenxiJisuanYichang
 from src.ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
 from src.ashare.gupiao_yanjiu import zongjie_jishu
 from src.ashare.fenxi_wenti import pinggu_yanjiu_wenti
@@ -78,7 +79,7 @@ def _failure(query: str, *, status: str, outcome: str, code: str, stage: str, er
 
 def _fundamental_block(raw: dict[str, Any], as_of: str) -> dict[str, Any]:
     financials, valuation = raw.get("financials") or {}, raw.get("valuation") or {}
-    if financials and valuation:
+    if financials and valuation and not financials.get("missing_fields") and raw.get("profile"):
         status = "ok"
     elif financials or valuation:
         status = "partial"
@@ -175,10 +176,13 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         extra_gaps.append(_gap("latest_daily_missing", "最新完整日线", f"实际日线停留在 {as_of}，没有取得请求日期 {requested_date:%Y-%m-%d} 的日线"))
     try:
         technical = zongjie_jishu(history, macd_structure_config=(config.get("fenxi") or {}).get("macd_structure"))
-    except RuntimeError as exc:
-        technical = {"status": "partial", "reason": str(exc), "trade_date": as_of, "close": history.iloc[-1].get("close")}
     except Exception as exc:
-        technical = {"status": "error", "outcome": "program_error", "error": str(exc), "trade_date": as_of}
+        raise FenxiJisuanYichang(f"{code} 技术摘要计算失败：{exc}") from exc
+    if technical.get("status") == "error" or technical.get("outcome") == "program_error":
+        reason = (technical.get("error") or technical.get("reason")
+                  or (technical.get("macd_structure") or {}).get("reason")
+                  or "技术结构研判发生程序错误")
+        raise FenxiJisuanYichang(f"{code} 技术摘要计算失败：{reason}")
     try:
         snapshot = context.dangu_kuaizhao(code)
     except Exception as exc:
@@ -233,6 +237,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         factor_analysis=unified.get("factor_analysis"), pattern=unified.get("limit_up_pullback_pattern"),
         late=unified.get("late_session_analysis"), supplemental=unified.get("supplemental_diagnostics"),
         research_assessment=question_assessment, snapshot=snapshot, tradability=tradability,
+        ownership_analysis=unified.get("ownership_analysis"),
     )
     status = "error" if technical.get("status") == "error" else "partial" if gaps else "ok"
     confirmation = "intraday_provisional" if clock.get("session_status") in {"opening_auction", "trading", "midday_break"} else "close_pending" if clock.get("session_status") == "close_pending" else "completed_daily_close"
@@ -252,6 +257,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         "limit_up_pullback_pattern": unified.get("limit_up_pullback_pattern"),
         "late_session_analysis": unified.get("late_session_analysis"),
         "supplemental_diagnostics": unified.get("supplemental_diagnostics"),
+        "ownership_analysis": unified.get("ownership_analysis"),
         "realtime_snapshot": snapshot, "tradability": tradability, "evidence_gaps": gaps,
         "risks": risks, "warnings": _texts([*(resolution_warnings or []), *(history_meta.get("warnings") or []), *(fundamentals.get("warnings") or [])]),
         "diagnosis_validity": {

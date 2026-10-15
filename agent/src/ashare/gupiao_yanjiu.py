@@ -19,6 +19,8 @@ from src.ashare.shuju_yuan import (
     huoqu_zhangdieting_guize,
 )
 from src.ashare.shichang_shuju import akshare_zhilian
+from src.ashare.wangluo_kehu import GongkaiShujuHTTPKehu, WangluoQingqiuYichang
+from src.ashare.shuju_zhiliang import VERIFIED_DAILY_VALUATION_SOURCES
 from src.ashare.yinzi_gongcheng import (
     RAW_PRICE_VOLUME_FEATURE_COLUMNS as ENGINEERED_RAW_PRICE_VOLUME_FEATURE_COLUMNS,
     add_price_volume_factors,
@@ -182,6 +184,8 @@ def jiexi_gupiao(
                     warnings.append("股票名称来自 AKShare 实时接口")
             except Exception as exc:
                 warnings.append(f"股票名称表暂不可用：{exc}")
+        if not resolved.get("name"):
+            raise RuntimeError(f"必要A股身份不可用：{code} 尚未在本次真实股票目录中确认，不能只凭代码形状分析为股票")
         return code, resolved, warnings
 
     errors: list[str] = []
@@ -558,7 +562,17 @@ def zongjie_jishu(
     *,
     macd_structure_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    features = jisuan_tezheng_biao(history)
+    return zongjie_jishu_tezheng(
+        jisuan_tezheng_biao(history), macd_structure_config=macd_structure_config,
+    )
+
+
+def zongjie_jishu_tezheng(
+    features: pd.DataFrame,
+    *,
+    macd_structure_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """解释本次已计算的完整日线特征，供因子构造与技术复核共用。"""
     if features.empty:
         return {"status": "unavailable", "outcome": "data_unavailable", "reason": "没有有效日线", "missing_indicators": [], "evidence": []}
     latest = features.iloc[-1]
@@ -587,9 +601,11 @@ def zongjie_jishu(
         "raw_indicators": {key: float(latest[key]) if pd.notna(latest[key]) else None for key in (
             "close", "ma_5", "ma_10", "ma_20", "ma_60", "ma_gap_20", "ma_trend_5_20", "ret_1", "ret_3", "ret_5", "ret_10", "ret_20",
             "macd_hist", "macd_hist_pct", "volume_ratio_5_20", "volatility_20",
+            "directional_efficiency_20", "up_amount_dominance_20",
         )},
         "indicator_definitions": {key: factor_definition(key) for key in (
             "rsi_14", "macd_hist_pct", "atr_14_pct", "volatility_20", "position_20", "drawdown_20",
+            "directional_efficiency_20", "up_amount_dominance_20",
         )},
         "calculation_basis": "同一份已核验完整日线；raw_indicators 保留计算精度，显示舍入不参与筛选",
         "close": _round_optional(latest["close"], 3),
@@ -619,19 +635,6 @@ def zongjie_jishu(
         "evidence": reasons,
         "indicator_warnings": indicator_warnings,
     }
-
-
-def _first_number(row: pd.Series | dict[str, Any], aliases: Iterable[str]) -> float | None:
-    items = row.items() if hasattr(row, "items") else []
-    normalized = [(str(key).lower(), value) for key, value in items]
-    for alias in aliases:
-        target = alias.lower()
-        for key, value in normalized:
-            if key == target or target in key:
-                number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-                if pd.notna(number):
-                    return float(number)
-    return None
 
 
 def _akshare_info(
@@ -688,48 +691,67 @@ def _financial_missing_fields(financials: dict[str, Any]) -> list[str]:
     return [field for field in FINANCIAL_CRITICAL_FIELDS if _round_optional(financials.get(field)) is None]
 
 
-def _akshare_financials(code: str, *, as_of: str | None = None) -> tuple[dict[str, Any], list[str]]:
-    import akshare as ak
-
-    errors: list[str] = []
-    digits = code.split(".")[0]
+def _gongkai_caiwu(code: str, *, as_of: str) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """公开财务主表：公告日和报告期均不得越过本次分析日，无积分依赖。"""
+    cutoff = pd.Timestamp(as_of).normalize()
+    metadata: dict[str, Any] = {"source": "eastmoney_financial_main", "persistence": "none"}
     try:
-        with akshare_zhilian():
-            table = ak.stock_financial_analysis_indicator(symbol=digits, start_year=str(datetime.now().year - 4))
-        if table is None or table.empty:
-            raise RuntimeError("返回空表")
-        date_column = next((column for column in ["日期", "报告期", "date"] if column in table.columns), None)
-        if not date_column:
-            raise RuntimeError("返回结果缺少报告期，无法保证分析时点一致")
-        table = table.assign(_date=pd.to_datetime(table[date_column], errors="coerce")).dropna(subset=["_date"])
-        if as_of is not None:
-            as_of_date = pd.to_datetime(as_of, errors="coerce")
-            if pd.isna(as_of_date):
-                raise ValueError(f"无效的分析日期：{as_of}")
-            table = table[table["_date"].dt.normalize() <= pd.Timestamp(as_of_date).normalize()]
-        if table.empty:
-            raise RuntimeError(f"截至 {as_of} 没有可用财务报告")
-        table = table.sort_values("_date")
-        row = table.iloc[-1]
-        financials = {
-            "report_date": pd.Timestamp(row["_date"]).strftime("%Y-%m-%d"),
-            "announcement_date": None,
-            "announcement_date_status": "AKShare 未提供公告日，仅在当前分析时点作为降级数据使用",
-            "roe_pct": _first_number(row, ["净资产收益率", "加权净资产收益率", "roe"]),
-            "gross_margin_pct": _first_number(row, ["销售毛利率", "毛利率", "grossprofit_margin"]),
-            "net_margin_pct": _first_number(row, ["销售净利率", "净利率", "netprofit_margin"]),
-            "debt_to_assets_pct": _first_number(row, ["资产负债率", "debt_to_assets"]),
-            "revenue_yoy_pct": _first_number(row, ["主营业务收入增长率", "营业收入同比增长", "or_yoy"]),
-            "net_profit_yoy_pct": _first_number(row, ["净利润增长率", "净利润同比增长", "netprofit_yoy"]),
-            "eps": _first_number(row, ["基本每股收益", "摊薄每股收益", "basic_eps"]),
-        }
-        financials["missing_fields"] = _financial_missing_fields(financials)
-        if financials["missing_fields"]:
-            errors.append(f"AKShare 最新财务报告缺少关键字段：{', '.join(financials['missing_fields'])}")
-        return financials, errors
-    except Exception as exc:
-        errors.append(f"AKShare 财务指标失败：{exc}")
-        return {}, errors
+        with GongkaiShujuHTTPKehu("eastmoney_financial_main") as client:
+            payload, endpoint = client.qingqiu_json(
+                ["https://datacenter.eastmoney.com/securities/api/data/v1/get"],
+                params={"reportName": "RPT_F10_FINANCE_MAINFINADATA", "columns": "ALL",
+                        "filter": f'(SECUCODE="{code}")', "sortColumns": "REPORT_DATE",
+                        "sortTypes": "-1", "pageSize": 32, "pageNumber": 1},
+            )
+            metadata.update(endpoint=endpoint, attempted_providers=[item.to_dict() for item in client.attempts])
+    except WangluoQingqiuYichang as exc:
+        metadata.update(status="unavailable", **exc.to_dict())
+        return {}, [f"公开财务取数失败：{exc}"], metadata
+    result = payload.get("result") or {}
+    rows = result.get("data") if isinstance(result, dict) else None
+    if payload.get("success") is not True or not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
+        metadata["status"] = "unavailable"
+        return {}, ["公开财务接口没有返回有效明细"], metadata
+    table = pd.DataFrame(rows)
+    if not {"SECUCODE", "REPORT_DATE", "NOTICE_DATE"}.issubset(table.columns):
+        metadata["status"] = "unavailable"
+        return {}, ["公开财务缺少证券、报告期或公告日，不能核验时点"], metadata
+    table = table[table["SECUCODE"].astype(str).eq(code)].copy()
+    table["_report"] = pd.to_datetime(table["REPORT_DATE"], errors="coerce")
+    table["_notice"] = pd.to_datetime(table["NOTICE_DATE"], errors="coerce")
+    known = table.loc[table["_report"].notna() & table["_notice"].notna()
+                      & table["_report"].dt.normalize().le(cutoff)
+                      & table["_notice"].dt.normalize().le(cutoff)].sort_values(["_report", "_notice"])
+    if known.empty:
+        metadata["status"] = "unavailable"
+        return {}, [f"截至 {as_of} 没有身份、报告期和公告日均通过核验的公开财务记录"], metadata
+    row = known.iloc[-1]
+    financials: dict[str, Any] = {
+        "known_as_of": as_of,
+        "report_date": row["_report"].strftime("%Y-%m-%d"),
+        "announcement_date": row["_notice"].strftime("%Y-%m-%d"),
+        "source": "eastmoney_financial_main",
+    }
+    fields = {"roe_pct": "ROEJQ", "gross_margin_pct": "XSMLL", "net_margin_pct": "XSJLL",
+              "debt_to_assets_pct": "ZCFZL", "revenue_yoy_pct": "TOTALOPERATEREVETZ",
+              "net_profit_yoy_pct": "PARENTNETPROFITTZ", "eps": "EPSJB"}
+    for target, origin in fields.items():
+        financials[target] = _round_optional(row.get(origin))
+    cash_ratio = _round_optional(row.get("JYXJLYYSR"), 12)
+    financials.update(
+        operating_cashflow_to_revenue_raw_ratio=cash_ratio,
+        operating_cashflow_to_revenue_pct=cash_ratio * 100 if cash_ratio is not None else None,
+        cashflow_unit_status="verified_ratio_to_percent",
+        cashflow_definition="来源JYXJLYYSR为经营活动现金净流量/营业收入（不是营业总收入）的比值；百分数由原值乘100",
+    )
+    financials["missing_fields"] = _financial_missing_fields(financials)
+    metadata.update(status="partial" if financials["missing_fields"] else "ok",
+                    report_date=financials["report_date"], announcement_date=financials["announcement_date"],
+                    original_fields={**fields, "operating_cashflow_to_revenue_raw_ratio": "JYXJLYYSR"},
+                    known_as_of=as_of, fetched_at=datetime.now().astimezone().isoformat(),
+                    history_revision_note="按当前来源返回及公告日核验，不声称拥有历史版本财务快照")
+    errors = ["公开财务缺少关键字段：" + ", ".join(financials["missing_fields"])] if financials["missing_fields"] else []
+    return financials, errors, metadata
 
 
 def huoqu_jibenmian(
@@ -797,89 +819,46 @@ def huoqu_jibenmian(
             if not dated.empty:
                 row = dated.iloc[-1]
                 valuation_date = pd.Timestamp(row["_trade_date"]).strftime("%Y-%m-%d")
-                if valuation_date == as_of_text:
+                valuation_source = str(row.get("valuation_source") or basic_daily.attrs.get("source")
+                                       or ("tushare_daily_basic" if daily_basic_loader is None else "unverified"))
+                complete_daily = row.get("valuation_is_complete_daily", valuation_source == "tushare_daily_basic")
+                verified_complete = complete_daily is True or isinstance(complete_daily, np.bool_) and bool(complete_daily)
+                if valuation_date == as_of_text and valuation_source in VERIFIED_DAILY_VALUATION_SOURCES and verified_complete:
                     valuation = {
                         "as_of": valuation_date,
                         "valuation_trade_date": valuation_date,
-                        "valuation_source": "tushare_daily_basic",
+                        "valuation_source": valuation_source,
                         "valuation_is_complete_daily": True,
                         "pe": _round_optional(row.get("pe")),
                         "pe_definition": "来源定义为总市值/净利润，保留原始口径，不改称动态或滚动市盈率",
                         "pe_ttm": _round_optional(row.get("pe_ttm")),
+                        "pe_static": _round_optional(row.get("pe_static")),
+                        "valuation_close": _round_optional(row.get("valuation_close")),
                         "pb": _round_optional(row.get("pb")),
                         "total_market_value_yuan": _round_optional(float(row.get("total_mv")) * 10000 if pd.notna(row.get("total_mv")) else None, 2),
                         "circulating_market_value_yuan": _round_optional(float(row.get("circ_mv")) * 10000 if pd.notna(row.get("circ_mv")) else None, 2),
                         "turnover_rate_pct": _round_optional(row.get("turnover_rate")),
                         "volume_ratio": _round_optional(row.get("volume_ratio")),
                     }
-                    sources["valuation"] = "tushare"
+                    sources["valuation"] = valuation_source
+                    data_quality["valuation"] = dict(basic_daily.attrs)
                 else:
                     errors.append(
-                        f"Tushare 估值日期为 {valuation_date}，与分析日 {as_of_text} 不一致，已忽略"
+                        f"估值日期 {valuation_date}、来源 {valuation_source} 或完整日终标记未通过分析日 {as_of_text} 核验，已忽略"
                     )
     except Exception as exc:
         errors.append(f"Tushare 估值失败：{exc}")
 
-    try:
-        pro = _tushare_pro()
-        indicator = pro.fina_indicator(
-            ts_code=code,
-            fields=(
-                "ts_code,ann_date,end_date,roe,roe_dt,grossprofit_margin,netprofit_margin,"
-                "debt_to_assets,or_yoy,netprofit_yoy,ocf_to_or,basic_eps"
-            ),
-        )
-        if indicator is not None and not indicator.empty:
-            known = indicator.copy()
-            announcement_dates = (
-                known["ann_date"]
-                if "ann_date" in known.columns
-                else pd.Series(pd.NaT, index=known.index, dtype="datetime64[ns]")
-            )
-            report_dates = (
-                known["end_date"]
-                if "end_date" in known.columns
-                else pd.Series(pd.NaT, index=known.index, dtype="datetime64[ns]")
-            )
-            known["_ann_date"] = pd.to_datetime(announcement_dates, errors="coerce")
-            known["_end_date"] = pd.to_datetime(report_dates, errors="coerce")
-            known = known.dropna(subset=["_ann_date", "_end_date"])
-            known = known[
-                (known["_ann_date"].dt.normalize() <= as_of_date)
-                & (known["_end_date"].dt.normalize() <= as_of_date)
-            ]
-            known = known.sort_values(["_end_date", "_ann_date"])
-            if known.empty:
-                errors.append(f"Tushare 截至 {as_of_text} 没有已公告的财务指标")
-            else:
-                row = known.iloc[-1]
-                roe = _round_optional(row.get("roe"))
-                roe_diluted = _round_optional(row.get("roe_dt"))
-                if roe is None:
-                    roe = roe_diluted
-                financials = {
-                    "known_as_of": as_of_text,
-                    "report_date": pd.Timestamp(row["_end_date"]).strftime("%Y-%m-%d"),
-                    "announcement_date": pd.Timestamp(row["_ann_date"]).strftime("%Y-%m-%d"),
-                    "roe_pct": roe,
-                    "roe_diluted_pct": roe_diluted,
-                    "gross_margin_pct": _round_optional(row.get("grossprofit_margin")),
-                    "net_margin_pct": _round_optional(row.get("netprofit_margin")),
-                    "debt_to_assets_pct": _round_optional(row.get("debt_to_assets")),
-                    "revenue_yoy_pct": _round_optional(row.get("or_yoy")),
-                    "net_profit_yoy_pct": _round_optional(row.get("netprofit_yoy")),
-                    "operating_cashflow_to_revenue_pct": _round_optional(row.get("ocf_to_or")),
-                    "eps": _round_optional(row.get("basic_eps")),
-                }
-                financials["missing_fields"] = _financial_missing_fields(financials)
-                if financials["missing_fields"]:
-                    errors.append(
-                        f"截至 {as_of_text} 的最新已公告财报缺少关键字段："
-                        f"{', '.join(financials['missing_fields'])}"
-                    )
-                sources["financials"] = "tushare"
-    except Exception as exc:
-        errors.append(f"Tushare 财务指标失败：{exc}")
+    financials, financial_errors, financial_quality = _gongkai_caiwu(code, as_of=as_of_text)
+    errors.extend(financial_errors)
+    data_quality["financials"] = financial_quality
+    if financials:
+        sources["financials"] = "eastmoney_financial_main"
+    data_quality["financial_source_policy"] = {
+        "source": "eastmoney_financial_main", "requires_tushare_points": False,
+        "tushare_fina_indicator": "not_requested",
+        "reason": "当前账号已实测无fina_indicator权限，默认财务链路采用带公告日的公开来源",
+    }
 
     need_ak_info = not profile or (not valuation and allow_current_snapshot)
     if need_ak_info:
@@ -918,19 +897,6 @@ def huoqu_jibenmian(
                 errors.append(f"AKShare 实时估值与历史分析日 {as_of_text} 不一致，已忽略该快照")
         except Exception as exc:
             errors.append(f"AKShare 基本面降级失败：{exc}")
-
-    if not financials:
-        if allow_current_snapshot:
-            try:
-                financials, ak_errors = _akshare_financials(code, as_of=as_of_text)
-                errors.extend(ak_errors)
-                if financials:
-                    financials["known_as_of"] = as_of_text
-                    sources["financials"] = "akshare"
-            except Exception as exc:
-                errors.append(f"AKShare 财务指标降级失败：{exc}")
-        else:
-            errors.append(f"AKShare 财务指标缺少公告日，未用于历史分析日 {as_of_text}")
 
     return {
         "profile": profile,

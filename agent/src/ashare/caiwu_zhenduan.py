@@ -157,10 +157,12 @@ def _cashflow(financials: dict[str, Any], industry: str | None, date_conflicts: 
     cashflow = _number(financials.get("operating_cashflow_to_revenue_pct"))
     margin_sign = _sign(margin)
     cashflow_sign = _sign(cashflow)
+    unit_verified = financials.get("cashflow_unit_status") == "verified_ratio_to_percent"
     metrics = {
         "net_margin_pct": margin,
         "operating_cashflow_to_revenue_raw": cashflow,
-        "cashflow_unit_status": "unverified",
+        "cashflow_unit_status": "verified_ratio_to_percent" if unit_verified else "unverified",
+        "cashflow_definition": financials.get("cashflow_definition"),
         "cashflow_evidence_basis": "sign_only",
         "net_margin_sign": margin_sign,
         "operating_cashflow_sign": cashflow_sign,
@@ -175,6 +177,8 @@ def _cashflow(financials: dict[str, Any], industry: str | None, date_conflicts: 
         facts.append(f"本期净利率 {margin:.6g}%")
     if cashflow is not None:
         facts.append("经营现金流指标" + {"positive": "为正", "negative": "为负", "zero": "为零"}[cashflow_sign])
+        if unit_verified:
+            facts.append(f"来源经营现金净流量相对营业收入为 {cashflow:.6g}%；该比值不是回款率")
     if margin_sign is not None and cashflow_sign is not None:
         if margin_sign == "positive" and cashflow_sign == "negative":
             facts.append("净利率为正但现金流指标为负，两项符号背离，需进一步核对回款和支出")
@@ -186,7 +190,7 @@ def _cashflow(financials: dict[str, Any], industry: str | None, date_conflicts: 
             facts.append("两项符号一致，不能单凭这一组合认定经营质量")
     else:
         facts.append("字段不齐，无法核对盈利与经营现金流符号")
-    facts.append("现金流字段单位尚未核验，仅核对正负和零")
+    facts.append("来源比值单位已核验，盈利与现金流关系仍仅核对符号，不作综合评分" if unit_verified else "现金流字段单位尚未核验，仅核对正负和零")
     status = "ok" if not missing else "unavailable" if margin is None and cashflow is None else "partial"
     return _block("cashflow_quality", "盈利与经营现金流核对", status, "；".join(facts) + "。" + _CASHFLOW_APPLICABILITY, metrics, missing)
 

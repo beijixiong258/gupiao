@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 from src.ashare.wangluo_kehu import GongkaiShujuHTTPKehu
@@ -70,10 +71,12 @@ def tengxun_qfq_rili_duqu(
     symbol, digits = _tengxun_symbol(code)
     start = _api_date(start_date)
     end = _api_date(end_date)
+    # 腾讯日线接口的末日为排他边界；请求下一自然日后仍裁剪至用户原末日。
+    request_end = (datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     payload, endpoint = client.qingqiu_json(
         endpoints,
         params={
-            "param": f"{symbol},day,{start},{end},640,qfq"
+            "param": f"{symbol},day,{start},{request_end},640,qfq"
         },
         headers={"Referer": "https://gu.qq.com/"},
     )
@@ -103,6 +106,10 @@ def tengxun_qfq_rili_duqu(
     rows = [value for value in raw_rows if isinstance(value, list) and len(value) >= 9]
     if len(rows) != len(raw_rows):
         raise ValueError("腾讯证券前复权日线包含字段不完整的行情行")
+    row_dates = [datetime.strptime(_api_date(str(row[0])), "%Y-%m-%d").strftime("%Y-%m-%d") for row in rows]
+    rows = [row for row, day in zip(rows, row_dates) if start <= day <= end]
+    if not rows:
+        raise ValueError("腾讯证券未返回请求日期范围内的有效日线")
 
     qt = entry.get("qt")
     quote = qt.get(symbol) if isinstance(qt, dict) else None

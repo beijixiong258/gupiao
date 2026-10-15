@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from src.ashare.shuju_yuan import biaozhunhua_gupiao_daima
+from src.ashare.shuju_zhiliang import VERIFIED_DAILY_VALUATION_SOURCES
 
 
 def jiexi_shizhi_tiaojian(value: Any) -> dict[str, Any] | None:
@@ -67,7 +68,7 @@ def guolv_shizhi(
 
     daily["ts_code"] = daily["ts_code"].map(normalize_code)
     daily["trade_date"] = pd.to_datetime(daily["trade_date"], errors="coerce").dt.normalize()
-    # Tushare daily_basic 的 total_mv/circ_mv 单位为万元，公开证据统一为元。
+    # 适配层将已核验日终来源统一为万元；此处转成元，不能接收未核验快照。
     daily["value_yuan"] = pd.to_numeric(daily[field], errors="coerce") * 10_000.0
     grouped = {code: frame for code, frame in daily.groupby("ts_code", sort=False)}
     checks: list[dict[str, Any]] = []
@@ -80,6 +81,10 @@ def guolv_shizhi(
         actual = None
         if rows is None:
             reason = source_error or "未取得该股票可核验的日终市值；快照市值不能代替日终证据"
+        elif "valuation_source" not in rows or not rows["valuation_source"].isin(VERIFIED_DAILY_VALUATION_SOURCES).all():
+            reason = "市值来源尚未核验为支持的日终估值来源"
+        elif "valuation_is_complete_daily" not in rows or not rows["valuation_is_complete_daily"].eq(True).all():
+            reason = "市值尚未通过完整日终数据核验"
         elif not rows["trade_date"].eq(target).all():
             reason = "市值来源日期缺失或与分析日不一致"
         elif not rows["value_yuan"].map(lambda value: pd.notna(value) and math.isfinite(value) and value > 0).all():
@@ -96,7 +101,7 @@ def guolv_shizhi(
             "ts_code": code, "name": str(row.get("name") or ""),
             "status": "unavailable" if reason else "met" if met else "unmet",
             "condition": condition, "actual_yuan": actual, "unit": "元",
-            "source": "tushare_daily_basic", "as_of": target.strftime("%Y-%m-%d"),
+            "source": str(rows.iloc[0].get("valuation_source")) if rows is not None else valuation.attrs.get("source"), "as_of": target.strftime("%Y-%m-%d"),
             "source_dates": sorted(rows["trade_date"].dropna().dt.strftime("%Y-%m-%d").unique().tolist()) if rows is not None else [],
             "fetched_at": fetched_at,
             "reason": reason or ("符合市值条件" if met else "超过上限或不满足上限边界"),
@@ -109,7 +114,7 @@ def guolv_shizhi(
     unmet = sum(item["status"] == "unmet" for item in checks)
     summary = {
         "status": "partial" if unavailable else "ok", "condition": condition,
-        "source": "tushare_daily_basic", "as_of": target.strftime("%Y-%m-%d"),
+        "source": valuation.attrs.get("source") or sorted(daily.get("valuation_source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()), "as_of": target.strftime("%Y-%m-%d"),
         "fetched_at": fetched_at, "source_error": source_error,
         "input_count": len(work), "verified_count": len(work) - unavailable,
         "matched_count": len(accepted), "unmet_count": unmet, "unavailable_count": unavailable,

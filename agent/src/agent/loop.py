@@ -1,4 +1,4 @@
-"""AgentLoop: ReAct core loop.
+"""AgentLoop: intent recognition followed by bounded ReAct tool execution.
 
 Five-layer context management:
   Layer 1 (microcompact)     — silently prunes old tool results each iteration
@@ -28,6 +28,7 @@ from src.agent.clarification import (
     build_scope_clarification,
 )
 from src.agent.context import ContextBuilder
+from src.agent.intent import IntentDecision, IntentRecognitionError, recognize_intent
 from src.agent.memory import WorkspaceMemory
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
@@ -425,6 +426,7 @@ class AgentLoop:
         self._pending_scope_review: dict[str, Any] | None = None
         self._latest_analysis_payload: dict[str, Any] | None = None
         self._latest_business_result: tuple[str, dict[str, Any]] | None = None
+        self._intent: IntentDecision | None = None
         self._cancelled: bool = False
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
@@ -456,6 +458,7 @@ class AgentLoop:
         reset_scope_request()
         self._latest_analysis_payload = None
         self._latest_business_result = None
+        self._intent = None
         self._previous_summary = ""
 
         state_store = RunStateStore()
@@ -480,6 +483,36 @@ class AgentLoop:
         iteration = 0
         final_content = ""
         try:
+            # Node 1 only identifies the request; no business tools are exposed or executed.
+            self._emit("intent_start", {})
+            intent_started = _time.perf_counter()
+            self._intent = recognize_intent(self.llm, messages[1:])
+            intent_metadata = {
+                "elapsed_ms": int((_time.perf_counter() - intent_started) * 1000),
+                "task_kind": self._intent.task_kind,
+                "requires_market_data": self._intent.requires_market_data,
+                "has_stock_query": self._intent.stock_query is not None,
+                "has_scope_text": self._intent.scope_text is not None,
+                "scope_kind": self._intent.scope_kind,
+                "condition_count": len(self._intent.explicit_conditions),
+                "has_research_question": self._intent.research_question is not None,
+                "missing_information_count": len(self._intent.missing_information),
+                "requested_count": self._intent.requested_count,
+                "unverifiable_requirement_count": len(self._intent.unverifiable_requirements),
+            }
+            trace.write({"type": "intent", "status": "ok", **intent_metadata})
+            react_trace.append({"type": "intent", **intent_metadata})
+            self._emit("intent", intent_metadata)
+            messages[0] = {
+                "role": "system",
+                "content": context.build_system_prompt(user_message, self._intent),
+            }
+            tool_definitions = [
+                definition for definition in self.registry.get_definitions()
+                if definition["function"]["name"] in self._intent.allowed_tool_names
+            ]
+
+            # Node 2 executes only tools permitted by that decision, then interprets results.
             while iteration < self.max_iterations:
                 if self._cancelled:
                     trace.write({"type": "cancelled", "iter": iteration})
@@ -513,9 +546,12 @@ class AgentLoop:
 
                 response = self.llm.stream_chat(
                     messages,
-                    tools=self.registry.get_definitions(),
+                    tools=tool_definitions,
                     on_text_chunk=_on_text_chunk,
                 )
+                if self._cancelled:
+                    trace.write({"type": "cancelled", "iter": iteration})
+                    break
 
                 thinking_text = "".join(thinking_chunks)
                 if thinking_text:
@@ -523,6 +559,11 @@ class AgentLoop:
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
                 if not response.has_tool_calls:
+                    if (
+                        (self._intent.requires_market_data or self._intent.task_kind == "clarification")
+                        and self._latest_business_result is None
+                    ):
+                        raise ValueError("本次请求尚未完成必要的分析或结构化澄清，不能直接作为已完成回答")
                     if self._pending_scope_review is not None:
                         final_content = self._finish_scope_review(context)
                         answer_message = {"role": "assistant", "content": final_content}
@@ -565,6 +606,16 @@ class AgentLoop:
                                 )
                     from src.agent.fenxi_zhanshi import buquan_zhengju_baogao
 
+                    if (
+                        self._intent.unverifiable_requirements
+                        and isinstance(self._latest_analysis_payload, dict)
+                        and self._latest_analysis_payload.get("status") in {"ok", "partial"}
+                    ):
+                        limitation = context.sanitize_user_facing_content(
+                            "以下为已取得证据支持的研究参考，尚不能核验原始要求："
+                            + "；".join(self._intent.unverifiable_requirements) + "。"
+                        )
+                        final_content = limitation + "\n\n" + final_content
                     final_content = buquan_zhengju_baogao(
                         final_content, self._latest_analysis_payload,
                     )
@@ -611,16 +662,24 @@ class AgentLoop:
 
         except Exception as exc:
             reset_scope_request()
-            logger.exception(f"AgentLoop error: {exc}")
-            trace.write({"type": "end", "status": "error", "reason": str(exc), "iterations": iteration})
+            failure_status = "cancelled" if self._cancelled else "failed"
+            failure_reason = "cancelled by user" if self._cancelled else str(exc)
+            if self._cancelled:
+                logger.info("AgentLoop cancelled during a model call")
+            else:
+                logger.exception(f"AgentLoop error: {exc}")
+            if isinstance(exc, IntentRecognitionError) and not self._cancelled:
+                trace.write({"type": "intent", "status": "failed"})
+                final_content = "未能可靠识别本次请求，尚未执行行情分析。请重新说明要分析的股票或选股范围。"
+            trace.write({"type": "end", "status": failure_status, "reason": failure_reason, "iterations": iteration})
             trace.close()
-            state_store.mark_failure(run_dir, str(exc))
+            state_store.mark_status(run_dir, failure_status, failure_reason)
             state_store.save_response(
                 run_dir,
                 {
-                    "status": "failed",
-                    "content": "",
-                    "reason": str(exc),
+                    "status": failure_status,
+                    "content": final_content,
+                    "reason": failure_reason,
                     "iterations": iteration,
                     "react_trace": react_trace,
                     "history": durable_history,
@@ -629,13 +688,14 @@ class AgentLoop:
             public_run_dir, public_run_id = state_store.public_location(run_dir)
             state_store.cleanup_ephemeral(run_dir)
             return {
-                "status": "failed",
-                "reason": str(exc),
+                "status": failure_status,
+                "reason": failure_reason,
                 "run_dir": public_run_dir,
                 "run_id": public_run_id,
-                "content": "",
+                "content": final_content,
                 "react_trace": react_trace,
                 "history": durable_history,
+                "intent": self._intent.to_dict() if self._intent is not None else None,
             }
 
         if self._pending_scope_review is not None and not self._cancelled:
@@ -646,7 +706,7 @@ class AgentLoop:
         business_payload = self._latest_business_result[1] if self._latest_business_result else None
         reason = ""
         if self._cancelled:
-            state_store.mark_failure(run_dir, "cancelled by user")
+            state_store.mark_status(run_dir, "cancelled", "cancelled by user")
             final_status = "cancelled"
         elif self._latest_business_result is not None:
             tool_name, business_payload = self._latest_business_result
@@ -704,9 +764,46 @@ class AgentLoop:
             "history": durable_history,
             "clarification": clarification,
             "business_outcome": business_outcome,
+            "intent": self._intent.to_dict() if self._intent is not None else None,
         }
 
     # -- Tool execution with read/write batching --------------------------------
+
+    def _intent_tool_rejection(self, tc: Any) -> str | None:
+        """Enforce routing before any special-case, serial or parallel execution."""
+        intent = self._intent
+        if intent is None or tc.name not in intent.allowed_tool_names:
+            return "该工具不属于本次已识别请求允许的执行范围"
+        if not isinstance(tc.arguments, dict):
+            return "工具参数必须是结构化对象"
+        if tc.name != "gupiao_fenxi":
+            return None
+        if intent.research_question is not None:
+            research = tc.arguments.get("yanjiu_wenti")
+            if not isinstance(research, dict) or research.get("question") != intent.research_question:
+                return "必须将本次研究问题原文保留在分析参数中，不能省略或替换"
+            unverified = research.get("unverifiable_parts")
+            if intent.unverifiable_requirements and (
+                not isinstance(unverified, list)
+                or any(part not in unverified for part in intent.unverifiable_requirements)
+            ):
+                return "必须保留无法核验的原始目标，不能把未来持有期收益替换成历史表现"
+        requested_count = tc.arguments.get("shuliang")
+        if requested_count != intent.requested_count or isinstance(requested_count, bool):
+            return "候选数量必须来自用户明确要求；未明确数量时传null或省略，不能擅自填1"
+        scope = tc.arguments.get("fanwei", "all_market")
+        if intent.task_kind == "single_stock":
+            if scope != "single_stock":
+                return "本次是单股分析，不能改为范围或全市场选股"
+            if intent.stock_query is not None and tc.arguments.get("gupiao") != intent.stock_query:
+                return "单股分析对象必须保留本次识别的股票原文"
+        elif intent.task_kind == "selection":
+            expected_scope = intent.scope_kind
+            if scope != expected_scope:
+                return "选股范围必须与本次识别结果一致，不能扩大、替换或改为单股分析"
+            if intent.scope_text is not None and tc.arguments.get("mingcheng") != intent.scope_text:
+                return "命名范围必须保留用户原文，再由现有业务流程动态核验"
+        return None
 
     def _finish_scope_review(self, context: ContextBuilder) -> str:
         """智能体未完成范围选择时，保留真实澄清状态，不能靠一段文字变成成功。"""
@@ -752,6 +849,15 @@ class AgentLoop:
         clarification_requested_in_batch = any(tool_call.name == "clarify" for tool_call in tool_calls)
 
         for tc in tool_calls:
+            rejection = self._intent_tool_rejection(tc)
+            if rejection is not None:
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={"status": "blocked", "error_code": "intent_tool_mismatch", "error": rejection},
+                    reason="intent_tool_mismatch", context=context, messages=messages,
+                    durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                )
+                continue
             # Layer 4: compact tool — mark then defer execution
             if tc.name == "compact":
                 compact_requested = True
