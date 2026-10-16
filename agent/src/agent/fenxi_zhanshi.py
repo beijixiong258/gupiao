@@ -88,14 +88,55 @@ _LABELS = {
     "data_as_of": "证据截止日", "daily_data_as_of": "日线截止日", "explanation": "口径说明", "reassess_when": "何时更新诊断",
     "result_confirmation": "结果确认状态", "session_status": "交易时段", "realtime_status": "实时核验状态",
     "selection_analysis": "选股条件核验", "meets_selection_conditions": "是否通过选股条件",
-    "recommendation_index_analysis": "推荐指数计算明细", "raw_values": "计算原始值",
+    "recommendation_index_analysis": "上涨概率、条件涨幅与期望净收益明细", "raw_values": "计算原始值",
     "percentiles": "共同有效池中的名次分位", "price_group": "价格组分P（0–1）",
     "volume_group": "量价组分V（0–1）", "pool_size": "共同有效比较股票数N",
-    "equivalent_index_count": "推荐指数精确相同的并列对象数",
+    "equivalent_index_count": "期望净收益精确相同的并列对象数",
     "recommendation_index_ready": "推荐指数有效数量", "recommendation_index_unavailable": "推荐指数证据不足数量",
     "recommendation_index_status": "推荐指数计算状态", "recommendation_index_missing_fields": "推荐指数缺失原始量",
+    "up_probability": "上涨概率估计", "conditional_upside_mean": "上涨条件下平均涨幅估计",
+    "conditional_downside_mean": "非上涨条件下平均亏损幅度估计", "expected_gross_return": "期望毛参考收益",
+    "expected_net_return": "期望净参考收益", "composite_score_bps": "综合评分（期望净收益，基点）",
+    "current_state": "当前固定价量状态", "state_key": "价量状态标识", "statistics": "同状态成熟事件统计",
+    "candidate_estimates": "逐股同状态估计", "state_statistics": "各固定状态历史统计",
+    "known_count": "结果已知的成熟事件数", "unknown_count": "结果未知的成熟事件数",
+    "up_count": "已知事件中上涨次数", "non_up_count": "已知事件中非上涨次数",
+    "date_count": "成熟事件涉及信号日期数", "known_signal_dates": "有已知结果的不同信号日期数",
+    "sample_support": "样本支持状态", "probability_missing_bounds": "历史未知标签所对应频率可能范围（非未来区间）",
+    "uncertainty": "按信号日期考虑相关性的估计不确定性", "date_summaries": "逐信号日期统计",
+    "event_counts": "参考事件状态计数", "signal_events": "完整历史参考事件",
+    "observed_summary": "历史已知样本描述（工程支持不足时不可用于推荐）",
+    "signal_dates": "涉及信号日期数", "signal_start": "成熟信号起日", "signal_end": "成熟信号止日",
+    "known_signal_start": "已知结果信号起日", "known_signal_end": "已知结果信号止日",
+    "unknown_reason_counts": "未知结果原因计数", "execution_limitation_counts": "参考成交限制计数",
+    "minimum_distinct_known_signal_dates": "公开估计所需不同已知信号日期数（工程门槛）",
+    "supported": "工程样本支持是否满足", "reference_coverage": "参考结果覆盖率", "return_coverage": "结果覆盖率",
+    "up_probability_95_interval": "上涨频率历史样本探索区间（非未来概率保证）",
+    "expected_net_return_95_interval": "期望净收益历史样本探索区间（非未来收益范围）",
+    "chronological_subperiods": "按时间顺序划分的四个子期", "historical_events": "成熟历史事件数",
+    "reference_known_events": "参考结果已知事件数", "reference_unknown_events": "参考结果未知事件数",
+    "current_state_valid": "当前价量状态有效股数", "estimate_available": "同状态估计可用股数",
+    "estimate_unavailable": "同状态估计不可用股数", "historical_state_missing_events": "历史状态输入不足事件数",
+    "scheduled_signal_dates": "计划信号日期数", "mature_signal_dates": "已成熟信号日期数",
+    "immature_signal_dates": "尚未成熟信号日期数", "roundtrip_reference_cost_rate": "参考往返损耗比例",
+    "notional_yuan": "参考名义金额（元）", "actual_fill_or_broker_cost_verified": "实际成交与券商费用是否核实",
+    "historical_identity_or_limit_rules_verified": "历史证券身份与涨跌停规则是否核实",
+    "cost_assumption": "参考成本假设", "methodology": "固定状态与统计口径", "coverage": "输入及事件覆盖",
+    "expected_gross_return_difference": "本股减下一候选的期望毛收益差",
+    "composite_score_bps_difference": "本股减下一候选的期望净收益综合分差（基点）",
+    "probability_estimation": "概率与期望收益样本口径",
+    "reference_only": "仅为参考价格统计", "execution_verified": "实际成交是否核验",
+    "future_probability_calibrated": "未来概率是否经过校准验证",
+    "historical_pool": "历史统计样本范围（当前存续且当前条件有效，非历史完整市场）",
+    "expected_net_return_difference": "本股减下一候选的期望净收益差",
+    "up_probability_difference": "本股减下一候选的上涨概率差",
+    "conditional_upside_mean_difference": "本股减下一候选的上涨条件均幅差",
+    "conditional_downside_mean_difference": "本股减下一候选的非上涨条件均亏差",
+    "direction": "最近方向组合", "position": "相对均线位置", "amount_change": "成交额变化状态",
+    "atr14": "14日真实波幅（元）",
+    "atr_distance": "距MA20的ATR倍数", "amount_ratio_5_15": "最近5日与此前15日均成交额之比",
     "missing_reasons": "无法计算的原因",
-    "current_index": "本股推荐指数", "next_index": "下一候选推荐指数", "index_difference": "推荐指数差值",
+    "current_index": "本股期望净收益综合分（基点）", "next_index": "下一候选期望净收益综合分（基点）", "index_difference": "期望净收益综合分差（基点）",
     "current_percentiles": "本股原始量名次分位", "next_percentiles": "下一候选原始量名次分位",
     "current_groups": "本股价格与量价组分", "next_groups": "下一候选价格与量价组分",
     "raw_advantages": "本股领先的原始量", "raw_tradeoffs": "本股落后的原始量",
@@ -144,6 +185,22 @@ _LABELS = {
     "size_matched_stocks": "行业与规模均可核验的同行数", "target_size_verified": "本股规模是否核验",
 }
 _STATUS = {
+    "up_up": "近5日上涨且最近1日上涨", "up_nonup": "近5日上涨但最近1日非上涨",
+    "nonup_up": "近5日非上涨但最近1日上涨", "nonup_nonup": "近5日和最近1日均非上涨",
+    "at_or_below_ma20": "价格不高于MA20", "above_ma20_within_2_atr": "高于MA20且不超过2ATR",
+    "above_ma20_over_2_atr": "高于MA20超过2ATR", "increased": "近期成交额增加", "not_increased": "近期成交额未增加",
+    "basis_points": "基点", "next_session_open_to_fifth_session_close": "次交易日开盘至第5交易日收盘",
+    "current_request_currently_eligible_stocks_not_reconstructed_historical_full_market": "本次取得的当前存续且当前条件有效样本，未重建历史完整市场",
+    "reference_known": "参考价格结果已知", "reference_unknown": "参考价格结果未知",
+    "engineering_support_gate_not_return_effectiveness_or_calibration": "只满足工程支持门槛，不代表收益有效或未来概率已校准",
+    "circular_signal_date_block_bootstrap": "按信号日期连续分块重抽样（历史样本探索）",
+    "exploratory_observed_sample_distribution_not_future_guarantee": "描述已观测样本的探索性不确定性，不保证未来结果",
+    "observed_mature_event_unknown_label_bounds_not_future_confidence_interval": "历史成熟事件未知标签的可能范围，不是未来概率区间",
+    "expected_net_return_descending_exact_ties": "未舍入期望净收益降序，精确同值并列",
+    "fewer_than_ten_distinct_known_signal_dates": "已知结果不足10个不同信号日期，尚不支持公开估计",
+    "probability_interval_degenerate_boundary_all_known_labels_equal": "已知结果全涨或全非涨，重抽样概率区间退化，不发布零宽区间",
+    "probability_interval_degenerate_empirical_resamples": "历史重抽样上涨频率无变化，探索区间不可用",
+    "net_return_interval_degenerate_empirical_resamples": "历史重抽样净收益无变化，探索区间不可用",
     "lt": "低于（不含上限）", "le": "不超过（含上限）", "not_evaluated": "尚未核验",
     "ok": "可用", "success": "可用", "partial": "部分可用", "unavailable": "不可用", "insufficient_data": "数据不足",
     "error": "程序错误", "program_error": "程序错误", "failed": "未完成", "not_applicable": "当前不适用", "not_used": "未使用",
@@ -176,6 +233,7 @@ _HIDDEN_KEYS = {
 }
 _LEGACY_TEXT = re.compile(r"评分|综合分|技术状态分|技术分|得分|分数|置信度|权重|排名分|适配分|(?:暂不)?建议买入")
 _INDEX_SCORE_TERM = re.compile(r"推荐指数(?:的)?(?:评分|得分|分数)?")
+_NET_RETURN_SCORE_TERM = re.compile(r"期望净收益(?:的)?(?:综合评分|综合分|得分|分数)|(?:综合评分|综合分)(?=（期望净收益[，、]基点）)|(?:综合评分|综合分)(?=[^。！？\n]*(?:为|等于|=)\s*10000\s*[×*]\s*期望净收益)|(?:综合评分|综合分)(?=（基点）|\s*(?:为|是|[:：])?\s*[+-]?\d+(?:\.\d+)?\s*基点)")
 _INDEX_WEIGHT_TERM = re.compile(r"(?:固定(?:公式)?(?:组分)?|组分|价格组(?:内部)?|量价组(?:内部)?)(?:的)?权重")
 _NEGATED_LEGACY_TERM = re.compile(
     r"(?:不是|并非|不代表|不等于|不作为|不产生|不输出|不发布|不计算|不使用)"
@@ -243,11 +301,11 @@ def _text(value: Any) -> str:
 
 
 def qingli_jiu_pingfen_biaoshu(content: str) -> str:
-    """剔除旧评价体系；只保护明确绑定新版指数的术语及否定声明。"""
+    """剔除旧评价体系；保护明确绑定期望净收益基点的综合分与否定声明。"""
     parts = re.split(r"(?<=[。！？\n])", str(content or ""))
     retained: list[str] = []
     for part in parts:
-        checked = _NEGATED_LEGACY_TERM.sub("", part)
+        checked = _NET_RETURN_SCORE_TERM.sub("", _NEGATED_LEGACY_TERM.sub("", part))
         if "推荐指数" in part or "固定公式" in part:
             checked = _INDEX_SCORE_TERM.sub("", checked)
             checked = _INDEX_WEIGHT_TERM.sub("", checked)
@@ -301,6 +359,10 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_
             path = f"{prefix} / {_label(key)}" if prefix else _label(key)
             child_kind = (
                 "percentile" if key in _PERCENTILE_CONTAINERS
+                else "historical_frequency_bound" if key == "probability_missing_bounds"
+                else "sample_probability_interval" if key == "up_probability_95_interval"
+                else "sample_return_interval" if key == "expected_net_return_95_interval"
+                else "fraction_metadata" if key in {"return_coverage", "reference_coverage", "roundtrip_reference_cost_rate"}
                 else "coverage" if key == "feature_coverage"
                 else "metadata" if key in _METADATA_CONTAINERS
                 else value_kind
@@ -312,8 +374,8 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_
                 observation_key = str(value["metric_key"])
             elif key in {"price_return", "control_change"} and value.get("window") in {1, 5, 20}:
                 observation_key = f"ret_{value['window']}" if key == "price_return" else f"tdx_control_change_{value['window']}d"
-            elif key in {"current_index", "next_index", "index_difference"}:
-                observation_key = "recommendation_index"
+            elif key in {"recommendation_index", "current_index", "next_index", "index_difference"}:
+                observation_key = "composite_score_bps"
             lines.extend(_tree(child, path, observation_key, value_kind=child_kind))
         return lines or ([f"- {prefix}：未返回可用字段。"] if prefix else [])
     if isinstance(value, (list, tuple)):
@@ -323,6 +385,9 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_
         for index, child in enumerate(value, start=1):
             lines.extend(_tree(child, f"{prefix} {index}", metric_key, value_kind=value_kind))
         return lines
+    if value_kind in {"historical_frequency_bound", "sample_probability_interval", "sample_return_interval", "fraction_metadata"}:
+        displayed = value * 100 if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+        return [f"- {prefix}（%）：{_value(displayed)}"]
     if value_kind == "coverage":
         # 覆盖率与指标共享字段标识，但不是指标数值，不能套用收益、波动率或分位的单位与释义。
         displayed = value * 100 if isinstance(value, (int, float)) and not isinstance(value, bool) else value
@@ -410,6 +475,12 @@ def _identity(candidate: dict[str, Any], default: str) -> str:
 
 def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: bool) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
+    estimate_fields = {key: candidate[key] for key in (
+        "up_probability", "conditional_upside_mean", "conditional_downside_mean",
+        "expected_gross_return", "expected_net_return", "composite_score_bps",
+    ) if key in candidate}
+    if estimate_fields:
+        sections.append((identity + " / 上涨概率、条件涨幅与综合次序", "\n".join(_tree(estimate_fields))))
     summary = candidate.get("diagnosis_summary")
     if candidate.get("research_question"):
         sections.append((identity + " / 用户观点核验", "\n".join(_tree(candidate["research_question"]))))
@@ -472,7 +543,7 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
                        ("market_cap_filter", "市值筛选条件及核验"),
                        ("user_conditions", "用户明确选股条件"), ("comparison_coverage", "实际比较覆盖"),
                        ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
-                       ("selection_methodology", "选股方法"), ("diagnosis_validity", "诊断时点"),
+                       ("selection_methodology", "选股方法"), ("probability_estimation", "概率与期望收益样本口径"), ("diagnosis_validity", "诊断时点"),
                        ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
         if key in payload:
             kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
@@ -608,7 +679,7 @@ def goujian_fenxi_anquan_huitui(payload: dict[str, Any] | None) -> str:
         if status == "partial":
             lead += "部分来源或指标缺失，以下保留可用证据和具体缺口。"
     elif payload.get("recommendation_available") is True:
-        lead = "以下为通过用户条件和数据核验的优选候选：按当前量价推荐指数的未舍入值排序。指数不是收益率或上涨概率，具体原值、组分、比较依据与覆盖范围见报告。"
+        lead = "以下为通过用户条件和数据核验的候选：按同状态历史事件估计的未舍入期望净参考收益降序排列。上涨概率与上涨条件均幅分别展示，期望净收益综合分仅换算为基点；同状态可并列，估计不代表已知未来结果。样本、日期、成本及缺口见报告。"
         if status == "partial":
             lead += "部分来源或补充证据缺失，报告保留具体缺口和实际复核范围。"
     else:

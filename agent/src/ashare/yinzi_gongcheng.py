@@ -213,15 +213,32 @@ def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
 
 def factor_definition(feature: str) -> dict[str, Any]:
     """指标名称和单位的唯一说明，数值仍完全由量化程序计算。"""
-    if feature == "recommendation_index":
+    conditional_metrics = {
+        "up_probability": ("五交易日价格上涨概率估计", "%", 100, "k/n", "同价量状态下价格上涨事件数除以参考收益已知事件数；不是实际成交盈利概率或已校准的预测"),
+        "conditional_upside_mean": ("上涨条件平均涨幅", "%", 100, "mean(r | r>0)", "仅在价格上涨的历史同状态事件中计算平均涨幅；没有上涨样本时留空"),
+        "conditional_downside_mean": ("非上涨条件平均亏损幅度", "%", 100, "mean(-r | r<=0)", "在非上涨的历史同状态事件中计算正向亏损幅度，平盘计零；空条件组留空"),
+        "expected_gross_return": ("五交易日期望毛收益估计", "%", 100, "mean(r)=p*G-(1-p)*L", "同状态已知事件的平均参考价格收益；空条件组不补造均值，直接计算总体均值"),
+        "expected_net_return": ("五交易日期望净收益估计", "%", 100, "mean((1+r)*(1-reference_cost)-1)", "同状态已知事件按既定研究成本逐事件计算的平均参考净收益；不是保证或实际账户收益"),
+        "composite_score_bps": ("综合评分", "基点", 1, "10000*expected_net_return", "期望净收益估计的基点值，可为负；仅按未舍入期望净收益排序，不是上涨概率"),
+        "recommendation_index": ("综合评分（兼容字段）", "基点", 1, "10000*expected_net_return", "与composite_score_bps相同，仅兼容既有字段；不再表示旧0—100量价强势分或上涨概率"),
+        "atr_distance": ("收盘距MA20的ATR距离", "倍", 1, "(close-MA20)/ATR14", "当前价格伸展状态，按≤0、(0,2]、>2分组；2ATR是固定分组边界，不是自动看跌或风险过滤"),
+        "amount_ratio_5_15": ("近5日与此前15日均额比", "倍", 1, "mean(amount[-5:])/mean(amount[-20:-5])", "比较互不重叠的两个真实成交额窗口，以1区分增加与未增加，不假定越大收益越好"),
+    }
+    if feature.endswith("_difference") and feature.removesuffix("_difference") in conditional_metrics:
+        original = factor_definition(feature.removesuffix("_difference"))
+        return {**original, "label": original["label"] + "差值",
+                "unit": "百分点" if original["display_scale"] == 100 else original["unit"],
+                "meaning": "同一口径下本候选估计减去下一候选估计；点估计差不代表已证实的收益或概率优势",
+                "formula": "current." + feature.removesuffix("_difference") + "-next." + feature.removesuffix("_difference")}
+    if feature in conditional_metrics:
+        label, unit, scale, formula, meaning = conditional_metrics[feature]
         return {
-            "label": "推荐指数（当前量价状态）", "unit": "指数点", "display_scale": 1,
-            "meaning": "本次共同有效比较池内的相对量价状态；不是收益率、上涨概率、置信度或未来收益预测，跨日期及不同范围不能直接比较",
-            "formula": "p(x)=(升序平均名次(x)-0.5)/N; P=(p(ret_20)+p(directional_efficiency_20))/2; V=p(up_amount_dominance_20); I=100*sqrt(P*V)",
-            "window": "同一分析日、同一资格范围的完整三原值共同池；原值使用20个连续交易间隔",
-            "minimum_observations": "共同池至少2只三原值全部有效的股票；两组几何等权，价格组内部等权，不按历史结果调整权重",
-            "missing_rule": "任一原值缺失或共同池不足2只时不产生指数；不填中性值、不重分权重、不舍入后排序；完全相同明确并列",
-            "source_basis": "本次权威日历对齐并核验的真实收盘价、成交额及全量资格核验后共同池；不训练模型",
+            "label": label, "unit": unit, "display_scale": scale, "meaning": meaning,
+            "formula": formula,
+            "window": "信号日状态使用20条连续日线；历史价格参考为次日开盘至第五交易日收盘，只统计截至分析日已到期事件",
+            "minimum_observations": "20条权威日历对齐的有效价量，ATR及成交额分母为正；概率和收益排序至少10个不同已知信号日期，这是工程支持口径而非收益验证",
+            "missing_rule": "必要状态或样本不足时不发布排序估计，不补50%或旧强势分；条件空组均值留空，不妨碍已知总体均值计算；未知事件单列",
+            "source_basis": "同一请求、同一核验资格池的真实OHLC和成交额；固定24状态频数统计，不训练、不寻优、不持久化市场输入",
         }
     if feature == "tdx_control_raw" or feature == "tdx_control_range_position" or feature in {
         "tdx_control_change_1d", "tdx_control_change_5d", "tdx_control_change_20d",

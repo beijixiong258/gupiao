@@ -54,11 +54,27 @@ XUANGU_TOOL_CONTRACT_VERSION = 9
 def _normalize_requested_count(value: Any) -> int | None:
     if value in (None, ""):
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("选股数量必须为null或1至10的整数，不能静默截成其他数量")
     try:
         count = int(value)
     except (TypeError, ValueError):
-        return None
-    return max(1, min(5, count))
+        raise ValueError("选股数量必须为null或1至10的整数，不能静默截成其他数量") from None
+    if not 1 <= count <= 10:
+        raise ValueError("选股数量必须为null或1至10的整数，不能静默截成其他数量")
+    return count
+
+
+def _selection_display_target(settings: dict[str, Any], requested_count: int | None) -> int:
+    report_limit = int(settings["deep_analysis_limit"])
+    if requested_count is not None:
+        if requested_count > report_limit:
+            raise ValueError(
+                f"本次配置最多支持{report_limit}只股票的完整报告，不能满足明确要求的"
+                f"{requested_count}只；不会静默截成其他数量"
+            )
+        return requested_count
+    return min(1 + int(settings["backup_limit"]), report_limit)
 
 
 def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[str, Any]:
@@ -115,8 +131,7 @@ class XuanguFenxiFuWu:
             )
         settings = self._config["fenxi"]
         requested_count = _normalize_requested_count(requested_count)
-        display_target = min(requested_count or 1 + int(settings["backup_limit"]),
-                             1 + int(settings["backup_limit"]), int(settings["deep_analysis_limit"]))
+        display_target = _selection_display_target(settings, requested_count)
         if fanwei.leixing is FanweiLeixing.MINGMING_FANWEI:
             discovery = self._context.faxian_fanwei(str(fanwei.mingcheng or ""))
             if scope_choice is not None:
@@ -271,7 +286,7 @@ class XuanguFenxiFuWu:
             batch_codes = codes[offset:offset + batch_size]
             try:
                 batch, metadata = self._context.piliang_lishi(
-                    batch_codes, start_date=start_date, end_date=end_date, minimum_rows=21,
+                    batch_codes, start_date=start_date, end_date=end_date, minimum_rows=20,
                 )
                 histories.update({code: frame for code, frame in batch.items() if code in batch_codes})
             except FenxiJisuanYichang:
@@ -289,7 +304,7 @@ class XuanguFenxiFuWu:
         histories, history_rejected = guolv_lishi_wanzhengxing(
             histories,
             analysis_date=analysis_date,
-            minimum_rows=21,  # 20日已实现收益需要21条价格；与上市时长偏好无关。
+            minimum_rows=20,  # 当前价量状态需要MA20及互不重叠的5/15日成交额窗口。
             minimum_amount=0,
         )
         rejected.extend(history_rejected)
@@ -338,12 +353,19 @@ class XuanguFenxiFuWu:
                 "filter_summary": {"input_count": len(data), "rejected_count": len(rejected), "examples": rejected[:20]},
             }
         ready_profiles = prefiltered[prefiltered["ts_code"].isin(histories)].reset_index(drop=True)
+        analysis_calendar = self._context.jiaoyi_rili(start_date=start_date, end_date=end_date)
+        ranking_context = {
+            "trading_calendar": tuple(day for day in analysis_calendar.open_dates
+                                      if pd.Timestamp(start_date) <= day <= analysis_date),
+            "as_of": analysis_date,
+            "statistics_cache": {},
+        }
         technical_summaries: dict[str, dict[str, Any]] = {}
         panel, panel_meta = goujian_fenxi_yinzi_mianban(
             histories,
             ready_profiles,
             source="auto",
-            calendar=self._context.jiaoyi_rili(start_date=start_date, end_date=end_date),
+            calendar=analysis_calendar,
             latest_only=True,
             technical_summaries=technical_summaries,
             macd_structure_config=settings.get("macd_structure"),
@@ -447,7 +469,7 @@ class XuanguFenxiFuWu:
                 },
             }
             preliminary.append(item)
-        preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config)
+        preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config, ranking_context=ranking_context)
         # 完整比较与技术核验先完成；展示数量只限制昂贵的财务和分钟补充报告。
         # 初筛缺失不等于条件不满足：技术原值可补齐的候选仍须完成复核。
         review_pool = [item for item in preliminary if not item["selection"]["unmet_conditions"]]
@@ -477,12 +499,12 @@ class XuanguFenxiFuWu:
                     "outcome": "program_error",
                     "error": str(exc),
                 }
-            item["selection"] = pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True)
+            item["selection"] = pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True, ranking_context=ranking_context)
             technical_reviewed.append(item)
             if item["selection"]["outcome"] == "program_error":
                 review_stop_reason = "program_error"
                 break
-        technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True)
+        technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True, ranking_context=ranking_context)
         qualified_reviewed = [item for item in technical_reviewed if item["selection"]["eligible"]]
         deep_candidates = qualified_reviewed[:display_target] or technical_reviewed[:1]
         technical_errors = [
@@ -541,15 +563,15 @@ class XuanguFenxiFuWu:
                 as_of_date=analysis_date.strftime("%Y-%m-%d"),
                 minimum_amount_yuan=float(settings["min_amount_yuan"]),
             )
-            item["selection"].update(pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True))
+            item["selection"].update(pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True, ranking_context=ranking_context))
             item["research_assessment"] = pinggu_yanjiu_wenti(research_question, item)
-        # 对完整技术复核池重算共同分位；昂贵补充证据不能改变比较范围或排序。
+        # 同一完整资格池复用本请求状态统计；昂贵补充证据不改变期望净收益排序。
         # 资格若在补充阶段意外改变，停止发布，避免用旧的详报对象冒充最终Top。
-        technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True)
+        technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True, ranking_context=ranking_context)
         qualified_reviewed = [item for item in technical_reviewed if item["selection"]["eligible"]]
         final_deep_candidates = qualified_reviewed[:display_target] or technical_reviewed[:1]
         if {item["ts_code"] for item in final_deep_candidates} != {item["ts_code"] for item in deep_candidates}:
-            raise FenxiJisuanYichang("完整复核后的推荐指数候选与已补充报告对象不一致，本次不能发布未完成报告的排名")
+            raise FenxiJisuanYichang("完整复核后的期望净收益候选与已补充报告对象不一致，本次不能发布未完成报告的排名")
         deep_candidates = final_deep_candidates
         summaries = [
             goujian_houxuan_zhaiyao(
@@ -563,7 +585,7 @@ class XuanguFenxiFuWu:
                 summary["market_cap_check"] = item["profile"]["market_cap_check"]
         qualified = [] if technical_errors else [item for item in summaries if item["meets_selection_conditions"]]
         primary = qualified[0] if qualified else None
-        alternatives = qualified[1 : 1 + int(settings["backup_limit"])]
+        alternatives = qualified[1:display_target]
         recommendation_available = primary is not None
         reviewed_codes = {item["ts_code"] for item in technical_reviewed}
         reviewed_by_code = {item["ts_code"]: item for item in technical_reviewed}
@@ -575,6 +597,11 @@ class XuanguFenxiFuWu:
                 "missing_conditions": item["selection"]["missing_conditions"],
                 "unmet_conditions": item["selection"]["unmet_conditions"],
                 "recommendation_index": item["selection"].get("recommendation_index"),
+                "up_probability": item["selection"].get("up_probability"),
+                "conditional_upside_mean": item["selection"].get("conditional_upside_mean"),
+                "conditional_downside_mean": item["selection"].get("conditional_downside_mean"),
+                "expected_net_return": item["selection"].get("expected_net_return"),
+                "composite_score_bps": item["selection"].get("composite_score_bps"),
                 "recommendation_index_status": item["selection"].get("comparison_status"),
                 "recommendation_index_missing_fields": item["selection"].get("comparison_missing_fields", []),
                 "technical_review": {
@@ -586,6 +613,20 @@ class XuanguFenxiFuWu:
             }
             for item in preliminary
         ]
+        probability_statistics = ranking_context.get("latest_statistics") or {}
+        selected_state_ids = {
+            (item["selection"].get("recommendation_index_analysis") or {}).get("state_key")
+            for item in deep_candidates
+        }
+        probability_estimation = {
+            key: probability_statistics.get(key)
+            for key in ("status", "as_of", "coverage", "cost_assumption", "methodology")
+        }
+        probability_estimation["state_statistics"] = {
+            state_id: statistics
+            for state_id, statistics in (probability_statistics.get("state_statistics") or {}).items()
+            if state_id in selected_state_ids
+        }
         undecided_count = sum(bool(item["missing_conditions"]) and not item["unmet_conditions"] for item in condition_checks)
         # 范围覆盖与可选报告证据分开：指数、财务等失败不改写已核验的选股结论。
         scope_partial = (
@@ -603,6 +644,7 @@ class XuanguFenxiFuWu:
         )
         evidence_partial = bool(
             scope_partial or optional_source_partial or any(item["missing_conditions"] for item in condition_checks)
+            or (probability_statistics.get("coverage") or {}).get("reference_unknown_events", 0)
             or (research_question or {}).get("unverifiable_parts")
             or any(item["evidence_gaps"] or item["technical_summary"].get("status") == "partial"
                    or item["late_session_analysis"].get("status") in {"partial", "unavailable"}
@@ -662,7 +704,7 @@ class XuanguFenxiFuWu:
                 else "当前范围中没有股票同时通过用户明确条件、比较数据和适用的成交核验；具体缺项与反证已保留"
             ),
             "selection_limits": {
-                "maximum_alternatives": int(settings["backup_limit"]),
+                "maximum_alternatives": max(0, display_target - 1),
                 "maximum_full_reports": int(settings["deep_analysis_limit"]),
                 "maximum_technical_reviews": factor_limit,
                 "maximum_minute_requests": int(self._config["weipan"]["minute_candidate_limit"]),
@@ -672,6 +714,7 @@ class XuanguFenxiFuWu:
             "displayed_candidate_count": int(bool(primary)) + len(alternatives),
             "user_conditions": user_conditions or [],
             "research_question": research_question,
+            "probability_estimation": probability_estimation,
             "comparison_coverage": {
                 "method": "all_scope_members_in_batches", "sampled": False,
                 "scope_input": len(data), "history_requested": len(codes), "factor_ready": len(factor_map),
@@ -719,7 +762,7 @@ class XuanguFenxiFuWu:
                 "rejected_examples": rejected[:20],
                 "rules": [
                     "默认不按ST、上市时长、波动率或成交额大小施加风险偏好",
-                    "完整分析日、有效价量和20日比较窗口必须可核验；缺失不是通过",
+                    "完整分析日、连续20日价量状态、成熟同状态样本及技术一致性必须可核验；缺失不是通过",
                     "保留适用的当前成交及一字涨停核验；额外限制仅来自用户明确条件",
                 ],
             },
@@ -730,14 +773,14 @@ class XuanguFenxiFuWu:
                 "realtime_snapshot": realtime_meta,
             },
             "selection_methodology": {
-                "method": "user_constraints_then_current_price_volume_recommendation_index",
-                "conditions": "用户明确条件、有效比较窗口、技术一致性及本次适用的成交核验；未指定时不追加风险或全部看涨条件",
-                "comparison_dimensions": ["20日已实现收益", "20日带方向路径效率", "20日上涨成交额占优度"],
-                "ranking_basis": "完整合格共同池N至少为2；三原值使用平均升序名次分位p=(rank-0.5)/N，P=(pR+pE)/2，V=pU，推荐指数=100sqrt(PV)。两组几何等权、价格组内部等权是公开固定设计，不训练、不按结果寻优。按未舍入指数降序，完全相同明确并列；代码只稳定展示。",
-                "best_definition": "最优指本次实际可核验同一资格池中，当前价格推进与成交配合最符合上述公开指数规则；分数不是未来收益率、上涨概率、置信度或已验证收益优势，跨范围跨日期不可直接比较绝对强弱",
+                "method": "fixed_price_volume_state_conditional_frequency_and_expected_net_return",
+                "conditions": "用户明确条件、20日连续状态输入、技术一致性、适用成交核验及同状态至少10个已知历史信号日期；后者仅是统计工程支持口径，不是收益有效性认证",
+                "comparison_dimensions": ["五交易日价格上涨概率估计", "上涨条件平均涨幅", "非上涨条件平均亏损", "五交易日期望净收益估计"],
+                "ranking_basis": "以完整基础资格池历史构造固定24价量状态；概率与条件涨幅分开显示，综合仅按未舍入期望净收益降序。综合分=10000*期望净收益，单位基点，保留负值；精确同值明确并列，代码只稳定展示。无训练、无权重拟合或寻优。",
+                "best_definition": "最优仅指本次范围及同状态已知历史参考事件中，期望净收益点估计最高；上涨概率和条件涨幅未必同时最高，不声称已知未来收益或已校准概率。最高估计仍可能为负，须如实解释。",
                 "sampling_limit": "范围成分分批全量请求，完整比较并复核潜在合格者后才裁剪展示。财务与分钟补充仅服务最终候选，各守既有上限；来源失败时明确覆盖缺口。",
-                "missing_evidence": "必需条件或任一推荐原值缺失、分母为零、共同比较池不足2只均不产生指数，不填中性分、不临时重分权重；证据不足单列，不解释成条件不满足",
-                "llm_boundary": "只解释程序真实计算的指数、原值分位组分和反证，不改写数值权重排序，不生成上涨概率，不将状态排序冒充经验证的未来收益排名",
+                "missing_evidence": "必需状态缺失、分母无效或同状态已知信号日期不足时不发布排序估计，不补50%、不回退旧强势分；未知事件、条件空组和成交限制分别保留，不解释为确定下跌",
+                "llm_boundary": "只解释程序返回的经验上涨概率、条件幅度、期望净收益、样本与反证，不改写数值或顺序；不能将历史频率说成已验证未来概率或实际成交胜率",
             },
             "research_scope": "公开数据研究排序，不连接证券账户、不提交委托、不自动交易",
         }

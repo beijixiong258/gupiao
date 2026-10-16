@@ -35,7 +35,7 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
     })
     # 定义按字段共享一次；逐股样本数留在原位置，原始观测与缺失项不裁剪。
     definitions: dict[str, Any] = {}
-    from src.ashare.yinzi_gongcheng import FACTOR_REGISTRY
+    from src.ashare.yinzi_gongcheng import FACTOR_REGISTRY, factor_definition
     known = {entry["feature"] for entry in FACTOR_REGISTRY}
 
     def share_definitions(value: Any) -> None:
@@ -60,6 +60,16 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
                 share_definitions(item)
 
     share_definitions(public)
+    if isinstance(public.get("probability_estimation"), dict):
+        # 条件统计不属于八组原始指标，仍发布同一注册表的共享中文定义。
+        # 不在此复制标签、单位、公式，也不修改原始指标组的组成或观测数。
+        estimate_features = (
+            "up_probability", "conditional_upside_mean", "conditional_downside_mean",
+            "expected_gross_return", "expected_net_return", "composite_score_bps",
+        )
+        for feature in (*estimate_features, "recommendation_index", "atr_distance", "amount_ratio_5_15",
+                        *(f"{feature}_difference" for feature in estimate_features)):
+            definitions[feature] = factor_definition(feature)
     if definitions:
         public["indicator_definitions"] = definitions
     reviewed = result.get("reviewed_candidates")
@@ -101,17 +111,18 @@ class GupiaoFenxiTool(BaseTool):
         "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
         "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
         "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
-        "Selection compares all obtainable scope members by the user-approved fixed current-price/turnover recommendation index. "
-        "It uses 20-day return, signed path efficiency and up-day turnover balance in one common valid date/scope/window pool. "
-        "Read returned raw values, rank percentiles, components, pool size and unrounded index order; never recompute or change it. "
-        "Exact equal indices are tied. The old 20/5-day Pareto rule is a research comparator only. "
-        "No default ST, age, volatility or amount preference. Only user-requested extra "
-        "conditions belong in tiaojian; never invent risk constraints. Future holding horizons or maximum expected returns "
-        "are not historical-return filters: preserve the original objective in yanjiu_wenti.question and its untestable "
-        "requirements in unverifiable_parts. Never substitute ret_5 for a future one-week return. Pass a stated stock conjecture in yanjiu_wenti with "
-        "faithful observable checks and explicitly untestable parts. Do not equate an arbitrary proxy with the whole claim. "
-        "The fixed index weights are a disclosed product choice, not trained parameters. The index is not an expected return, "
-        "upside probability or confidence. Do not invent extra scores, weights, risk deductions, predicted probabilities or model forecasts."
+        "Selection compares all obtainable scope members using mature historical five-session events in fixed 24 price/turnover states. "
+        "Display up_probability, conditional_upside_mean and conditional_downside_mean separately. Order only by unrounded "
+        "expected_net_return descending; composite_score_bps and compatibility recommendation_index equal 10000 times that return. "
+        "Exact net-return ties are explicit, with code used only for stable display; do not rank secondarily by probability or upside. "
+        "Read returned state, observations, samples, dates, coverage, uncertainty, costs and limits; never recompute or change values. "
+        "Unestimable states stay unavailable, without 50% or an old-index fallback. Historical unknown-label bounds are not future intervals. "
+        "No default ST, age, volatility or amount preference. Only explicit extra conditions belong in tiaojian. "
+        "The supported reference event is next trading-day open to fifth trading-day close. Requests for this horizon's probability "
+        "and expected return estimates are supported, but guarantees, actual future maximum return and other horizons remain untestable. "
+        "Preserve the whole objective in yanjiu_wenti.question and unsupported parts in unverifiable_parts. Never substitute past ret_5 "
+        "or silently replace another horizon. Same-state historical estimates are not certified future outcomes or execution guarantees. "
+        "Old R/E/U and 20/5-day Pareto are diagnostics/research comparators only. Do not invent scores, weights, risk deductions or train models."
     )
     parameters = {
         "type": "object",
@@ -125,7 +136,7 @@ class GupiaoFenxiTool(BaseTool):
             },
             "yanjiu_wenti": {
                 "type": ["object", "null"],
-                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. Future probability, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
+                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. The supported five-session same-state historical probability estimate is allowed; guarantees, other horizons, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
                 "properties": {"question": {"type": "string"},
                                "checks": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA},
                                "unverifiable_parts": {"type": "array", "items": {"type": "string"}}},
@@ -159,8 +170,8 @@ class GupiaoFenxiTool(BaseTool):
             "shuliang": {
                 "type": ["integer", "null"],
                 "minimum": 1,
-                "maximum": 5,
-                "description": "Number of stocks only when explicitly requested. For vague wording such as some/a few use null or omit, keeping the normal primary plus available alternatives; never invent 1.",
+                "maximum": 10,
+                "description": "Number of stocks from 1 to 10 only when explicitly requested. For vague wording such as some/a few use null or omit, keeping the normal primary plus available alternatives; never invent 1. Never silently truncate an explicit count.",
             },
             "shizhi": {
                 "type": "object",
@@ -263,7 +274,7 @@ class GupiaoFenxiTool(BaseTool):
                 "scope": (
                     "已整理当前可取得的候选证据；部分来源或条件尚未完成核验"
                     if stored_result.get("status") == "partial"
-                    else "候选范围核验、原始证据、显式选股条件与推荐指数比较已完成"
+                    else "候选范围核验、原始证据、显式条件与期望净收益比较已完成"
                 ),
                 "next_step": (
                     "说明候选的量化依据、证据缺口、主要风险与重新评估条件"

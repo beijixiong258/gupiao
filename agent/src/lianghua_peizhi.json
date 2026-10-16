@@ -29,7 +29,7 @@
   "fenxi": {
     "history_calendar_days": 420,
     "history_batch_size": 240,
-    "deep_analysis_limit": 5,
+    "deep_analysis_limit": 10,
     "backup_limit": 4,
     "min_amount_yuan": 50000000,
     "high_volatility_threshold": 0.55,

@@ -9,15 +9,12 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 
-from src.ashare.chengben_huadian import DEFAULT_NOTIONAL_YUAN, DEFAULT_SCENARIO
+from src.ashare.chengben_huadian import DEFAULT_NOTIONAL_YUAN, DEFAULT_SCENARIO, reference_roundtrip_cost_rate
 from src.ashare.tuijian_zhishu import jisuan_tuijian_yuanzhi, jisuan_tuijian_zhishu
 
 
 def _cost_rate() -> float:
-    s, notional = DEFAULT_SCENARIO, DEFAULT_NOTIONAL_YUAN
-    buy = max(s.buy_commission_rate, s.min_commission_yuan / notional) + s.transfer_fee_buy_rate + s.buy_slippage_bps / 10000
-    sell = max(s.sell_commission_rate, s.min_commission_yuan / notional) + s.transfer_fee_sell_rate + s.stamp_tax_sell_rate + s.sell_slippage_bps / 10000
-    return round(1 - (1 - buy) * (1 - sell), 6)
+    return reference_roundtrip_cost_rate()
 
 
 def _old_order(records: list[dict[str, Any]], top_n: int) -> list[str]:

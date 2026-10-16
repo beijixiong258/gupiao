@@ -98,20 +98,22 @@ scope_kind为all_market、scope_text为null；没有指定行业或板块不是�
 missing_information；不要把真实含糊指代静默扩大为全市场，也不要把未限定范围误当含糊指代。
 selection的scope_kind不能为null。市值口径、上限或条件定义不完整时仍保留selection，
 记录原文与缺失项，让gupiao_fenxi进行既有结构化条件澄清，不在此处代替业务校验。
-requested_count仅在用户明确要求选股数量时记录1至5的整数；未明确数量或只说“一些”“几只”
+requested_count仅在用户明确要求选股数量时记录1至10的整数；未明确数量或只说“一些”“几只”
 时为null，绝不能默认填1；不把持有天数、收益数值或其他数字当选股数量。不能满足的明确数量
 须作为能力限制保留，不能擅自截成其他数量。
 explicit_conditions逐条保留用户真实显式且可执行条件的原话；不能默认增加低风险、低波动、ST、
 规模、成交额或必须上涨等要求，也不能编造阈值。research_question保留用户明确研究观点或问题
 原文，不能用任意代理改写成已可验证的结论；没有观点或目标则为null。
-unverifiable_requirements逐条保留现有数据和规则不能验证的目标原话，例如未来持有期收益、
-未来收益最大、上涨概率或未经验证的因果要求。这是现有能力边界，不是用户漏给了范围；
-仍保留selection，不因这类要求单独转clarification。存在这些要求时research_question必须非空，
-保留用户原始整体选股目标，不能只把它放进explicit_conditions而丢掉研究目标。
-按“推荐指数”选股属于现有selection，沿用原范围、数量与条件，不新增预测意图或预测工具。
-推荐指数是固定公式的当前量价状态排序，不是未来收益率、上涨概率或置信度。
-“持有一周”是未来持有期限，绝不能等同过去5日收益条件或当前推荐指数，也不能借它训练、
-预测或修改量化排序。程序可以给出当前状态优选，不能声称满足未来最大收益。
+unverifiable_requirements逐条保留现有数据和规则不能验证的目标原话，例如保证未来盈利、
+已知未来收益最大、未经验证的因果要求，或当前不支持的其他持有期限。这是现有能力边界，
+不是用户漏给了范围；仍保留selection，不因这类要求单独转clarification。存在这些要求时
+research_question必须非空，保留用户原始整体选股目标，不能丢掉研究目标。
+按“推荐指数”、上涨概率、上涨时涨幅或期望净收益选股属于现有selection，沿用原范围、数量
+与条件，不新增训练意图或预测工具。程序支持次交易日开盘至第5交易日收盘的一周参考事件，
+按固定价量状态作历史频率与条件均值估计，上涨概率与上涨条件均幅分别显示，综合按期望净
+参考收益排序。要求这种概率估计本身不列为不可核验；不能将估计说成真实未来概率或保证。
+“持有一周”不能等同过去5日收益条件；其他明确期限不得静默改成5日，须保留能力限制。
+不训练模型、不拟合或寻优规则，不能声称已经满足未来最大收益。
 对于因果问题，能核验的事件先后或同期表现不等于已证明因果；没有不可验证要求时返回空数组。
 missing_information只描述真实尚缺的用户信息，不发明限制，不把没有预测能力列作待用户补充。
 所有可空文本只能为null或非空字符串，数组只能包含非空字符串；无条件或无缺失项时返回空数组。
@@ -138,7 +140,7 @@ def _tool_definition() -> dict[str, Any]:
                         "enum": ["all_market", "main_board", "named_scope", None],
                     },
                     "scope_text": dict(optional_text),
-                    "requested_count": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+                    "requested_count": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
                     "explicit_conditions": dict(text_array),
                     "research_question": dict(optional_text),
                     "unverifiable_requirements": dict(text_array),
@@ -187,9 +189,9 @@ def _validate_decision(arguments: Any) -> IntentDecision:
     scope_text = _optional_text(arguments, "scope_text")
     requested_count = arguments["requested_count"]
     if requested_count is not None and (
-        type(requested_count) is not int or not 1 <= requested_count <= 5
+        type(requested_count) is not int or not 1 <= requested_count <= 10
     ):
-        raise IntentRecognitionError("选股数量必须为null或1至5的整数")
+        raise IntentRecognitionError("选股数量必须为null或1至10的整数")
     research_question = _optional_text(arguments, "research_question")
     explicit_conditions = _text_tuple(arguments, "explicit_conditions")
     unverifiable_requirements = _text_tuple(arguments, "unverifiable_requirements")

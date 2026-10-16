@@ -14,7 +14,7 @@ from src.ashare.fenxi_weipan import WeipanJieduan
 from src.ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
 from src.ashare.fenxi_wenti import heyan_mingque_tiaojian
 from src.ashare.shuju_yuan import heyan_kuaizhao_shidian, huoqu_zhangdieting_guize
-from src.ashare.tuijian_zhishu import jisuan_tuijian_yuanzhi, jisuan_tuijian_zhishu
+from src.ashare.tuijian_gailv import goujian_tongzhuangtai_tongji, jisuan_dangqian_zhuangtai
 
 
 def zhuan_you_xian_shuzhi(value: Any, digits: int | None = None) -> float | None:
@@ -243,6 +243,7 @@ def pinggu_shangzhang_tiaojian(
     *,
     config: dict[str, Any],
     deep_reviewed: bool = False,
+    ranking_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """默认只核验比较基础；方向、波动等限制须由用户明确提出。"""
     conditions: list[dict[str, Any]] = []
@@ -250,22 +251,18 @@ def pinggu_shangzhang_tiaojian(
     raw = technical.get("raw_indicators") or {}
     conflicts: list[str] = []
 
-    def add(key: str, label: str, values: dict[str, Any], passed: bool, rule: str) -> None:
-        missing = [field for field, value in values.items() if value is None]
-        status = "unavailable" if missing else "met" if passed else "unmet"
-        conditions.append({"key": key, "label": label, "status": status, "values": values,
-                           "reason": "缺少必需字段：" + "、".join(missing) if missing else rule})
-
-    dimensions = _tuijian_yuanzhi(item, deep_reviewed=deep_reviewed)
-    for field, reviewed in dimensions.items():
-        group = _TUIJIAN_YUANZHI_GROUPS[field]
-        first = _factor_value(item, group, field)
-        if deep_reviewed and ((first is None) != (reviewed is None) or (
-            first is not None and not math.isclose(first, reviewed, rel_tol=1e-10, abs_tol=1e-12)
-        )):
-            conflicts.append(f"{field} 初筛与同一日线技术复核的原始值或缺失状态不一致")
-    add("comparison_evidence", "推荐指数三项原值具备有效比较基础", dimensions,
-        True, "同一完整交易日、连续21条价格及20日真实成交额；负值仍可比较，缺失或零分母不填中性值")
+    state = _dangqian_zhuangtai(item, ranking_context)
+    dimensions = dict(state.get("raw_values") or {})
+    state_available = state.get("status") == "success" and state.get("calendar_verified") is True
+    conditions.append({
+        "key": "comparison_evidence", "label": "当前价量状态具备有效比较基础",
+        "status": "met" if state_available else "unavailable",
+        "values": {**dimensions, "state": state.get("state"), "calendar_verified": state.get("calendar_verified")},
+        "reason": (
+            "同一完整交易日的连续价量窗口已按权威日历核验；最近方向、ATR标准化价格位置及成交额变化可计算"
+            if state_available else "；".join(state.get("missing_reasons") or ["当前状态或权威连续交易日窗口不可用"])
+        ),
+    })
     conditions.extend(heyan_mingque_tiaojian(item.get("user_conditions") or [], item))
 
     technical_status, technical_outcome, technical_reason = _technical_state(item)
@@ -338,24 +335,53 @@ def pinggu_shangzhang_tiaojian(
     }
 
 
-_TUIJIAN_YUANZHI_GROUPS = {
-    "ret_20": "momentum_reversal",
-    "directional_efficiency_20": "trend_structure",
-    "up_amount_dominance_20": "price_volume_confirmation",
-}
+_SHOUYI_GUJI_FIELDS = (
+    "up_probability", "conditional_upside_mean", "conditional_downside_mean",
+    "expected_gross_return", "expected_net_return", "composite_score_bps",
+)
 
 
-def _tuijian_yuanzhi(item: dict[str, Any], *, deep_reviewed: bool) -> dict[str, float | None]:
-    if deep_reviewed:
-        raw = (item.get("technical") or {}).get("raw_indicators") or {}
-        if all(field in raw for field in _TUIJIAN_YUANZHI_GROUPS):
-            return {field: zhuan_you_xian_shuzhi(raw[field]) for field in _TUIJIAN_YUANZHI_GROUPS}
-        history = item.get("history")
-        if history is not None and not history.empty:
-            values = jisuan_tuijian_yuanzhi(history).iloc[-1]
-            return {field: zhuan_you_xian_shuzhi(values.get(field)) for field in _TUIJIAN_YUANZHI_GROUPS}
-        return {field: None for field in _TUIJIAN_YUANZHI_GROUPS}
-    return {field: _factor_value(item, group, field) for field, group in _TUIJIAN_YUANZHI_GROUPS.items()}
+def _dangqian_zhuangtai(
+    item: dict[str, Any], ranking_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """当前状态与同状态历史统计共享本次请求的日历和截止日。"""
+    if ranking_context is None and isinstance(item.get("probability_state"), dict):
+        return item["probability_state"]
+    context = ranking_context if ranking_context is not None else {}
+    calendar = context.get("trading_calendar")
+    if hasattr(calendar, "open_dates"):
+        calendar = calendar.open_dates
+    as_of = context.get("as_of") or (item.get("data_quality") or {}).get("as_of")
+    history = item.get("history")
+    key = (str(item.get("ts_code") or ""), str(as_of), id(history))
+    cache = context.setdefault("current_state_cache", {}) if ranking_context is not None else {}
+    if key not in cache:
+        cache[key] = jisuan_dangqian_zhuangtai(history, trading_calendar=calendar, as_of=as_of)
+    return cache[key]
+
+
+def _tongzhuangtai_tongji(
+    pool: list[dict[str, Any]], ranking_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """仅在全部资格核验后，聚合完整合格池；不按最终展示数量截取样本。"""
+    if not pool:
+        empty = {"candidate_estimates": {}, "state_statistics": {}}
+        if ranking_context is not None:
+            ranking_context["latest_statistics"] = empty
+        return empty
+    context = ranking_context if ranking_context is not None else {}
+    calendar = context.get("trading_calendar")
+    if hasattr(calendar, "open_dates"):
+        calendar = calendar.open_dates
+    as_of = context.get("as_of") or (pool[0].get("data_quality") or {}).get("as_of")
+    histories = {str(item["ts_code"]): item["history"] for item in pool}
+    key = (str(as_of), tuple(sorted((code, id(history)) for code, history in histories.items())))
+    cache = context.setdefault("statistics_cache", {}) if ranking_context is not None else {}
+    if key not in cache:
+        cache[key] = goujian_tongzhuangtai_tongji(histories, calendar, as_of)
+    if ranking_context is not None:
+        ranking_context["latest_statistics"] = cache[key]
+    return cache[key]
 
 
 def paixu_shangzhang_houxuan(
@@ -363,82 +389,114 @@ def paixu_shangzhang_houxuan(
     *,
     config: dict[str, Any],
     deep_reviewed: bool = False,
+    ranking_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """在同一已核验合格池中计算推荐指数，按未舍入指数排序。"""
+    """当前状态的上涨概率与条件幅度分列，仅按未舍入期望净收益排序。"""
     prepared: list[dict[str, Any]] = []
     for item in items:
         result = dict(item)
-        selection = pinggu_shangzhang_tiaojian(item, config=config, deep_reviewed=deep_reviewed)
-        dimensions = _tuijian_yuanzhi(item, deep_reviewed=deep_reviewed)
+        result["probability_state"] = _dangqian_zhuangtai(item, ranking_context)
+        selection = pinggu_shangzhang_tiaojian(result, config=config, deep_reviewed=deep_reviewed,
+                                              ranking_context=ranking_context)
+        dimensions = dict(result["probability_state"].get("raw_values") or {})
         missing = [field for field, value in dimensions.items() if value is None]
         selection.update({
             "comparison_values": dimensions,
             "comparison_missing_fields": missing,
             "comparison_status": "unavailable" if missing or selection["missing_conditions"] else "pending" if selection["eligible"] else "not_applicable",
             "recommendation_index": None,
-            "ranking_basis": "先完成用户明确条件、日期身份和技术原值及适用成交核验；在完整三原值的同一合格池中计算平均名次分位，P=(pR+pE)/2、V=pU，推荐指数=100sqrt(PV)。按未舍入指数降序，完全相同明确并列，代码仅稳定展示。指数表达当前量价状态，不是未来收益率、上涨概率或置信度。",
-            "preference_order": ["recommendation_index_descending", "code_for_exact_ties"],
+            **{field: None for field in _SHOUYI_GUJI_FIELDS},
+            "ranking_basis": "先完成用户明确条件、当前状态、日期身份和技术原值及适用成交核验；在全部合格对象的同请求历史中统计固定同状态、已到期五交易日事件。上涨概率与上涨/非上涨条件幅度分别展示，综合只按未舍入期望净收益降序，完全相同明确并列，代码仅稳定展示。综合分=10000×期望净收益，是基点分而非概率；历史条件频率不是已经验证的未来真实概率，不训练或调权。",
+            "preference_order": ["expected_net_return_descending", "code_for_exact_ties"],
         })
         result["selection"] = selection
         prepared.append(result)
 
     pool = [item for item in prepared if item["selection"]["eligible"]]
-    index_map = jisuan_tuijian_zhishu([
-        {"ts_code": item["ts_code"], **item["selection"]["comparison_values"]} for item in pool
-    ])
+    statistics = _tongzhuangtai_tongji(pool, ranking_context)
+    estimate_map = statistics.get("candidate_estimates") or {}
     for item in pool:
         selection = item["selection"]
-        index_result = index_map[item["ts_code"]]
-        selection["recommendation_index_analysis"] = index_result
-        selection["comparison_pool_size"] = index_result["pool_size"]
-        selection["recommendation_index"] = index_result["recommendation_index"]
-        selection["comparison_status"] = "complete" if index_result["status"] == "success" else "unavailable"
-        if index_result["status"] != "success":
+        estimate = estimate_map.get(str(item["ts_code"])) or {
+            "status": "unavailable", "missing_reasons": ["该对象没有同状态统计结果"], "statistics": {},
+        }
+        stats = estimate.get("statistics") or {}
+        net = zhuan_you_xian_shuzhi(stats.get("expected_net_return"))
+        available = estimate.get("status") == "success" and net is not None
+        selection["recommendation_index_analysis"] = {
+            **estimate, "current_state": item["probability_state"],
+            "statistics_pool_size": len(pool), "score_unit": "basis_points",
+            "score_definition": "10000×同状态历史事件期望净收益；不是上涨概率",
+        }
+        selection["comparison_pool_size"] = len(pool)
+        selection["statistics_pool_size"] = len(pool)
+        selection["comparison_status"] = "complete" if available else "unavailable"
+        selection["comparison_state_values"] = dict(item["probability_state"].get("raw_values") or {})
+        if available:
+            selection.update({field: zhuan_you_xian_shuzhi(stats.get(field)) for field in _SHOUYI_GUJI_FIELDS})
+            # 兼容既有字段名，但综合分语义由期望净收益明确决定。
+            selection["composite_score_bps"] = 10000.0 * net
+            selection["recommendation_index"] = selection["composite_score_bps"]
+            selection["comparison_values"] = {field: selection[field] for field in _SHOUYI_GUJI_FIELDS}
+            selection["comparison_missing_fields"] = []
+        else:
             selection["conditions"].append({
-                "key": "recommendation_pool", "label": "推荐指数共同比较池有效",
-                "status": "unavailable", "values": {"pool_size": index_result["pool_size"]},
-                "reason": "；".join(index_result["missing_reasons"]),
+                "key": "recommendation_statistics", "label": "同状态历史概率与收益可估计",
+                "status": "unavailable", "values": {"statistics_pool_size": len(pool),
+                    "known_count": stats.get("known_count"), "known_signal_dates": stats.get("known_signal_dates"),
+                    "sample_support": stats.get("sample_support")},
+                "reason": "；".join(estimate.get("missing_reasons") or ["同状态事件样本或期望净收益不可估计"]),
             })
-            selection["missing_conditions"].append("recommendation_pool")
-            selection["comparison_status"] = "unavailable"
+            selection["missing_conditions"].append("recommendation_statistics")
             selection.update(eligible=False, status="partial", outcome="evidence_unavailable")
 
     def display_order(item: dict[str, Any]) -> tuple[Any, ...]:
         selection = item["selection"]
-        index = selection["recommendation_index"]
-        category = 0 if selection["eligible"] and index is not None else 1 if not selection["unmet_conditions"] else 2
-        return (category, -index if index is not None else math.inf, str(item.get("ts_code") or ""))
+        net = selection["expected_net_return"]
+        category = 0 if selection["eligible"] and net is not None else 1 if not selection["unmet_conditions"] else 2
+        return (category, -net if net is not None else math.inf, str(item.get("ts_code") or ""))
 
     ordered = sorted(prepared, key=display_order)
     eligible_pool = [item for item in ordered if item["selection"]["eligible"]]
-    equivalent_counts = Counter(item["selection"]["recommendation_index"] for item in eligible_pool)
+    equivalent_counts = Counter(item["selection"]["expected_net_return"] for item in eligible_pool)
     previous_value, comparison_rank = None, 0
     for index, item in enumerate(eligible_pool):
         selection = item["selection"]
-        if selection["recommendation_index"] != previous_value:
+        if selection["expected_net_return"] != previous_value:
             comparison_rank = index + 1
         selection["comparison_rank"] = comparison_rank
-        previous_value = selection["recommendation_index"]
+        previous_value = selection["expected_net_return"]
         selection["comparison_pool_size"] = len(eligible_pool)
-        selection["equivalent_index_count"] = equivalent_counts[selection["recommendation_index"]]
-        selection["absolute_performance"] = "20日净上涨" if selection["comparison_values"]["ret_20"] > 0 else "20日未净上涨；相对高分不等于绝对走强"
+        selection["equivalent_index_count"] = equivalent_counts[selection["expected_net_return"]]
+        selection["absolute_performance"] = (
+            "同状态历史事件平均净收益为正" if selection["expected_net_return"] > 0
+            else "同状态历史事件平均净收益非正；排名靠前不等于存在正收益依据"
+        )
         other = eligible_pool[index + 1] if index + 1 < len(eligible_pool) else None
         if other is not None:
             right = other["selection"]
-            equal = selection["recommendation_index"] == right["recommendation_index"]
-            left_index = selection["recommendation_index_analysis"]
-            right_index = right["recommendation_index_analysis"]
-            reason = "推荐指数完全相同，明确并列；代码仅用于稳定展示" if equal else "同一共同池中按未舍入推荐指数取舍；原值、分位及价格与成交组分保留供解释"
+            equal = selection["expected_net_return"] == right["expected_net_return"]
+            reason = (
+                "期望净收益完全相同，明确并列；不以概率或涨幅隐藏次排序，代码仅用于稳定展示"
+                if equal else "按同状态已到期事件的未舍入期望净收益取舍；上涨概率、上涨幅度和非上涨亏损分别保留，不能只看概率×涨幅"
+            )
+            differences = {
+                field + "_difference": selection[field] - right[field]
+                if selection[field] is not None and right[field] is not None else None
+                for field in _SHOUYI_GUJI_FIELDS
+            }
             selection["comparison_to_next"] = {"ts_code": other["ts_code"], "name": other.get("name"), "reason": reason,
                                                 "role": "comparison_reference",
                                                 "current_values": selection["comparison_values"], "next_values": right["comparison_values"],
                                                 "current_index": selection["recommendation_index"], "next_index": right["recommendation_index"],
                                                 "index_difference": selection["recommendation_index"] - right["recommendation_index"],
-                                                "current_percentiles": left_index["percentiles"], "next_percentiles": right_index["percentiles"],
-                                                "current_groups": {"price_group": left_index["price_group"], "volume_group": left_index["volume_group"]},
-                                                "next_groups": {"price_group": right_index["price_group"], "volume_group": right_index["volume_group"]},
-                                                "raw_advantages": [field for field, value in selection["comparison_values"].items() if value > right["comparison_values"][field]],
-                                                "raw_tradeoffs": [field for field, value in selection["comparison_values"].items() if value < right["comparison_values"][field]]}
+                                                "index_unit": "basis_points", **differences,
+                                                "current_state": item["probability_state"].get("state"),
+                                                "next_state": other["probability_state"].get("state"),
+                                                "raw_advantages": [field for field in ("up_probability", "conditional_upside_mean", "expected_net_return")
+                                                    if selection[field] is not None and right[field] is not None and selection[field] > right[field]],
+                                                "raw_tradeoffs": [field for field in ("up_probability", "conditional_upside_mean", "expected_net_return")
+                                                    if selection[field] is not None and right[field] is not None and selection[field] < right[field]]}
     return ordered
 
 
@@ -693,7 +751,7 @@ def goujian_houxuan_zhaiyao(
     *,
     rank: int,
 ) -> dict[str, Any]:
-    """投影完整诊断证据、程序已计算指数和显式筛选条件。"""
+    """投影完整诊断、分列概率与幅度、期望净收益和显式条件。"""
     selection = dict(item.get("selection") or {})
     conditions = selection.get("conditions") or []
     positive = [f"{condition['label']}：{condition['reason']}" for condition in conditions if condition.get("status") == "met"]
@@ -732,6 +790,8 @@ def goujian_houxuan_zhaiyao(
     return {
         "rank": selection.get("comparison_rank", rank),
         "recommendation_index": selection.get("recommendation_index"),
+        "recommendation_index_semantics": "composite_score_bps_expected_net_return",
+        **{field: selection.get(field) for field in _SHOUYI_GUJI_FIELDS},
         "diagnosis_summary": diagnosis,
         "ts_code": item["ts_code"],
         "name": item["name"],
