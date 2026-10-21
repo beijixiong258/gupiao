@@ -88,7 +88,7 @@ _LABELS = {
     "data_as_of": "证据截止日", "daily_data_as_of": "日线截止日", "explanation": "口径说明", "reassess_when": "何时更新诊断",
     "result_confirmation": "结果确认状态", "session_status": "交易时段", "realtime_status": "实时核验状态",
     "selection_analysis": "选股条件核验", "meets_selection_conditions": "是否通过选股条件",
-    "recommendation_index_analysis": "上涨概率、条件涨幅与期望净收益明细", "raw_values": "计算原始值",
+    "recommendation_index_analysis": "未来5个交易日期望分与依据", "raw_values": "计算原始值",
     "percentiles": "共同有效池中的名次分位", "price_group": "价格组分P（0–1）",
     "volume_group": "量价组分V（0–1）", "pool_size": "共同有效比较股票数N",
     "equivalent_index_count": "期望净收益精确相同的并列对象数",
@@ -97,11 +97,31 @@ _LABELS = {
     "up_probability": "上涨概率估计", "conditional_upside_mean": "上涨条件下平均涨幅估计",
     "conditional_downside_mean": "非上涨条件下平均亏损幅度估计", "expected_gross_return": "期望毛参考收益",
     "expected_net_return": "期望净参考收益", "composite_score_bps": "综合评分（期望净收益，基点）",
-    "current_state": "当前固定价量状态", "state_key": "价量状态标识", "statistics": "同状态成熟事件统计",
-    "candidate_estimates": "逐股同状态估计", "state_statistics": "各固定状态历史统计",
+    "current_state": "当前固定价量状态", "state_key": "价量状态标识", "statistics": "逐股核加权成熟事件统计",
+    "candidate_estimates": "逐股核估计", "state_statistics": "旧固定状态统计",
+    "stock_statistics": "逐股核估计与检查", "kernel_parameters": "核估计参数",
+    "kernel_features": "连续价量特征", "feature_center": "特征中心", "feature_scale": "特征尺度",
+    "constant_dimensions": "常量特征维度", "minimum_effective_events": "最低有效事件量（工程门槛）",
+    "distinct_expected_returns": "不同期望净收益数量", "largest_exact_tie_group": "最大精确并列组大小",
+    "kernel": "核函数", "radius": "固定核半径", "scale_rule": "尺度计算口径",
+    "distance_rule": "联合距离口径", "weight_formula": "核与时间联合权重公式",
+    "bandwidth_fitted_to_returns": "是否按收益拟合带宽", "state_role": "24状态用途",
     "known_count": "结果已知的成熟事件数", "unknown_count": "结果未知的成熟事件数",
     "up_count": "已知事件中上涨次数", "non_up_count": "已知事件中非上涨次数",
     "date_count": "成熟事件涉及信号日期数", "known_signal_dates": "有已知结果的不同信号日期数",
+    "sample_stability_rule": "日期集中度与删日稳定性门槛",
+    "minimum_effective_signal_dates": "最低有效日期量（工程门槛）",
+    "date_stability_check": "删除少数信号日期后的稳定性检查",
+    "maximum_removed_signal_dates": "每次最多移除的信号日期数",
+    "maximum_date_removal_relative_change": "删日后相对变化上限（比例，1表示100%）",
+    "maximum_relative_change_allowed": "允许相对变化上限（比例，1表示100%）",
+    "evaluated_removals": "已检查的日期移除组合数",
+    "full_expected_net_return": "完整样本均值（比例，1表示100%，仅供敏感性核验）",
+    "minimum_expected_net_return": "删日后的最低均值（比例，1表示100%）",
+    "maximum_expected_net_return": "删日后的最高均值（比例，1表示100%）",
+    "maximum_absolute_change": "删日后最大均值变化（收益比例，1表示100%）",
+    "maximum_relative_change": "删日后最大相对变化（比例，1表示100%）",
+    "most_influential_signal_dates": "造成最大变化的信号日期",
     "sample_support": "样本支持状态", "probability_missing_bounds": "历史未知标签所对应频率可能范围（非未来区间）",
     "uncertainty": "按信号日期考虑相关性的估计不确定性", "date_summaries": "逐信号日期统计",
     "event_counts": "参考事件状态计数", "signal_events": "完整历史参考事件",
@@ -115,16 +135,30 @@ _LABELS = {
     "expected_net_return_95_interval": "期望净收益历史样本探索区间（非未来收益范围）",
     "chronological_subperiods": "按时间顺序划分的四个子期", "historical_events": "成熟历史事件数",
     "reference_known_events": "参考结果已知事件数", "reference_unknown_events": "参考结果未知事件数",
-    "current_state_valid": "当前价量状态有效股数", "estimate_available": "同状态估计可用股数",
-    "estimate_unavailable": "同状态估计不可用股数", "historical_state_missing_events": "历史状态输入不足事件数",
+    "current_state_valid": "当前价量状态有效股数", "estimate_available": "逐股核估计可用股数",
+    "estimate_unavailable": "逐股核估计不可用股数", "historical_state_missing_events": "历史状态输入不足事件数",
     "scheduled_signal_dates": "计划信号日期数", "mature_signal_dates": "已成熟信号日期数",
     "immature_signal_dates": "尚未成熟信号日期数", "roundtrip_reference_cost_rate": "参考往返损耗比例",
     "notional_yuan": "参考名义金额（元）", "actual_fill_or_broker_cost_verified": "实际成交与券商费用是否核实",
     "historical_identity_or_limit_rules_verified": "历史证券身份与涨跌停规则是否核实",
-    "cost_assumption": "参考成本假设", "methodology": "固定状态与统计口径", "coverage": "输入及事件覆盖",
+    "cost_assumption": "参考成本假设", "methodology": "连续特征与统计口径", "coverage": "输入及事件覆盖",
     "expected_gross_return_difference": "本股减下一候选的期望毛收益差",
     "composite_score_bps_difference": "本股减下一候选的期望净收益综合分差（基点）",
-    "probability_estimation": "概率与期望收益样本口径",
+    "probability_estimation": "期望分的样本与有效性检查",
+    "score_lookback_sessions": "评分样本上限（交易日）", "recency_half_life_sessions": "时间权重半衰期（交易日）",
+    "recency_formula": "时间权重及到期条件", "age_basis": "样本年龄口径", "parameter_status": "参数来源与验证状态",
+    "score_window_start": "评分信号窗口起日", "score_window_end": "评分信号窗口止日",
+    "effective_sample_meaning": "有效样本量定义及限制", "public_display": "报告展示口径",
+    "known_weight_sum": "已知结果权重合计", "unknown_weight_sum": "未知结果权重合计",
+    "effective_event_count": "加权有效事件量", "effective_signal_date_count": "按日期汇总权重后的有效日期量",
+    "older_mature_signal_dates_excluded": "超过评分窗口而排除的成熟信号日期数",
+    "older_state_missing_events": "评分窗口以前状态输入不足的事件数（不参与当前评分）",
+    "walk_forward_check": "近期逐期估计与实际参考结果检查", "validation_lookback_sessions": "逐期检查窗口（交易日）",
+    "checked_signal_dates": "检查的信号日期数", "available_signal_dates": "可成对比较的信号日期数",
+    "date_checks": "逐期检查明细", "training_known_signal_dates": "当时已到期且结果已知的信号日期数",
+    "training_effective_signal_date_count": "当时按权重汇总的有效日期量", "training_latest_exit_date": "当时所用样本最晚到期日",
+    "evaluation_known_events": "本期实际参考结果已知事件数", "evaluation_unknown_events": "本期实际参考结果未知事件数",
+    "parameters_tuned": "是否拟合或寻优参数", "future_return_validated": "是否已验证未来收益",
     "reference_only": "仅为参考价格统计", "execution_verified": "实际成交是否核验",
     "future_probability_calibrated": "未来概率是否经过校准验证",
     "historical_pool": "历史统计样本范围（当前存续且当前条件有效，非历史完整市场）",
@@ -194,6 +228,20 @@ _STATUS = {
     "reference_known": "参考价格结果已知", "reference_unknown": "参考价格结果未知",
     "engineering_support_gate_not_return_effectiveness_or_calibration": "只满足工程支持门槛，不代表收益有效或未来概率已校准",
     "circular_signal_date_block_bootstrap": "按信号日期连续分块重抽样（历史样本探索）",
+    "recency_weighted_circular_signal_date_block_bootstrap": "保留时间权重、按信号日期连续分块重抽样（探索性）",
+    "fixed_state_recent_weighted_expected_net_return": "旧固定价量状态下的五交易日期望分",
+    "stock_specific_recent_kernel_expected_net_return": "逐股连续价量特征核加权的五交易日期望分",
+    "kernel_time_weighted_circular_signal_date_block_bootstrap": "保留核与时间联合权重、按日期连续分块重抽样（探索性）",
+    "compact_biweight": "有限范围双权核",
+    "kernel_effective_events_below_ten": "局部有效事件不足10个，尚不支持公开估计",
+    "kernel_effective_signal_dates_below_minimum": "按日期权重折算的有效日期不足门槛，不发布排序估计",
+    "kernel_signal_date_removal_unstable": "估计过度依赖少数信号日期，不发布排序估计",
+    "kernel_signal_date_removal_unavailable": "日期移除检查所需有效样本不足，不发布排序估计",
+    "fixed_weight_leave_one_or_two_signal_dates_out": "固定其余权重，穷举移除1至2个完整信号日期",
+    "stable": "通过样本敏感性检查", "unstable": "未通过样本敏感性检查",
+    "future_five_session_expectation_score_and_net_return_only": "只展示未来五交易日期望分与预计净收益，内部概率明细留作审计",
+    "training_sample_unsupported": "当时已经到期的局部相似样本未达到支持门槛",
+    "evaluation_reference_unavailable": "本期实际参考结果缺失，不能成对比较",
     "exploratory_observed_sample_distribution_not_future_guarantee": "描述已观测样本的探索性不确定性，不保证未来结果",
     "observed_mature_event_unknown_label_bounds_not_future_confidence_interval": "历史成熟事件未知标签的可能范围，不是未来概率区间",
     "expected_net_return_descending_exact_ties": "未舍入期望净收益降序，精确同值并列",
@@ -224,6 +272,13 @@ _STATUS = {
 }
 _METADATA_CONTAINERS = {"data_provenance", "data_quality", "sources", "method", "configuration"}
 _HIDDEN_KEYS = {
+    # 概率与条件幅度留在结构化计算结果供审计，公开选股报告只展示期望分及净收益。
+    "up_probability", "conditional_upside_mean", "conditional_downside_mean", "up_count", "non_up_count",
+    "up_probability_difference", "conditional_upside_mean_difference", "conditional_downside_mean_difference",
+    "probability_missing_bounds", "up_probability_95_interval", "probability_missing_bounds_meaning",
+    "decomposed_expected_gross_return", "expected_gross_return", "expected_gross_return_difference",
+    "up_label", "gain_loss_basis", "future_probability_calibrated",
+    "observed_summary",  # 未通过支持检查的原始点估计仅供结构化审计。
     "analysis_id", "tool_contract_version", "buy_decision", "ranking_details", "ranking_score_0_100",
     "ranking_score_definition", "score", "score_0_100", "score_definition", "score_interpretation",
     "confidence", "component_weights", "factor_group_weights", "risk_penalty", "scoring_effect",
@@ -235,6 +290,7 @@ _LEGACY_TEXT = re.compile(r"评分|综合分|技术状态分|技术分|得分|�
 _INDEX_SCORE_TERM = re.compile(r"推荐指数(?:的)?(?:评分|得分|分数)?")
 _NET_RETURN_SCORE_TERM = re.compile(r"期望净收益(?:的)?(?:综合评分|综合分|得分|分数)|(?:综合评分|综合分)(?=（期望净收益[，、]基点）)|(?:综合评分|综合分)(?=[^。！？\n]*(?:为|等于|=)\s*10000\s*[×*]\s*期望净收益)|(?:综合评分|综合分)(?=（基点）|\s*(?:为|是|[:：])?\s*[+-]?\d+(?:\.\d+)?\s*基点)")
 _INDEX_WEIGHT_TERM = re.compile(r"(?:固定(?:公式)?(?:组分)?|组分|价格组(?:内部)?|量价组(?:内部)?)(?:的)?权重")
+_RECENCY_WEIGHT_TERM = re.compile(r"(?:时间|样本|近期样本|衰减|核|相似度|联合|核与时间联合)(?:的)?权重|权重(?=每(?:隔)?20个交易日减半)")
 _NEGATED_LEGACY_TERM = re.compile(
     r"(?:不是|并非|不代表|不等于|不作为|不产生|不输出|不发布|不计算|不使用)"
     r"(?:收益率[、，或和与及\s]*)?(?:上涨概率[、，或和与及\s]*)?"
@@ -305,7 +361,7 @@ def qingli_jiu_pingfen_biaoshu(content: str) -> str:
     parts = re.split(r"(?<=[。！？\n])", str(content or ""))
     retained: list[str] = []
     for part in parts:
-        checked = _NET_RETURN_SCORE_TERM.sub("", _NEGATED_LEGACY_TERM.sub("", part))
+        checked = _RECENCY_WEIGHT_TERM.sub("", _NET_RETURN_SCORE_TERM.sub("", _NEGATED_LEGACY_TERM.sub("", part)))
         if "推荐指数" in part or "固定公式" in part:
             checked = _INDEX_SCORE_TERM.sub("", checked)
             checked = _INDEX_WEIGHT_TERM.sub("", checked)
@@ -476,11 +532,10 @@ def _identity(candidate: dict[str, Any], default: str) -> str:
 def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: bool) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     estimate_fields = {key: candidate[key] for key in (
-        "up_probability", "conditional_upside_mean", "conditional_downside_mean",
-        "expected_gross_return", "expected_net_return", "composite_score_bps",
+        "composite_score_bps", "expected_net_return",
     ) if key in candidate}
     if estimate_fields:
-        sections.append((identity + " / 上涨概率、条件涨幅与综合次序", "\n".join(_tree(estimate_fields))))
+        sections.append((identity + " / 未来5个交易日期望分与预计净收益", "\n".join(_tree(estimate_fields))))
     summary = candidate.get("diagnosis_summary")
     if candidate.get("research_question"):
         sections.append((identity + " / 用户观点核验", "\n".join(_tree(candidate["research_question"]))))
@@ -543,7 +598,7 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
                        ("market_cap_filter", "市值筛选条件及核验"),
                        ("user_conditions", "用户明确选股条件"), ("comparison_coverage", "实际比较覆盖"),
                        ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
-                       ("selection_methodology", "选股方法"), ("probability_estimation", "概率与期望收益样本口径"), ("diagnosis_validity", "诊断时点"),
+                       ("selection_methodology", "选股方法"), ("probability_estimation", "期望分的样本与有效性检查"), ("diagnosis_validity", "诊断时点"),
                        ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
         if key in payload:
             kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
@@ -679,7 +734,7 @@ def goujian_fenxi_anquan_huitui(payload: dict[str, Any] | None) -> str:
         if status == "partial":
             lead += "部分来源或指标缺失，以下保留可用证据和具体缺口。"
     elif payload.get("recommendation_available") is True:
-        lead = "以下为通过用户条件和数据核验的候选：按同状态历史事件估计的未舍入期望净参考收益降序排列。上涨概率与上涨条件均幅分别展示，期望净收益综合分仅换算为基点；同状态可并列，估计不代表已知未来结果。样本、日期、成本及缺口见报告。"
+        lead = "以下候选按未来5个交易日期望分降序排列，期限为下一交易日开盘至第五交易日收盘。100分对应预计净收益1%；评分用最近120交易日内已到期事件，时间衰减半衰期为20交易日，并按各股连续价量特征的相似度赋权。有效日期不足10或删去任意1至2个信号日导致均值变化超过50%的估计不参与排序。只在精确同值时并列；近期逐股检查、当前依据及缺口见报告。"
         if status == "partial":
             lead += "部分来源或补充证据缺失，报告保留具体缺口和实际复核范围。"
     else:

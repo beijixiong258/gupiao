@@ -67,7 +67,7 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
             "up_probability", "conditional_upside_mean", "conditional_downside_mean",
             "expected_gross_return", "expected_net_return", "composite_score_bps",
         )
-        for feature in (*estimate_features, "recommendation_index", "atr_distance", "amount_ratio_5_15",
+        for feature in (*estimate_features, "recommendation_index", "atr_distance", "amount_ratio_5_15", "log_amount_ratio_5_15",
                         *(f"{feature}_difference" for feature in estimate_features)):
             definitions[feature] = factor_definition(feature)
     if definitions:
@@ -111,17 +111,19 @@ class GupiaoFenxiTool(BaseTool):
         "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
         "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
         "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
-        "Selection compares all obtainable scope members using mature historical five-session events in fixed 24 price/turnover states. "
-        "Display up_probability, conditional_upside_mean and conditional_downside_mean separately. Order only by unrounded "
+        "Selection compares all obtainable scope members with stock-specific continuous-feature kernel estimates from mature five-session events; 24-state labels are diagnostic only. "
+        "The score uses only signals from the last 120 trading sessions, weighted jointly by a 20-session half-life and local feature similarity (fixed biweight radius 3; origin-only IQR scales, no return fitting). "
+        "Display future-five-session expectation scores and estimated net returns; probability and conditional gain/loss fields "
+        "stay in structured audit data and must not be listed in public reports. Read the returned chronological check and limits. Order only by unrounded "
         "expected_net_return descending; composite_score_bps and compatibility recommendation_index equal 10000 times that return. "
         "Exact net-return ties are explicit, with code used only for stable display; do not rank secondarily by probability or upside. "
         "Read returned state, observations, samples, dates, coverage, uncertainty, costs and limits; never recompute or change values. "
-        "Unestimable states stay unavailable, without 50% or an old-index fallback. Historical unknown-label bounds are not future intervals. "
+        "Local estimates require at least 10 known signal dates and 10 effective events as engineering support; unsupported estimates stay unavailable, without 50% or an old-index fallback. Historical unknown-label bounds are not future intervals. "
         "No default ST, age, volatility or amount preference. Only explicit extra conditions belong in tiaojian. "
         "The supported reference event is next trading-day open to fifth trading-day close. Requests for this horizon's probability "
         "and expected return estimates are supported, but guarantees, actual future maximum return and other horizons remain untestable. "
         "Preserve the whole objective in yanjiu_wenti.question and unsupported parts in unverifiable_parts. Never substitute past ret_5 "
-        "or silently replace another horizon. Same-state historical estimates are not certified future outcomes or execution guarantees. "
+        "or silently replace another horizon. Kernel conditional estimates are not certified future outcomes or execution guarantees. "
         "Old R/E/U and 20/5-day Pareto are diagnostics/research comparators only. Do not invent scores, weights, risk deductions or train models."
     )
     parameters = {
@@ -136,7 +138,7 @@ class GupiaoFenxiTool(BaseTool):
             },
             "yanjiu_wenti": {
                 "type": ["object", "null"],
-                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. The supported five-session same-state historical probability estimate is allowed; guarantees, other horizons, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
+                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. The supported five-session kernel conditional probability estimate is allowed; guarantees, other horizons, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
                 "properties": {"question": {"type": "string"},
                                "checks": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA},
                                "unverifiable_parts": {"type": "array", "items": {"type": "string"}}},

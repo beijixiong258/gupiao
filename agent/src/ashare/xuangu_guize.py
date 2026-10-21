@@ -344,7 +344,7 @@ _SHOUYI_GUJI_FIELDS = (
 def _dangqian_zhuangtai(
     item: dict[str, Any], ranking_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """当前状态与同状态历史统计共享本次请求的日历和截止日。"""
+    """当前特征与逐股核估计共享本次请求的日历和截止日。"""
     if ranking_context is None and isinstance(item.get("probability_state"), dict):
         return item["probability_state"]
     context = ranking_context if ranking_context is not None else {}
@@ -391,7 +391,7 @@ def paixu_shangzhang_houxuan(
     deep_reviewed: bool = False,
     ranking_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """当前状态的上涨概率与条件幅度分列，仅按未舍入期望净收益排序。"""
+    """近期相似价量样本核加权估计未来五交易日净收益，仅按未舍入期望排序。"""
     prepared: list[dict[str, Any]] = []
     for item in items:
         result = dict(item)
@@ -406,7 +406,7 @@ def paixu_shangzhang_houxuan(
             "comparison_status": "unavailable" if missing or selection["missing_conditions"] else "pending" if selection["eligible"] else "not_applicable",
             "recommendation_index": None,
             **{field: None for field in _SHOUYI_GUJI_FIELDS},
-            "ranking_basis": "先完成用户明确条件、当前状态、日期身份和技术原值及适用成交核验；在全部合格对象的同请求历史中统计固定同状态、已到期五交易日事件。上涨概率与上涨/非上涨条件幅度分别展示，综合只按未舍入期望净收益降序，完全相同明确并列，代码仅稳定展示。综合分=10000×期望净收益，是基点分而非概率；历史条件频率不是已经验证的未来真实概率，不训练或调权。",
+            "ranking_basis": "先完成用户明确条件、当前状态、日期身份和技术原值及适用成交核验；评分仅用最近120交易日内已到期的五交易日参考事件，20交易日半衰期与逐股连续特征相似度核权重相乘；不共享24状态组分数。有效日期不足10，或删除任意1至2个信号日期后均值变化超过原值绝对值50%时，不发布排序估计。未来5个交易日期望分=10000×预计净收益，100分对应1%；综合上涨机会、幅度、非上涨损失及成本，内部明细不在公开报告列出。仅按未舍入预计净收益降序，同值明确并列，代码只稳定展示。参数固定，不训练或寻优，估计未经未来收益有效性确认。",
             "preference_order": ["expected_net_return_descending", "code_for_exact_ties"],
         })
         result["selection"] = selection
@@ -418,7 +418,7 @@ def paixu_shangzhang_houxuan(
     for item in pool:
         selection = item["selection"]
         estimate = estimate_map.get(str(item["ts_code"])) or {
-            "status": "unavailable", "missing_reasons": ["该对象没有同状态统计结果"], "statistics": {},
+            "status": "unavailable", "missing_reasons": ["该对象没有逐股核估计结果"], "statistics": {},
         }
         stats = estimate.get("statistics") or {}
         net = zhuan_you_xian_shuzhi(stats.get("expected_net_return"))
@@ -426,7 +426,7 @@ def paixu_shangzhang_houxuan(
         selection["recommendation_index_analysis"] = {
             **estimate, "current_state": item["probability_state"],
             "statistics_pool_size": len(pool), "score_unit": "basis_points",
-            "score_definition": "10000×同状态历史事件期望净收益；不是上涨概率",
+            "score_definition": "10000×近期相似价量样本核加权预计五交易日净收益；100分对应1%",
         }
         selection["comparison_pool_size"] = len(pool)
         selection["statistics_pool_size"] = len(pool)
@@ -441,11 +441,13 @@ def paixu_shangzhang_houxuan(
             selection["comparison_missing_fields"] = []
         else:
             selection["conditions"].append({
-                "key": "recommendation_statistics", "label": "同状态历史概率与收益可估计",
+                "key": "recommendation_statistics", "label": "逐股核加权五交易日期望分可估计",
                 "status": "unavailable", "values": {"statistics_pool_size": len(pool),
                     "known_count": stats.get("known_count"), "known_signal_dates": stats.get("known_signal_dates"),
-                    "sample_support": stats.get("sample_support")},
-                "reason": "；".join(estimate.get("missing_reasons") or ["同状态事件样本或期望净收益不可估计"]),
+                    "effective_signal_date_count": stats.get("effective_signal_date_count"),
+                    "sample_support": stats.get("sample_support"),
+                    "date_stability_check": stats.get("date_stability_check")},
+                "reason": "；".join(estimate.get("missing_reasons") or ["局部事件样本或期望净收益不可估计"]),
             })
             selection["missing_conditions"].append("recommendation_statistics")
             selection.update(eligible=False, status="partial", outcome="evidence_unavailable")
@@ -469,16 +471,16 @@ def paixu_shangzhang_houxuan(
         selection["comparison_pool_size"] = len(eligible_pool)
         selection["equivalent_index_count"] = equivalent_counts[selection["expected_net_return"]]
         selection["absolute_performance"] = (
-            "同状态历史事件平均净收益为正" if selection["expected_net_return"] > 0
-            else "同状态历史事件平均净收益非正；排名靠前不等于存在正收益依据"
+            "未来五交易日净收益点估计为正，尚非收益保证" if selection["expected_net_return"] > 0
+            else "未来五交易日净收益点估计非正；排名靠前仍缺少正收益依据"
         )
         other = eligible_pool[index + 1] if index + 1 < len(eligible_pool) else None
         if other is not None:
             right = other["selection"]
             equal = selection["expected_net_return"] == right["expected_net_return"]
             reason = (
-                "期望净收益完全相同，明确并列；不以概率或涨幅隐藏次排序，代码仅用于稳定展示"
-                if equal else "按同状态已到期事件的未舍入期望净收益取舍；上涨概率、上涨幅度和非上涨亏损分别保留，不能只看概率×涨幅"
+                "预计净收益完全相同，明确并列；代码仅用于稳定展示，没有额外优劣次序"
+                if equal else "按近期相似价量事件核加权后的未舍入预计净收益取舍，已综合上涨机会、幅度、非上涨损失和成本"
             )
             differences = {
                 field + "_difference": selection[field] - right[field]
@@ -493,9 +495,9 @@ def paixu_shangzhang_houxuan(
                                                 "index_unit": "basis_points", **differences,
                                                 "current_state": item["probability_state"].get("state"),
                                                 "next_state": other["probability_state"].get("state"),
-                                                "raw_advantages": [field for field in ("up_probability", "conditional_upside_mean", "expected_net_return")
+                                                "raw_advantages": [field for field in ("expected_net_return",)
                                                     if selection[field] is not None and right[field] is not None and selection[field] > right[field]],
-                                                "raw_tradeoffs": [field for field in ("up_probability", "conditional_upside_mean", "expected_net_return")
+                                                "raw_tradeoffs": [field for field in ("expected_net_return",)
                                                     if selection[field] is not None and right[field] is not None and selection[field] < right[field]]}
     return ordered
 
@@ -751,7 +753,7 @@ def goujian_houxuan_zhaiyao(
     *,
     rank: int,
 ) -> dict[str, Any]:
-    """投影完整诊断、分列概率与幅度、期望净收益和显式条件。"""
+    """投影完整诊断、期望净收益和显式条件，内部概率与幅度保留供审计。"""
     selection = dict(item.get("selection") or {})
     conditions = selection.get("conditions") or []
     positive = [f"{condition['label']}：{condition['reason']}" for condition in conditions if condition.get("status") == "met"]

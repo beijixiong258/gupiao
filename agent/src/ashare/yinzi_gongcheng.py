@@ -214,16 +214,29 @@ def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
 def factor_definition(feature: str) -> dict[str, Any]:
     """指标名称和单位的唯一说明，数值仍完全由量化程序计算。"""
     conditional_metrics = {
-        "up_probability": ("五交易日价格上涨概率估计", "%", 100, "k/n", "同价量状态下价格上涨事件数除以参考收益已知事件数；不是实际成交盈利概率或已校准的预测"),
-        "conditional_upside_mean": ("上涨条件平均涨幅", "%", 100, "mean(r | r>0)", "仅在价格上涨的历史同状态事件中计算平均涨幅；没有上涨样本时留空"),
-        "conditional_downside_mean": ("非上涨条件平均亏损幅度", "%", 100, "mean(-r | r<=0)", "在非上涨的历史同状态事件中计算正向亏损幅度，平盘计零；空条件组留空"),
-        "expected_gross_return": ("五交易日期望毛收益估计", "%", 100, "mean(r)=p*G-(1-p)*L", "同状态已知事件的平均参考价格收益；空条件组不补造均值，直接计算总体均值"),
-        "expected_net_return": ("五交易日期望净收益估计", "%", 100, "mean((1+r)*(1-reference_cost)-1)", "同状态已知事件按既定研究成本逐事件计算的平均参考净收益；不是保证或实际账户收益"),
-        "composite_score_bps": ("综合评分", "基点", 1, "10000*expected_net_return", "期望净收益估计的基点值，可为负；仅按未舍入期望净收益排序，不是上涨概率"),
-        "recommendation_index": ("综合评分（兼容字段）", "基点", 1, "10000*expected_net_return", "与composite_score_bps相同，仅兼容既有字段；不再表示旧0—100量价强势分或上涨概率"),
-        "atr_distance": ("收盘距MA20的ATR距离", "倍", 1, "(close-MA20)/ATR14", "当前价格伸展状态，按≤0、(0,2]、>2分组；2ATR是固定分组边界，不是自动看跌或风险过滤"),
-        "amount_ratio_5_15": ("近5日与此前15日均额比", "倍", 1, "mean(amount[-5:])/mean(amount[-20:-5])", "比较互不重叠的两个真实成交额窗口，以1区分增加与未增加，不假定越大收益越好"),
+        "up_probability": ("内部上涨机会估计", "%", 100, "sum(w*I(r>0))/sum(w)", "最近120个交易日内成熟事件按逐股特征相似度及20交易日半衰期联合加权的正收益占比；仅供内部计算审计，不在选股报告列出"),
+        "conditional_upside_mean": ("内部上涨条件平均涨幅", "%", 100, "sum(w*r | r>0)/sum(w | r>0)", "与总体估计采用同一核与时间联合权重；没有上涨样本时留空，仅供内部计算审计"),
+        "conditional_downside_mean": ("内部非上涨条件平均亏损幅度", "%", 100, "sum(w*(-r) | r<=0)/sum(w | r<=0)", "与总体估计采用同一核与时间联合权重，平盘损失计零；空条件组留空，仅供内部计算审计"),
+        "expected_gross_return": ("五交易日期望毛收益估计", "%", 100, "sum(w*r)/sum(w)=p*G-(1-p)*L", "最近120个交易日内成熟事件按逐股核权重及20交易日半衰期联合加权的毛收益均值；内部计算审计"),
+        "expected_net_return": ("未来5个交易日预计净收益", "%", 100, "sum(w*((1+r)*(1-reference_cost)-1))/sum(w)", "最近120个交易日内成熟事件按逐股核权重及20交易日半衰期联合加权，综合上涨机会、幅度、非上涨损失及成本；期限为下一交易日开盘至第五交易日收盘，属于估计而非保证"),
+        "composite_score_bps": ("未来5个交易日期望分", "基点", 1, "10000*expected_net_return", "100分对应预计净收益1%，可为负；仅按未舍入预计净收益排序，不是0—100评分"),
+        "recommendation_index": ("未来5个交易日期望分（兼容字段）", "基点", 1, "10000*expected_net_return", "与composite_score_bps相同，保留既有接口名称"),
+        "atr_distance": ("收盘距MA20的ATR距离", "倍", 1, "(close-MA20)/ATR14", "价格伸展的连续核估计特征；≤0、(0,2]、>2只用于状态说明，不是自动看跌或风险过滤"),
+        "amount_ratio_5_15": ("近5日与此前15日均额比", "倍", 1, "mean(amount[-5:])/mean(amount[-20:-5])", "比较互不重叠的两个真实成交额窗口；核估计取其自然对数，不假定越大收益越好"),
     }
+    conditional_metrics["log_amount_ratio_5_15"] = ("近5日与此前15日均额比的自然对数", "无量纲", 1, "ln(amount_ratio_5_15)", "以自然对数表达连续成交额变化，供联合距离计算；均额比非正或缺失时不可用")
+    check_metrics = {
+        "estimated_net_return": "逐期检查当时的预计净收益", "realized_net_return": "逐期检查实际参考净收益",
+        "mean_estimated_net_return": "逐期预计净收益均值", "mean_realized_net_return": "逐期实际参考净收益均值",
+        "prediction_error": "当时估计减实际参考净收益", "mean_prediction_error": "逐期估计误差均值",
+        "mean_absolute_error": "逐期估计绝对误差均值",
+    }
+    if feature in check_metrics:
+        return {"label": check_metrics[feature], "unit": "百分点" if "error" in feature else "%", "display_scale": 100,
+                "formula": "当时仅用已到期样本估计，与该股随后五交易日实际参考净收益逐日期配对；各日期等权汇总",
+                "meaning": "最近60个交易日的固定口径逐期参考检查，追溯当前选中个股，保留当前存续资格池与事后选股偏差；不是策略或组合回测，也不是未来保证",
+                "window": "最近60交易日内已到期的五交易日参考事件", "minimum_observations": "每期局部估计至少10个不同已知结果日期及10个有效事件",
+                "missing_rule": "估计或对应实际参考结果缺失时，该期不进入成对误差汇总"}
     if feature.endswith("_difference") and feature.removesuffix("_difference") in conditional_metrics:
         original = factor_definition(feature.removesuffix("_difference"))
         return {**original, "label": original["label"] + "差值",
@@ -235,10 +248,10 @@ def factor_definition(feature: str) -> dict[str, Any]:
         return {
             "label": label, "unit": unit, "display_scale": scale, "meaning": meaning,
             "formula": formula,
-            "window": "信号日状态使用20条连续日线；历史价格参考为次日开盘至第五交易日收盘，只统计截至分析日已到期事件",
-            "minimum_observations": "20条权威日历对齐的有效价量，ATR及成交额分母为正；概率和收益排序至少10个不同已知信号日期，这是工程支持口径而非收益验证",
+            "window": "信号日状态使用20条连续日线；评分只用最近120交易日内已到期事件，联合权重w=2**(-信号年龄/20)*max(1-d_squared/9,0)**2，价格参考为次日开盘至第五交易日收盘",
+            "minimum_observations": "20条权威日历对齐的有效价量，ATR及成交额分母为正；概率和收益排序的局部样本至少10个不同已知信号日期及10个有效事件，这是工程支持口径而非收益验证",
             "missing_rule": "必要状态或样本不足时不发布排序估计，不补50%或旧强势分；条件空组均值留空，不妨碍已知总体均值计算；未知事件单列",
-            "source_basis": "同一请求、同一核验资格池的真实OHLC和成交额；固定24状态频数统计，不训练、不寻优、不持久化市场输入",
+            "source_basis": "同一请求、同一核验资格池的真实OHLC和成交额；逐股连续特征核加权统计，24状态仅作说明，不训练、不寻优、不持久化市场输入",
         }
     if feature == "tdx_control_raw" or feature == "tdx_control_range_position" or feature in {
         "tdx_control_change_1d", "tdx_control_change_5d", "tdx_control_change_20d",

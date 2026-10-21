@@ -1,4 +1,4 @@
-"""固定价量状态的历史条件频率与参考期望净收益；不训练、不取数、不落盘。
+"""逐股核加权的五交易日条件期望净收益；不训练、不取数、不落盘。
 
 历史事件仅描述次日开盘至第五个交易日收盘的价格参考结果，不能证明
 实际可按这些价格成交。经验上涨频率未经样本外校准，不是未来保证。
@@ -20,11 +20,19 @@ from src.ashare.chengben_huadian import (
     reference_roundtrip_cost_rate,
 )
 from src.ashare.yinzi_gongcheng import daily_atr
+from src.ashare.he_jiaquan_guji import (
+    prepare_kernel_pool, kernel_weights, estimate_kernel,
+    MAX_REMOVED_SIGNAL_DATES, MAX_DATE_REMOVAL_RELATIVE_CHANGE,
+)
 
 
 MIN_KNOWN_SIGNAL_DATES = 10
 SIGNAL_STRIDE = 5
 STATE_WINDOW = 20
+SCORE_LOOKBACK_SESSIONS = 120
+RECENCY_HALF_LIFE_SESSIONS = 20
+VALIDATION_LOOKBACK_SESSIONS = 60
+_KERNEL_COLUMNS = ("ret_1", "ret_5", "atr_distance", "log_amount_ratio_5_15")
 _BAR_COLUMNS = ("open", "high", "low", "close", "volume", "amount_yuan")
 _RAW_COLUMNS = ("ret_1", "ret_5", "ma20", "atr14", "atr_distance", "amount_ratio_5_15")
 _DIRECTIONS = ("up_up", "up_nonup", "nonup_up", "nonup_nonup")
@@ -151,7 +159,8 @@ def _execution_flags(row: np.ndarray, previous_close: float, stage: str) -> list
     return reasons
 
 
-def _event(code: str, key: str, bars: np.ndarray, position: int, dates: pd.DatetimeIndex, cost: float) -> dict[str, Any]:
+def _event(code: str, key: str, bars: np.ndarray, position: int, dates: pd.DatetimeIndex, cost: float,
+    raw_values: dict[str, Any] | None = None) -> dict[str, Any]:
     entry, exit_pos = position + 1, position + 5
     buy, sell = bars[entry], bars[exit_pos]
     flags = _execution_flags(buy, bars[position, 3], "entry") + _execution_flags(sell, bars[exit_pos - 1, 3], "exit")
@@ -162,7 +171,9 @@ def _event(code: str, key: str, bars: np.ndarray, position: int, dates: pd.Datet
     if known and not (math.isfinite(gross) and math.isfinite(net)):
         known, gross, net = False, None, None
         missing = ["reference_return_nonfinite_after_price_ratio_or_cost"]
-    return {"ts_code": code, "state_key": key, "signal_date": dates[position].strftime("%Y-%m-%d"),
+    return {"ts_code": code, "state_key": key, "kernel_features": _kernel_vector(raw_values) if raw_values else None,
+        "signal_date": dates[position].strftime("%Y-%m-%d"),
+        "signal_session_index": position, "exit_session_index": exit_pos,
         "entry_date": dates[entry].strftime("%Y-%m-%d"), "exit_date": dates[exit_pos].strftime("%Y-%m-%d"),
         "status": "reference_known" if known else "reference_unknown", "price_up": bool(sell[3] > buy[0]) if known else None,
         "gross_reference_return": gross, "net_reference_return": net,
@@ -173,27 +184,49 @@ def _event(code: str, key: str, bars: np.ndarray, position: int, dates: pd.Datet
         "missing_reasons": missing}
 
 
-def _stable_mean(values: list[float]) -> float | None:
+def _stable_mean(values: list[float], weights: list[float] | None = None) -> float | None:
     """先按样本绝对最大值缩放，避免有限输入累计时溢出。"""
+    if weights is not None and (len(weights) != len(values) or any(not math.isfinite(w) or w <= 0 for w in weights)):
+        raise ValueError("样本权重必须与观测一一对应且为有限正数")
     if not values:
         return None
     scale = max(abs(value) for value in values)
     if not scale:
         return 0.0
-    normalized = math.fsum(value / scale for value in values) / len(values)
+    if weights is None:
+        normalized = math.fsum(value / scale for value in values) / len(values)
+    else:
+        normalized = math.fsum(value / scale * w for value, w in zip(values, weights)) / math.fsum(weights)
     return scale * min(1.0, max(-1.0, normalized))
+
+
+def _recent_events(events: list[dict[str, Any]], as_of_position: int) -> list[dict[str, Any]]:
+    """最近120个交易日的信号且已到期；年龄由权威交易日序号计算。"""
+    return [{**event, "signal_age_sessions": as_of_position - event["signal_session_index"],
+             "recency_weight": 2.0 ** (-(as_of_position - event["signal_session_index"]) / RECENCY_HALF_LIFE_SESSIONS)}
+            for event in events
+            if 0 <= as_of_position - event["signal_session_index"] < SCORE_LOOKBACK_SESSIONS
+            and event["exit_session_index"] <= as_of_position]
 
 
 def _observed(events: list[dict[str, Any]]) -> dict[str, Any]:
     known = [event for event in events if event["status"] == "reference_known"]
-    gains = [event["gross_reference_return"] for event in known if event["price_up"]]
-    losses = [-event["gross_reference_return"] for event in known if not event["price_up"]]
+    gains = [event for event in known if event["price_up"]]
+    losses = [event for event in known if not event["price_up"]]
     n, m, k = len(known), len(events) - len(known), len(gains)
-    gross = _stable_mean([event["gross_reference_return"] for event in known])
-    net = _stable_mean([event["net_reference_return"] for event in known])
-    p = k / n if n else None
-    gain = _stable_mean(gains)
-    loss = _stable_mean(losses)
+    weights = [event["recency_weight"] for event in known]
+    known_weight = math.fsum(weights)
+    up_weight = math.fsum(event["recency_weight"] for event in gains)
+    unknown_weight = math.fsum(event["recency_weight"] for event in events if event["status"] != "reference_known")
+    total_weight = known_weight + unknown_weight
+    date_weights: dict[str, float] = {}
+    for event in known:
+        date_weights[event["signal_date"]] = date_weights.get(event["signal_date"], 0.0) + event["recency_weight"]
+    gross = _stable_mean([event["gross_reference_return"] for event in known], weights)
+    net = _stable_mean([event["net_reference_return"] for event in known], weights)
+    p = up_weight / known_weight if known_weight else None
+    gain = _stable_mean([event["gross_reference_return"] for event in gains], [event["recency_weight"] for event in gains])
+    loss = _stable_mean([-event["gross_reference_return"] for event in losses], [event["recency_weight"] for event in losses])
     decomposed = p * (gain if gain is not None else 0) - (1 - p) * (loss if loss is not None else 0) if n else None
     score = 10000 * net if net is not None else None
     score_finite = score is None or math.isfinite(score)
@@ -203,13 +236,16 @@ def _observed(events: list[dict[str, Any]]) -> dict[str, Any]:
         "decomposed_expected_gross_return": decomposed, "expected_net_return": net,
         "composite_score_bps": score if score_finite else None,
         "numeric_range_reasons": [] if score_finite else ["composite_score_bps_exceeds_finite_float_range"],
-        "probability_missing_bounds": [k / (n + m), (k + m) / (n + m)] if n + m else None,
+        "known_weight_sum": known_weight, "unknown_weight_sum": unknown_weight,
+        "effective_event_count": known_weight ** 2 / math.fsum(w * w for w in weights) if weights else None,
+        "effective_signal_date_count": known_weight ** 2 / math.fsum(w * w for w in date_weights.values()) if date_weights else None,
+        "probability_missing_bounds": [up_weight / total_weight, (up_weight + unknown_weight) / total_weight] if total_weight else None,
         "return_coverage": n / (n + m) if n + m else None}
 
 
 def _uncertainty(events: list[dict[str, Any]], signal_dates: list[str], supported: bool) -> dict[str, Any]:
     """按完整信号日期槽聚集重抽样；区间只描述已观测样本的不确定性。"""
-    result: dict[str, Any] = {"method": "circular_signal_date_block_bootstrap", "block_signal_date_slots": 4,
+    result: dict[str, Any] = {"method": "kernel_time_weighted_circular_signal_date_block_bootstrap", "block_signal_date_slots": 4,
         "repetitions": 2000, "seed": 20261017, "valid_repetitions": 0,
         "up_probability_95_interval": None, "expected_net_return_95_interval": None,
         "status": "unavailable", "missing_reasons": [], "future_probability_calibrated": False,
@@ -223,9 +259,10 @@ def _uncertainty(events: list[dict[str, Any]], signal_dates: list[str], supporte
     for event in events:
         if event["status"] == "reference_known":
             row = aggregates[event["signal_date"]]
-            row[0] += 1
-            row[1] += int(event["price_up"])
-            row[2] += event["net_reference_return"] / net_scale
+            weight = event["recency_weight"]
+            row[0] += weight
+            row[1] += weight * int(event["price_up"])
+            row[2] += weight * event["net_reference_return"] / net_scale
     arrays = np.array(list(aggregates.values()), dtype=float)
     rng, count = np.random.default_rng(20261017), len(arrays)
     starts = rng.integers(0, count, size=(2000, math.ceil(count / 4)))
@@ -235,8 +272,8 @@ def _uncertainty(events: list[dict[str, Any]], signal_dates: list[str], supporte
     frequencies = sums[:, 1] / sums[:, 0]
     returns = np.clip(sums[:, 2] / sums[:, 0], -1, 1) * net_scale
     result.update(status="exploratory", valid_repetitions=len(sums))
-    known_count, up_count = arrays[:, 0].sum(), arrays[:, 1].sum()
-    if up_count in (0, known_count):
+    known_labels = {event["price_up"] for event in events if event["status"] == "reference_known"}
+    if len(known_labels) == 1:
         result["missing_reasons"].append("probability_interval_degenerate_boundary_all_known_labels_equal")
     elif np.ptp(frequencies) == 0:
         result["missing_reasons"].append("probability_interval_degenerate_empirical_resamples")
@@ -247,6 +284,62 @@ def _uncertainty(events: list[dict[str, Any]], signal_dates: list[str], supporte
     else:
         result["expected_net_return_95_interval"] = np.quantile(returns, [.025, .975]).tolist()
     return result
+
+
+def _kernel_vector(raw: dict[str, Any]) -> list[float]:
+    ratio = float(raw["amount_ratio_5_15"])
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("核估计成交额比必须有限且为正")
+    vector = [float(raw["ret_1"]), float(raw["ret_5"]), float(raw["atr_distance"]), math.log(ratio)]
+    if not all(math.isfinite(value) for value in vector):
+        raise ValueError("核估计连续特征必须有限")
+    return vector
+
+
+def _walk_forward(events: list[dict[str, Any]], positions: list[int], dates: pd.DatetimeIndex,
+    codes: list[str]) -> dict[str, Any]:
+    """最终候选逐股检查；每个起点重新确定当时可知样本、尺度和权重。"""
+    checks = {code: [] for code in codes}
+    targets = {(event["ts_code"], event["signal_session_index"]): event
+               for event in events if event["ts_code"] in checks}
+    for position in positions:
+        pool = prepare_kernel_pool(events, position, SCORE_LOOKBACK_SESSIONS, RECENCY_HALF_LIFE_SESSIONS)
+        available_codes = [code for code in codes if (code, position) in targets]
+        estimates = estimate_kernel(pool, [targets[(code, position)]["kernel_features"] for code in available_codes],
+                                    MIN_KNOWN_SIGNAL_DATES)
+        estimate_by_code = dict(zip(available_codes, estimates))
+        for code in codes:
+            target = targets.get((code, position))
+            stats = estimate_by_code.get(code) or {}
+            predicted = stats.get("expected_net_return") if stats.get("status") == "success" else None
+            realized = target["net_reference_return"] if target and target["status"] == "reference_known" else None
+            checks[code].append({
+                "signal_date": dates[position].strftime("%Y-%m-%d"),
+                "status": "available" if predicted is not None and realized is not None else "unavailable",
+                "training_known_signal_dates": stats.get("known_signal_dates"),
+                "training_effective_signal_date_count": stats.get("effective_signal_date_count"),
+                "training_latest_exit_date": pool["latest_exit_date"],
+                "estimated_net_return": predicted, "realized_net_return": realized,
+                "prediction_error": predicted - realized if predicted is not None and realized is not None else None,
+                "evaluation_known_events": int(realized is not None),
+                "evaluation_unknown_events": int(target is not None and realized is None),
+                "missing_reasons": ([] if predicted is not None else ["training_sample_unsupported", *stats.get("missing_reasons", [])])
+                    + ([] if realized is not None else ["evaluation_reference_unavailable"]),
+            })
+    results = {}
+    for code, rows in checks.items():
+        valid = [row for row in rows if row["status"] == "available"]
+        results[code] = {
+            "status": "exploratory" if valid else "unavailable", "validation_lookback_sessions": VALIDATION_LOOKBACK_SESSIONS,
+            "checked_signal_dates": len(rows), "available_signal_dates": len(valid),
+            "mean_estimated_net_return": _stable_mean([row["estimated_net_return"] for row in valid]),
+            "mean_realized_net_return": _stable_mean([row["realized_net_return"] for row in valid]),
+            "mean_prediction_error": _stable_mean([row["prediction_error"] for row in valid]),
+            "mean_absolute_error": _stable_mean([abs(row["prediction_error"]) for row in valid]),
+            "date_checks": rows, "parameters_tuned": False, "future_return_validated": False,
+            "interpretation": "按当前入选股票追溯，用当时成熟样本估计该股随后五日净收益，各日期等权汇总。包含事后选股、当前存续及资格池偏差；不是历史选股策略或组合回测，不证明未来有效。",
+        }
+    return results
 
 
 def _statistics(events: list[dict[str, Any]], signal_dates: list[str]) -> dict[str, Any]:
@@ -287,12 +380,7 @@ def _statistics(events: list[dict[str, Any]], signal_dates: list[str]) -> dict[s
 
 def goujian_tongzhuangtai_tongji(histories: dict[str, pd.DataFrame], trading_calendar: Iterable,
     as_of: Any) -> dict[str, Any]:
-    """用本次已核验资格池的历史统计24个固定状态，并评价当前各股。
-
-    信号从第20个权威交易日开始，每5个交易日一次，仅统计第五日已在
-    as_of之前或当日完成的事件。当前资格池带来存续及末端资格偏差，
-    本函数不声称重建历史全市场。历史输入和统计结果均只在请求内存中。
-    """
+    """兼容原入口名；24状态仅作说明，排序使用逐股连续特征核估计。"""
     if not isinstance(histories, dict):
         raise TypeError("histories必须是证券代码到单股DataFrame的映射")
     dates = _calendar(trading_calendar, as_of)
@@ -302,66 +390,118 @@ def goujian_tongzhuangtai_tongji(histories: dict[str, pd.DataFrame], trading_cal
     cost = reference_roundtrip_cost_rate()
     scheduled = list(range(STATE_WINDOW - 1, len(dates), SIGNAL_STRIDE))
     mature = [position for position in scheduled if position + 5 < len(dates)]
-    signal_dates = [dates[position].strftime("%Y-%m-%d") for position in mature]
-    states = {f"{direction}|{position}|{amount}": [] for direction in _DIRECTIONS for position in _POSITIONS for amount in _AMOUNT_STATES}
-    current: dict[str, dict[str, Any]] = {}
-    invalid_signal_count = 0
-    for code, history in histories.items():
-        if not isinstance(code, str) or not code.strip():
-            raise ValueError("histories证券代码不能为空")
-        frame = _history(history, dates, cutoff)
+    recent_mature = [position for position in mature if len(dates) - 1 - position < SCORE_LOOKBACK_SESSIONS]
+    validation_positions = [position for position in mature if len(dates) - 1 - position < VALIDATION_LOOKBACK_SESSIONS]
+    current, events = {}, []
+    invalid_signal_count = older_invalid_signal_count = 0
+    if any(not isinstance(code, str) or not code.strip() for code in histories):
+        raise ValueError("histories证券代码不能为空")
+    for code in sorted(histories):
+        frame = _history(histories[code], dates, cutoff)
         values = _state_series(frame)
         current[code] = _state(values.iloc[-1] if len(values) else None, dates[-1] if len(dates) else None, True)
         bars = frame.to_numpy(dtype=float)
         for position in mature:
             state = _state(values.iloc[position], dates[position], True)
             if state["status"] != "success":
-                invalid_signal_count += 1
+                if len(dates) - 1 - position < SCORE_LOOKBACK_SESSIONS:
+                    invalid_signal_count += 1
+                else:
+                    older_invalid_signal_count += 1
                 continue
-            key = state["state_key"]
-            states[key].append(_event(code, key, bars, position, dates, cost))
-    statistics = {key: {"state_id": key, **_statistics(events, signal_dates)} for key, events in states.items()}
-    estimates: dict[str, dict[str, Any]] = {}
+            events.append(_event(code, state["state_key"], bars, position, dates, cost, state["raw_values"]))
+    pool = prepare_kernel_pool(events, len(dates) - 1, SCORE_LOOKBACK_SESSIONS, RECENCY_HALF_LIFE_SESSIONS)
+    valid_codes = [code for code, state in current.items() if state["status"] == "success"]
+    statistics = estimate_kernel(pool, [_kernel_vector(current[code]["raw_values"]) for code in valid_codes], MIN_KNOWN_SIGNAL_DATES)
+    by_code = dict(zip(valid_codes, statistics))
+    estimates = {}
     for code, state in current.items():
-        stats = statistics.get(state["state_key"])
-        reasons = list(state["missing_reasons"])
-        if stats is not None:
-            reasons += stats["missing_reasons"]
+        stats = by_code.get(code)
+        reasons = list(state["missing_reasons"]) + (stats["missing_reasons"] if stats else [])
         success = state["status"] == "success" and stats is not None and stats["status"] == "success"
-        brief_stats = {key: value for key, value in stats.items() if key not in ("date_summaries", "chronological_subperiods")} if stats else None
-        estimates[code] = {**state, "ts_code": code, "status": "success" if success else "unavailable", "statistics": brief_stats,
+        estimates[code] = {
+            **state, "ts_code": code, "status": "success" if success else "unavailable", "statistics": stats,
             "recommendation_index": stats["composite_score_bps"] if success else None,
-            "up_probability": stats["up_probability"] if success else None,
-            "conditional_upside_mean": stats["conditional_upside_mean"] if success else None,
-            "conditional_downside_mean": stats["conditional_downside_mean"] if success else None,
-            "expected_net_return": stats["expected_net_return"] if success else None,
-            "missing_reasons": reasons}
+            **{key: stats[key] if success else None for key in
+               ("up_probability", "conditional_upside_mean", "conditional_downside_mean", "expected_net_return")},
+            "missing_reasons": reasons,
+        }
     available = sum(item["status"] == "success" for item in estimates.values())
-    all_events = [event for events in states.values() for event in events]
-    known = sum(event["status"] == "reference_known" for event in all_events)
-    return {"status": "ok" if available == len(estimates) and available else "partial" if available else "unavailable",
-        "as_of": cutoff.strftime("%Y-%m-%d"), "candidate_estimates": estimates, "state_statistics": statistics,
-        "coverage": {"input_stocks": len(histories), "current_state_valid": sum(item["state_key"] is not None for item in estimates.values()),
+    score_counts = Counter(item["expected_net_return"] for item in estimates.values() if item["status"] == "success")
+    known = int(pool["known"].sum())
+    return {
+        "status": "ok" if available == len(estimates) and available else "partial" if available else "unavailable",
+        "as_of": cutoff.strftime("%Y-%m-%d"), "candidate_estimates": estimates,
+        # 旧字段保留空映射，避免调用者把组均值错用为逐股估计。
+        "state_statistics": {},
+        "coverage": {
+            "input_stocks": len(histories), "current_state_valid": len(valid_codes),
             "estimate_available": available, "estimate_unavailable": len(estimates) - available,
-            "scheduled_signal_dates": len(scheduled), "mature_signal_dates": len(mature),
-            "immature_signal_dates": len(scheduled) - len(mature), "historical_state_missing_events": invalid_signal_count,
-            "historical_events": len(all_events), "reference_known_events": known,
-            "reference_unknown_events": len(all_events) - known,
-            "reference_coverage": known / len(all_events) if all_events else None,
+            "scheduled_signal_dates": len(scheduled), "mature_signal_dates": len(recent_mature),
+            "older_mature_signal_dates_excluded": len(mature) - len(recent_mature),
+            "older_state_missing_events": older_invalid_signal_count, "immature_signal_dates": len(scheduled) - len(mature),
+            "historical_state_missing_events": invalid_signal_count, "historical_events": len(pool["events"]),
+            "reference_known_events": known, "reference_unknown_events": len(pool["events"]) - known,
+            "reference_coverage": known / len(pool["events"]) if pool["events"] else None,
             "calendar_start": dates[0].strftime("%Y-%m-%d") if len(dates) else None,
-            "calendar_end": dates[-1].strftime("%Y-%m-%d") if len(dates) else None},
+            "calendar_end": dates[-1].strftime("%Y-%m-%d") if len(dates) else None,
+            "distinct_expected_returns": len(score_counts), "largest_exact_tie_group": max(score_counts.values(), default=0),
+        },
         "cost_assumption": {"source": DEFAULT_COST_SOURCE, "roundtrip_reference_cost_rate": cost,
             "notional_yuan": DEFAULT_NOTIONAL_YUAN, "net_formula": "(1+gross_reference_return)*(1-cost_rate)-1",
             "applied_once_per_known_reference_event": True, "actual_fill_or_broker_cost_verified": False},
-        "methodology": {"state_count": 24, "state_window": STATE_WINDOW, "signal_stride": SIGNAL_STRIDE,
+        "methodology": {
+            "method": "stock_specific_recent_kernel_expected_net_return", "state_count": 24,
+            "state_role": "仅保留分组说明，不共享分组分数", "state_window": STATE_WINDOW, "signal_stride": SIGNAL_STRIDE,
+            "score_lookback_sessions": SCORE_LOOKBACK_SESSIONS, "recency_half_life_sessions": RECENCY_HALF_LIFE_SESSIONS,
+            "recency_formula": "w=2**(-signal_age_sessions/20)*max(1-d_squared/9,0)**2; age<120; exit<=as_of",
+            "kernel_features": list(_KERNEL_COLUMNS), "kernel_parameters": pool["geometry"],
+            "age_basis": "权威交易日历中分析日到信号日的交易间隔，分析日年龄为0",
+            "score_window_start": dates[max(0, len(dates) - SCORE_LOOKBACK_SESSIONS)].strftime("%Y-%m-%d") if len(dates) else None,
+            "score_window_end": cutoff.strftime("%Y-%m-%d"),
+            "parameter_status": "固定核半径3与120/20口径；尺度只由当时可知特征计算，不拟合收益、不寻优，非最优参数声明",
+            "effective_sample_meaning": "有效事件量与日期量=(sum(w))^2/sum(w^2)，日期量先按日期汇总权重；只描述集中程度，不认证独立性。有效日期量不足10不发布估计",
+            "sample_stability_rule": {"minimum_effective_signal_dates": MIN_KNOWN_SIGNAL_DATES,
+                "maximum_removed_signal_dates": MAX_REMOVED_SIGNAL_DATES,
+                "maximum_date_removal_relative_change": MAX_DATE_REMOVAL_RELATIVE_CHANGE,
+                "interpretation": "固定其余核与时间权重，删除任意1至2个完整信号日期后，均值变化不得超过原均值绝对值的50%；未通过不公布排序估计。固定工程敏感性门槛，不寻优、不作为未来有效性证明。"},
+            "public_display": "future_five_session_expectation_score_and_net_return_only",
             "horizon": "next_session_open_to_fifth_session_close", "up_label": "exit_close>entry_open_before_cost",
             "gain_loss_basis": "gross_reference_return", "ranking": "expected_net_return_descending_exact_ties",
             "composite_score": "10000*expected_net_return", "score_unit": "basis_points",
             "probability_missing_bounds_meaning": "observed_mature_event_unknown_label_bounds_not_future_confidence_interval",
             "historical_pool": "current_request_currently_eligible_stocks_not_reconstructed_historical_full_market",
-            "historical_state_sample": "valid_price_amount_state_references_not_verified_executable_trades",
+            "historical_state_sample": "valid_price_amount_references_not_verified_executable_trades",
             "historical_identity_or_limit_rules_verified": False, "future_probability_calibrated": False,
-            "training": False, "parameter_search": False, "market_data_persisted": False}}
+            "training": False, "parameter_search": False, "market_data_persisted": False,
+        },
+        "_kernel_context": {"events": events, "dates": dates, "pool": pool, "validation_positions": validation_positions},
+    }
 
 
-__all__ = ["MIN_KNOWN_SIGNAL_DATES", "STATE_WINDOW", "jisuan_dangqian_zhuangtai", "goujian_tongzhuangtai_tongji"]
+def buquan_he_guji_jianyan(result: dict[str, Any], codes: list[str]) -> None:
+    """只补充最终候选的检验，点估计、资格和排序保持原值。"""
+    context = result.get("_kernel_context")
+    if not context:
+        return
+    estimates = result.get("candidate_estimates") or {}
+    codes = sorted(set(code for code in codes if code in estimates and estimates[code]["status"] == "success"))
+    if not codes:
+        return
+    pool = context["pool"]
+    weights = kernel_weights(pool, [_kernel_vector(estimates[code]["raw_values"]) for code in codes])
+    checks = _walk_forward(context["events"], context["validation_positions"], context["dates"], codes)
+    for code, row in zip(codes, weights):
+        selected = [{**event, "recency_weight": float(weight)} for event, weight in zip(pool["events"], row) if weight > 0]
+        rich = _statistics(selected, pool["date_labels"])
+        stats = estimates[code]["statistics"]
+        if not math.isclose(stats["expected_net_return"], rich["expected_net_return"], rel_tol=1e-12, abs_tol=1e-14):
+            raise ValueError("核估计逐股明细与排序原值不一致")
+        for key in ("uncertainty", "date_summaries", "event_counts", "execution_limitation_counts",
+                    "unknown_reason_counts", "chronological_subperiods"):
+            stats[key] = rich[key]
+        stats["walk_forward_check"] = checks[code]
+
+
+__all__ = ["MIN_KNOWN_SIGNAL_DATES", "STATE_WINDOW", "jisuan_dangqian_zhuangtai",
+           "goujian_tongzhuangtai_tongji", "buquan_he_guji_jianyan"]
