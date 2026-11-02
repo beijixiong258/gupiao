@@ -20,6 +20,7 @@ class HuimaqiangZhuangtai(str, Enum):
     SHOUPAN_QUEREN = "close_confirmed"
     SHIXIAO = "invalidated"
     GUOQI = "expired"
+    XINXI_BUZU = "information_partial"
 
 
 _STATE_LABELS = {
@@ -31,6 +32,7 @@ _STATE_LABELS = {
     HuimaqiangZhuangtai.SHOUPAN_QUEREN: "收盘正式确认",
     HuimaqiangZhuangtai.SHIXIAO: "形态失效",
     HuimaqiangZhuangtai.GUOQI: "超过观察期",
+    HuimaqiangZhuangtai.XINXI_BUZU: "观察期证据不足",
 }
 
 
@@ -52,7 +54,7 @@ class HuimaqiangJieguo:
         shrink_window = int(settings.get("shrink_window_sessions", self.actuals.get("shrink_window_sessions", 7)))
         breakout_deadline = int(settings.get("breakout_deadline_sessions", self.actuals.get("breakout_deadline_sessions", 14)))
         return {
-            "status": "ok" if self.eligible else "not_applicable",
+            "status": "partial" if self.actuals.get("missing_observation_count") else "ok" if self.eligible else "not_applicable",
             "state": self.state.value,
             "state_label": _STATE_LABELS[self.state],
             "eligible": self.eligible,
@@ -127,8 +129,18 @@ def _zhengli_lishi(history: pd.DataFrame) -> pd.DataFrame:
     for column in ("open", "high", "low", "close", "pre_close", "volume"):
         if column in data.columns:
             data[column] = pd.to_numeric(data[column], errors="coerce")
-    data = data.dropna(subset=["trade_date", "open", "high", "low", "close", "volume"])
-    data = data.sort_values("trade_date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
+    # 输入已按权威交易日历补齐；价量缺失行必须占据原交易日，不能压缩D7/D14。
+    data = data.dropna(subset=["trade_date"]).sort_values("trade_date")
+    columns = ["open", "high", "low", "close", "volume"]
+    duplicate = data["trade_date"].duplicated(keep=False)
+    data.loc[duplicate, columns] = np.nan
+    data = data.drop_duplicates("trade_date").reset_index(drop=True)
+    data[columns] = data[columns].replace([np.inf, -np.inf], np.nan)
+    valid_price = data[["open", "high", "low", "close"]].gt(0).all(axis=1)
+    valid_price &= data["low"].le(data[["open", "close"]].min(axis=1))
+    valid_price &= data[["open", "close"]].max(axis=1).le(data["high"])
+    data.loc[~valid_price, ["open", "high", "low", "close"]] = np.nan
+    data.loc[data["volume"].lt(0), "volume"] = np.nan
     if "pre_close" not in data.columns:
         data["pre_close"] = data["close"].shift(1)
     else:
@@ -154,6 +166,7 @@ def _fenxi_jizhunri(
     breakout_volume_ratio_min = float(config.get("breakout_volume_median_ratio_min", 1.2))
     observations = data.iloc[baseline_index + 1 : baseline_index + 1 + breakout_deadline].copy()
     observed_sessions = int(len(observations))
+    elapsed_sessions = len(data) - baseline_index - 1
     failure_reasons: list[str] = []
     evidence = [
         f"基准涨停阳线为 {baseline_date}，开盘 {baseline_open:.2f}、最高 {baseline_high:.2f}、成交量 {baseline_volume:.0f} 股"
@@ -175,6 +188,7 @@ def _fenxi_jizhunri(
         "baseline_close": round(float(baseline["close"]), 3),
         "baseline_volume": round(baseline_volume, 2),
         "observed_sessions_after_baseline": observed_sessions,
+        "elapsed_sessions_after_baseline": elapsed_sessions,
         "shrink_volume_ratio_threshold": shrink_ratio_max,
         "shrink_window_sessions": shrink_window,
         "breakout_volume_median_ratio_threshold": breakout_volume_ratio_min,
@@ -202,6 +216,20 @@ def _fenxi_jizhunri(
             conditions=conditions,
             evidence=tuple(evidence),
             failure_reasons=tuple(failure_reasons),
+        )
+    missing = observations[["open", "high", "low", "close", "volume"]].isna().any(axis=1)
+    if missing.any():
+        missing_dates = observations.loc[missing, "trade_date"].dt.strftime("%Y-%m-%d").tolist()
+        actuals.update(missing_observation_count=len(missing_dates), missing_observation_dates=missing_dates)
+        expired = elapsed_sessions >= breakout_deadline
+        reason = "观察窗口价量缺失，不能确认缩量、调整有效性及突破；缺失日仍计入交易日期限"
+        if expired:
+            reason += f"，D{breakout_deadline}观察期已结束"
+        return HuimaqiangJieguo(
+            state=HuimaqiangZhuangtai.GUOQI if expired else HuimaqiangZhuangtai.XINXI_BUZU,
+            eligible=True, baseline_date=baseline_date, shrink_date=None, breakout_date=None,
+            risk_reference_price=None, actuals=actuals, conditions=conditions,
+            evidence=tuple(evidence), failure_reasons=(reason,),
         )
     conditions["all_adjustment_closes_above_baseline_open"] = True
 
@@ -407,6 +435,8 @@ def fenxi_zhangting_huimaqiang(
     tolerance = float(config.get("limit_up_tolerance_yuan", 0.005))
     baselines: list[int] = []
     for index, row in data.iterrows():
+        if row[["open", "high", "low", "close", "volume"]].isna().any() or row["volume"] <= 0:
+            continue
         previous_close = _number(row.get("pre_close"))
         if previous_close is None or previous_close <= 0:
             continue
@@ -414,6 +444,7 @@ def fenxi_zhangting_huimaqiang(
         if float(row["close"]) >= legal_limit - tolerance and float(row["close"]) > float(row["open"]):
             baselines.append(int(index))
     if not baselines:
+        missing_count = int(data[["open", "high", "low", "close", "volume"]].isna().any(axis=1).sum())
         return HuimaqiangJieguo(
             state=HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=True,
@@ -422,14 +453,15 @@ def fenxi_zhangting_huimaqiang(
             shrink_date=None,
             breakout_date=None,
             risk_reference_price=None,
-            actuals={"history_rows": int(len(data)), "limit_up_tolerance_yuan": tolerance},
+            actuals={"history_rows": int(len(data)), "limit_up_tolerance_yuan": tolerance,
+                     "missing_observation_count": missing_count},
             conditions={
                 "normal_10pct_main_board": True,
-                "baseline_closed_at_limit_up": False,
+                "baseline_closed_at_limit_up": None if missing_count else False,
                 "baseline_bullish_candle": None,
             },
             evidence=(),
-            failure_reasons=("观察区间内没有合法涨停阳线基准日",),
+            failure_reasons=("观察区间存在缺失，未能确认合法涨停阳线基准日" if missing_count else "观察区间内没有合法涨停阳线基准日",),
         ).to_dict(config=config)
     results = [
         _fenxi_jizhunri(
@@ -449,6 +481,7 @@ def fenxi_zhangting_huimaqiang(
         HuimaqiangZhuangtai.SHIXIAO: 2,
         HuimaqiangZhuangtai.GUOQI: 1,
         HuimaqiangZhuangtai.WU_XINGTAI: 0,
+        HuimaqiangZhuangtai.XINXI_BUZU: 3,
     }
     active = next(
         (

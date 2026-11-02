@@ -18,7 +18,7 @@ from src.ashare.shuju_yuan import (
     huoqu_gupiao_jichu_ziliao,
     huoqu_zhangdieting_guize,
 )
-from src.ashare.shichang_shuju import akshare_zhilian
+from src.ashare.shichang_shuju import akshare_zhilian, heyan_fuquan_yinzi
 from src.ashare.wangluo_kehu import GongkaiShujuHTTPKehu, WangluoQingqiuYichang
 from src.ashare.shuju_zhiliang import VERIFIED_DAILY_VALUATION_SOURCES
 from src.ashare.yinzi_gongcheng import (
@@ -27,6 +27,7 @@ from src.ashare.yinzi_gongcheng import (
     continuous_ewm,
     daily_atr,
     factor_definition,
+    interval_return,
 )
 
 FEATURE_COLUMNS = [
@@ -289,11 +290,7 @@ def _apply_qfq(pro: Any, code: str, start_date: str, end_date: str, data: pd.Dat
         factors = pro.adj_factor(ts_code=code, start_date=start_date, end_date=end_date)
         if factors is None or factors.empty:
             return data, "raw_unadjusted", "Tushare adj_factor 返回空值，价格未复权"
-        adj = factors[["trade_date", "adj_factor"]].copy()
-        adj["trade_date"] = pd.to_datetime(adj["trade_date"], errors="coerce")
-        adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
-        merged = data.merge(adj, on="trade_date", how="left")
-        merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
+        merged = heyan_fuquan_yinzi(data, factors)
         latest_factor = float(merged["adj_factor"].iloc[-1])
         if not math.isfinite(latest_factor) or latest_factor <= 0:
             return data, "raw_unadjusted", "Tushare adj_factor 无效，价格未复权"
@@ -403,7 +400,7 @@ def huoqu_rili_xingqing(
 
 
 def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
-    """计算确定性日线指标，缺失不填充，不跨缺失行拼接窗口。"""
+    """消费保留交易日位置的日线；区间收益核验两端，均线等按完整窗口计算。"""
     if history is None or history.empty:
         raise ValueError("日线行情为空")
     if "trade_date" not in history.columns:
@@ -424,9 +421,7 @@ def jisuan_tezheng_biao(history: pd.DataFrame) -> pd.DataFrame:
     previous_close = close.shift(1)
 
     for period in [1, 3, 5, 10, 20]:
-        data[f"ret_{period}"] = close.pct_change(period, fill_method=None).where(
-            close.rolling(period + 1, min_periods=period + 1).count().eq(period + 1)
-        )
+        data[f"ret_{period}"] = interval_return(close, period)
     for period in [5, 10, 20, 60]:
         average = close.rolling(period, min_periods=period).mean()
         data[f"ma_{period}"] = average

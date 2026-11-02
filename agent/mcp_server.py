@@ -24,7 +24,10 @@ RequestedCount = Annotated[
 MCP_INSTRUCTIONS = """
 Only provide personal-use research on mainland China A-share stocks. The server has exactly
 one business tool for unified stock analysis and diagnosis. Natural-language assistants must hide tool
-parameters and analysis_id from end users. When the user names a scope, pass the ordinary phrase
+parameters and analysis_id from end users. Default selection uses daily_leaderboards: same completed-day
+gain top 100 union turnover top 100, deduplicated, with historical statistics restricted to that pool.
+Keep this fixed for the five-day test; do not backfill off-list stocks or claim a full-market optimum.
+When the user names an industry/theme scope, pass the ordinary phrase
 unchanged as named_scope; the entire Shanghai/Shenzhen main-board market uses main_board instead,
 with its original wording in mingcheng. The analysis tool dynamically downloads industry and concept catalogs
 and may return one plain-language clarification. Never guess an industry-versus-concept category.
@@ -32,12 +35,16 @@ For a named stock use single_stock and gupiao; pass an explicit conjecture throu
 then explain the observable claim assessment, counterevidence, gaps and reassessment conditions.
 For selection carry explicit cap restrictions in shizhi and other explicit conditions in tiaojian.
 Use null/omit shuliang for vague quantities. Preserve future holding/return objectives in yanjiu_wenti,
-listing their untestable requirements without equating historical return rankings with expected future returns.
-Never add risk preferences or invent bounds. Compare returned 20-day/5-day performance and actual
-coverage; do not change the order. A verified scope_review_required can be resolved once with
+preserving unsupported horizons and guarantees. The supported forecast is next-session close relative to the
+latest complete signal-session close, without fees, using 24 stock states conditioned on CSI300 20-session
+direction and SW2021 level-two industry relative direction (96 joint states), with a 120-session lookback
+and 20-session recency half-life. The explicit legacy_24 mode preserves the old observation separately.
+Compare returned expected_next_day_return, chronological checks and actual coverage; preserve return ties.
+Observation order breaks exact return ties using industry_excess_ret_20 then stock_excess_ret_20, without
+changing forecasts. Preserve complete cutoff boundary ties and first-decisive-field explanations.
+Never add risk preferences or invent bounds. A verified scope_review_required can be resolved once with
 fanwei_xuanze while preserving original_request, or clarified if truly ambiguous.
-Prediction and model training are
-not available. The server never connects to brokers,
+Fixed-rule historical estimates are available but are not guaranteed future outcomes. Model training is not available. The server never connects to brokers,
 accepts trading credentials, submits orders, controls trading terminals, or performs
 automatic trading. All outputs are research results for manual review.
 """.strip()
@@ -61,7 +68,7 @@ mcp = FastMCP(
     },
 )
 def gupiao_fenxi(
-    fanwei: FenxiScope = "all_market",
+    fanwei: FenxiScope = "daily_leaderboards",
     mingcheng: str | None = None,
     gupiao: str | None = None,
     shuliang: RequestedCount | None = None,

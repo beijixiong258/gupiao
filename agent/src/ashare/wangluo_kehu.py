@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from ssl import SSLContext
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
@@ -93,7 +94,7 @@ def _cuowu_fenlei(exc: Exception) -> tuple[str, bool]:
         status = exc.response.status_code
         if status == 429:
             return "source_rate_limited", True
-        if status in {408, 425, 500, 502, 503, 504}:
+        if status in {408, 425, 500, 502, 503, 504, 508}:
             return "source_http_temporary", True
         return "source_http_rejected", False
     if isinstance(exc, (ValueError, KeyError, TypeError)):
@@ -112,7 +113,10 @@ def _anquan_xiangqing(exc: Exception) -> str:
 class GongkaiShujuHTTPKehu:
     """遵循配置的短生命周期 HTTP 客户端，支持端点级回退。"""
 
-    def __init__(self, provider: str, *, settings: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, provider: str, *, settings: dict[str, Any] | None = None,
+        ssl_context: SSLContext | None = None, trust_env: bool | None = None,
+    ) -> None:
         self.provider = str(provider).strip() or "unknown"
         self.settings = dict(settings or _wangluo_peizhi())
         mode = _lianjie_moshi(self.settings)
@@ -124,7 +128,8 @@ class GongkaiShujuHTTPKehu:
         )
         self._client = httpx.Client(
             timeout=timeout,
-            trust_env=mode is LianjieMoshi.XITONG_DAILI,
+            trust_env=mode is LianjieMoshi.XITONG_DAILI if trust_env is None else trust_env,
+            verify=ssl_context if ssl_context is not None else True,
             follow_redirects=True,
             headers={
                 "User-Agent": (
@@ -220,7 +225,29 @@ class GongkaiShujuHTTPKehu:
         headers: dict[str, str] | None = None,
     ) -> tuple[str, str]:
         """文本版端点回退；主要供交易日历使用。"""
+        content, endpoint = self._qingqiu_neirong(endpoints, params=params, headers=headers, binary=False)
+        return str(content), endpoint
+
+    def qingqiu_erjinzhi(
+        self,
+        endpoints: Iterable[str],
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, str]:
+        """二进制资料仅保留在调用内存中，与文本请求共用受限重试。"""
+        content, endpoint = self._qingqiu_neirong(endpoints, params=params, headers=headers, binary=True)
+        if not isinstance(content, bytes):
+            raise TypeError("二进制响应类型错误")
+        return content, endpoint
+
+    def _qingqiu_neirong(
+        self, endpoints: Iterable[str], *, params: dict[str, Any] | None,
+        headers: dict[str, str] | None, binary: bool,
+    ) -> tuple[str | bytes, str]:
         candidates = tuple(dict.fromkeys(str(value).strip() for value in endpoints if str(value).strip()))
+        if not candidates:
+            raise ValueError("远端端点不能为空")
         maximum_attempts = int(self.settings.get("max_attempts_per_endpoint", 2))
         backoff = float(self.settings.get("retry_backoff_seconds", 0.35))
         last_error: Exception | None = None
@@ -232,10 +259,11 @@ class GongkaiShujuHTTPKehu:
                 try:
                     response = self._client.get(endpoint, params=params, headers=headers)
                     response.raise_for_status()
-                    if not response.text.strip():
-                        raise ValueError("响应文本为空")
+                    content = response.content if binary else response.text
+                    if not content.strip():
+                        raise ValueError("响应内容为空")
                     self.attempts.append(QingqiuChangshi(self.provider, host, attempt, "ok"))
-                    return response.text, endpoint
+                    return content, endpoint
                 except Exception as exc:
                     last_error = exc
                     last_code, last_retryable = _cuowu_fenlei(exc)

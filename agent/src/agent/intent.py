@@ -10,8 +10,8 @@ from typing import Any, Literal
 TaskKind = Literal[
     "single_stock", "selection", "explanation", "usage", "clarification", "unsupported"
 ]
-ScopeKind = Literal["all_market", "main_board", "named_scope"]
-_SCOPE_KINDS = frozenset({"all_market", "main_board", "named_scope"})
+ScopeKind = Literal["daily_leaderboards", "all_market", "main_board", "named_scope"]
+_SCOPE_KINDS = frozenset({"daily_leaderboards", "all_market", "main_board", "named_scope"})
 _TASK_KINDS = frozenset(
     {"single_stock", "selection", "explanation", "usage", "clarification", "unsupported"}
 )
@@ -73,7 +73,7 @@ _SYSTEM_PROMPT = """你是A股分析程序的独立意图识别节点，只识�
 
 task_kind取值与边界：
 - single_stock：点名单股进行完整分析、检验观点、重新分析或获取新的市场判断。
-- selection：在用户给定范围与显式条件中选股或重新比较候选；未限定范围时默认全市场A股。
+- selection：在用户给定范围与显式条件中选股或重新比较候选；未限定范围时默认固定日终双榜。
 - explanation：仅解释本次对话中仍然存活且兼容的已有分析结果，不需要新的市场判断或计算。
   旧工具结果标明reanalysis_required、已失效、证据不兼容或本轮要求最新判断时，绝不能选此类；
   根据上下文选择single_stock或selection重新分析，不能借解释旧结果省略必需的取数。
@@ -87,8 +87,12 @@ stock_query保留用户或历史对话中已出现的股票名称或代码原文
 命名范围原文。出现“它”“这个板块”等指代时，只有上下文唯一明确才解析到该已有名称或代码，
 不要把指代词直接交业务工具，不自行归一别名、确认真实身份、把概念改成行业或发明范围。
 single_stock必须有非空stock_query，scope_kind与scope_text均为null。
-selection的stock_query为null。用户明确要求全市场A股，或者只是未限定命名范围时，
-scope_kind为all_market、scope_text为null；没有指定行业或板块不是缺失信息，不需要追问范围。
+selection的stock_query为null。默认或要求按已确认的五天测试规则选股时，scope_kind为
+daily_leaderboards、scope_text为null：同一完整交易日涨幅前100与成交额前100合并去重，
+历史统计也仅用本次候选池；五天内规则固定。只提到A股、沪深京而未要求逐只比较全市场，
+仍使用此默认范围。明确要求完整全市场比较时才用all_market、scope_text为null。
+榜单的100是入池数量，不是最终推荐数量，不写入requested_count，也不转换成个股涨幅或成交额阈值。
+没有指定行业或板块不是缺失信息，不需要追问范围。其他榜单或榜单数量不能静默改成固定双榜。
 用户要求整个沪深主板（无需具体行业或板块）时，scope_kind为main_board，scope_text保留用户
 范围原话且非空；主板是上市市场范围，不是行业或概念，不能交行业或概念目录解释。
 其他明确的命名范围用named_scope，scope_text保留该非空原文。按完整语义判断这些边界，
@@ -108,11 +112,13 @@ unverifiable_requirements逐条保留现有数据和规则不能验证的目标�
 已知未来收益最大、未经验证的因果要求，或当前不支持的其他持有期限。这是现有能力边界，
 不是用户漏给了范围；仍保留selection，不因这类要求单独转clarification。存在这些要求时
 research_question必须非空，保留用户原始整体选股目标，不能丢掉研究目标。
-按“推荐指数”、上涨概率、上涨时涨幅或期望净收益选股属于现有selection，沿用原范围、数量
-与条件，不新增训练意图或预测工具。程序支持次交易日开盘至第5交易日收盘的一周参考事件，
-按固定价量状态作历史频率与条件均值估计，上涨概率与上涨条件均幅分别显示，综合按期望净
-参考收益排序。要求这种概率估计本身不列为不可核验；不能将估计说成真实未来概率或保证。
-“持有一周”不能等同过去5日收益条件；其他明确期限不得静默改成5日，须保留能力限制。
+按“推荐指数”、次日涨幅、上涨概率或期望涨幅选股属于现有selection，沿用原范围、数量
+与条件，不新增训练意图或预测工具。程序支持信号日收盘至下一权威交易日收盘的涨幅估计，
+闭市后选股，周末使用最近完整交易日为基准；同源前复权收盘价比，不扣交易费用。
+固定24种价量状态，只用最近120交易日内已成熟同状态样本，时间权重半衰期20交易日。
+公开报告展示次日期望分、预计次日涨幅及依据，概率与条件均幅保留内部审计。
+该估计请求本身不列为不可核验，也不能被说成实际交易利润或未来保证；其他明确持有期限、
+次日开盘至再下一日开盘的T+1收益等，均不得静默替换为本口径，须保留能力限制和原始要求。
 不训练模型、不拟合或寻优规则，不能声称已经满足未来最大收益。
 对于因果问题，能核验的事件先后或同期表现不等于已证明因果；没有不可验证要求时返回空数组。
 missing_information只描述真实尚缺的用户信息，不发明限制，不把没有预测能力列作待用户补充。
@@ -137,7 +143,7 @@ def _tool_definition() -> dict[str, Any]:
                     "stock_query": dict(optional_text),
                     "scope_kind": {
                         "type": ["string", "null"],
-                        "enum": ["all_market", "main_board", "named_scope", None],
+                        "enum": ["daily_leaderboards", "all_market", "main_board", "named_scope", None],
                     },
                     "scope_text": dict(optional_text),
                     "requested_count": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
@@ -207,8 +213,8 @@ def _validate_decision(arguments: Any) -> IntentDecision:
             raise IntentRecognitionError("选股意图不能指定单股分析对象")
         if scope_kind is None:
             raise IntentRecognitionError("选股意图必须明确范围类型")
-        if scope_kind == "all_market" and scope_text is not None:
-            raise IntentRecognitionError("全市场选股不能指定命名范围")
+        if scope_kind in {"daily_leaderboards", "all_market"} and scope_text is not None:
+            raise IntentRecognitionError("双榜或全市场选股不能指定命名范围")
         if scope_kind in {"main_board", "named_scope"} and scope_text is None:
             raise IntentRecognitionError("主板或命名范围选股必须指定范围原文")
     if unverifiable_requirements and research_question is None:

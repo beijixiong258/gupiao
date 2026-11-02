@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from collections import Counter
 
 import pandas as pd
 
@@ -20,10 +21,11 @@ from src.ashare.fenxi_yinzi import (
     zengjia_dangri_guzhi_yinzi,
 )
 from src.ashare.peizhi import jiazai_lianghua_peizhi
+from src.ashare.hangye_huanjing import huoqu_hangye_huanjing
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 from src.ashare.shuju_yuan import biaozhunhua_gupiao_daima
 from src.ashare.tongdaxin_chicang import fenxi_kongpan_shuju
-from src.ashare.tuijian_gailv import buquan_he_guji_jianyan
+from src.ashare.tuijian_gailv import buquan_zhuangtai_guji_jianyan
 from src.ashare.wangluo_kehu import WangluoQingqiuYichang
 from src.ashare.xuangu_fanwei import (
     FanweiLeixing,
@@ -33,6 +35,7 @@ from src.ashare.xuangu_fanwei import (
 )
 from src.ashare.xuangu_guize import (
     goujian_houxuan_zhaiyao,
+    goujian_jiequ_bijiao,
     goujian_kejiaoyixing_zhaiyao,
     goujian_kuaizhao_jilu,
     goujian_zhen_duan_shixiaoxing,
@@ -361,6 +364,9 @@ class XuanguFenxiFuWu:
             "as_of": analysis_date,
             "statistics_cache": {},
         }
+        environment_enabled = settings.get("selection_method", "environment_96") == "environment_96"
+        benchmark_output = {"start_date": start_date} if environment_enabled else None
+        environment_meta: dict[str, Any] = {"status": "not_requested", "method": "legacy_24"}
         technical_summaries: dict[str, dict[str, Any]] = {}
         panel, panel_meta = goujian_fenxi_yinzi_mianban(
             histories,
@@ -370,9 +376,19 @@ class XuanguFenxiFuWu:
             latest_only=True,
             technical_summaries=technical_summaries,
             macd_structure_config=settings.get("macd_structure"),
+            benchmark_output=benchmark_output,
         )
         if panel.empty:
             raise RuntimeError("候选日 K 因子面板为空")
+        if environment_enabled:
+            environment_by_code, environment_meta = huoqu_hangye_huanjing(
+                list(histories), calendar=analysis_calendar, start_date=start_date, end_date=end_date,
+                market_features=benchmark_output.get("features", pd.DataFrame()),
+            )
+            environment_meta["market_benchmarks"] = benchmark_output.get("metadata", {})
+            ranking_context.update(environment_by_code=environment_by_code, environment_metadata=environment_meta)
+            # 历史指数只在这次计算中传递，报告仅保留来源、覆盖及实际指标。
+            benchmark_output.clear()
         panel_dates = pd.to_datetime(panel["trade_date"], errors="coerce").dt.normalize()
         latest_panel = panel.loc[panel_dates.eq(analysis_date.normalize())].copy()
         latest_panel = latest_panel[latest_panel["ts_code"].astype(str).isin(histories)].reset_index(drop=True)
@@ -566,15 +582,19 @@ class XuanguFenxiFuWu:
             )
             item["selection"].update(pinggu_shangzhang_tiaojian(item, config=self._config, deep_reviewed=True, ranking_context=ranking_context))
             item["research_assessment"] = pinggu_yanjiu_wenti(research_question, item)
-        # 同一完整资格池复用本请求逐股核估计；昂贵补充证据不改变期望净收益排序。
+        # 同一完整资格池复用本请求同状态估计；昂贵补充证据不改变预计次日涨幅排序。
         # 资格若在补充阶段意外改变，停止发布，避免用旧的详报对象冒充最终Top。
         technical_reviewed = paixu_shangzhang_houxuan(technical_reviewed, config=self._config, deep_reviewed=True, ranking_context=ranking_context)
         qualified_reviewed = [item for item in technical_reviewed if item["selection"]["eligible"]]
         final_deep_candidates = qualified_reviewed[:display_target] or technical_reviewed[:1]
         if {item["ts_code"] for item in final_deep_candidates} != {item["ts_code"] for item in deep_candidates}:
-            raise FenxiJisuanYichang("完整复核后的期望净收益候选与已补充报告对象不一致，本次不能发布未完成报告的排名")
+            raise FenxiJisuanYichang("完整复核后的预计次日涨幅候选与已补充报告对象不一致，本次不能发布未完成报告的排名")
         deep_candidates = final_deep_candidates
-        buquan_he_guji_jianyan(ranking_context.get("latest_statistics") or {},
+        cutoff_comparison = goujian_jiequ_bijiao(
+            qualified_reviewed if not technical_errors else [], display_target,
+            environment_enabled=environment_enabled,
+        )
+        buquan_zhuangtai_guji_jianyan(ranking_context.get("latest_statistics") or {},
                               [item["ts_code"] for item in deep_candidates])
         summaries = [
             goujian_houxuan_zhaiyao(
@@ -603,10 +623,13 @@ class XuanguFenxiFuWu:
                 "up_probability": item["selection"].get("up_probability"),
                 "conditional_upside_mean": item["selection"].get("conditional_upside_mean"),
                 "conditional_downside_mean": item["selection"].get("conditional_downside_mean"),
-                "expected_net_return": item["selection"].get("expected_net_return"),
+                "expected_next_day_return": item["selection"].get("expected_next_day_return"),
                 "composite_score_bps": item["selection"].get("composite_score_bps"),
                 "recommendation_index_status": item["selection"].get("comparison_status"),
                 "recommendation_index_missing_fields": item["selection"].get("comparison_missing_fields", []),
+                "environment_analysis": item["selection"].get("environment_analysis"),
+                "baseline_estimate": item["selection"].get("baseline_estimate"),
+                "observation_rank": item["selection"].get("observation_rank"),
                 "technical_review": {
                     "status": item["technical"].get("status", "not_requested"),
                     "outcome": item["technical"].get("outcome"),
@@ -625,6 +648,11 @@ class XuanguFenxiFuWu:
             item["ts_code"]: (probability_statistics.get("candidate_estimates", {}).get(item["ts_code"]) or {}).get("statistics")
             for item in deep_candidates
         }
+        if fanwei.leixing is FanweiLeixing.SHUANGBANG:
+            probability_estimation["methodology"] = {
+                **(probability_estimation.get("methodology") or {}),
+                "historical_pool": pool.metadata["historical_pool_rule"],
+            }
         undecided_count = sum(bool(item["missing_conditions"]) and not item["unmet_conditions"] for item in condition_checks)
         # 范围覆盖与可选报告证据分开：指数、财务等失败不改写已核验的选股结论。
         scope_partial = (
@@ -643,6 +671,10 @@ class XuanguFenxiFuWu:
         evidence_partial = bool(
             scope_partial or optional_source_partial or any(item["missing_conditions"] for item in condition_checks)
             or (probability_statistics.get("coverage") or {}).get("reference_unknown_events", 0)
+            or (environment_enabled and (
+                environment_meta.get("status") != "ok"
+                or (probability_statistics.get("coverage") or {}).get("historical_environment_missing_events", 0)
+            ))
             or (research_question or {}).get("unverifiable_parts")
             or any(item["evidence_gaps"] or item["technical_summary"].get("status") == "partial"
                    or item["late_session_analysis"].get("status") in {"partial", "unavailable"}
@@ -713,8 +745,18 @@ class XuanguFenxiFuWu:
             "user_conditions": user_conditions or [],
             "research_question": research_question,
             "probability_estimation": probability_estimation,
+            "environment_data": environment_meta,
+            "cutoff_comparison": cutoff_comparison,
+            "selection_concentration": {
+                "industry_counts": dict(Counter((item["selection"].get("environment_analysis") or {}).get("industry_name") or "未核验" for item in deep_candidates)),
+                "shared_estimate_groups": dict(Counter((item["selection"].get("recommendation_index_analysis") or {}).get("state_key") or "未知" for item in deep_candidates)),
+                "interpretation": "相同行业或共享状态估计不是独立机会；只披露集中程度，不设置行业名额或改写排序",
+            },
             "comparison_coverage": {
                 "method": "all_scope_members_in_batches", "sampled": False,
+                "scope_definition": pool.metadata.get("scope_name"),
+                "leaderboard_union_count": pool.metadata.get("leaderboard_union_count"),
+                "statistics_pool_size": (probability_statistics.get("coverage") or {}).get("input_stocks", 0),
                 "scope_input": len(data), "history_requested": len(codes), "factor_ready": len(factor_map),
                 "technical_review_planned": len(review_pool), "technical_reviewed": len(technical_reviewed),
                 "recommendation_index_ready": len(qualified_reviewed),
@@ -769,16 +811,17 @@ class XuanguFenxiFuWu:
                 "history": history_meta,
                 "factor_panel": panel_meta,
                 "realtime_snapshot": realtime_meta,
+                "environment": environment_meta,
             },
             "selection_methodology": {
-                "method": "stock_specific_recent_kernel_expected_net_return",
-                "conditions": "用户明确条件、20日连续状态输入、技术一致性、适用成交核验及核加权局部样本至少10个已知历史信号日期、10个有效事件和10个有效日期；删除任意1至2个信号日期后的均值变化不超过原均值绝对值的50%。统计门槛不代表未来收益有效",
-                "comparison_dimensions": ["未来5个交易日期望分", "预计净收益", "当前价量依据及近期逐期检查"],
-                "ranking_basis": "完整资格池按逐股连续价量特征作核加权条件期望估计；评分只用最近120交易日内成熟信号，20交易日半衰期与相似度核权重相乘。24状态仅作说明，不共享组分数。期望分=10000*预计净收益，100分对应1%，仅按未舍入预计净收益降序；精确同值并列，代码只稳定展示。内部合并上涨机会、幅度、非上涨损失与成本，公开报告不列历史上涨概率。参数为用户确认的初始固定口径，无训练或寻优。",
-                "best_definition": "最优仅指本次已覆盖范围内，未来五交易日净收益点估计最高；分值未验证为真实未来收益，最高估计仍可能为负，必须如实解释。",
+                "method": (probability_statistics.get("methodology") or {}).get("method", "fixed_state_recent_weighted_next_day_return"),
+                "conditions": "用户明确条件、20日连续状态输入、技术一致性、适用成交核验；同状态成熟样本至少10个不同已知结果信号日期。有效样本量只作披露，统计门槛不代表未来涨幅预测有效",
+                "comparison_dimensions": ["下一交易日期望分", "预计次日涨幅", "当前价量依据及近期逐期检查"],
+                "ranking_basis": (technical_reviewed[0]["selection"].get("ranking_basis") if technical_reviewed else "必要数据不足，未形成排名"),
+                "best_definition": "最优仅指本次已覆盖范围内，次日涨幅点估计最高；分值未验证为真实未来收益，最高估计仍可能为负，必须如实解释。",
                 "sampling_limit": "范围成分分批全量请求，完整比较并复核潜在合格者后才裁剪展示。财务与分钟补充仅服务最终候选，各守既有上限；来源失败时明确覆盖缺口。",
-                "missing_evidence": "必需状态缺失、分母无效、局部已知日期或有效事件及日期不足、删日检查不稳定时不发布排序估计，不补50%、不回退旧强势分；未知事件、条件空组和成交限制分别保留，不解释为确定下跌",
-                "llm_boundary": "展示未来五交易日期望分、预计净收益与当前入选依据，不列历史上涨概率及条件概率明细；简述近期逐股检查、样本集中程度及实质限制，不改数值或顺序，不把估计说成已验证预测",
+                "missing_evidence": "必需状态缺失、分母无效或同状态已知结果日期不足时不发布估计，不补50%、不回退旧强势分；未知事件、条件空组和成交限制分别保留，不解释为确定下跌",
+                "llm_boundary": "展示下一交易日期望分、预计次日涨幅与当前入选依据，不列历史上涨概率及条件概率明细；简述近期逐股检查、样本集中程度及实质限制，不改数值或顺序，不把估计说成已验证预测",
             },
             "research_scope": "公开数据研究排序，不连接证券账户、不提交委托、不自动交易",
         }
@@ -798,7 +841,7 @@ class XuanguFenxiFuWu:
 
 def fenxi_xuangu(
     *,
-    fanwei: str = "all_market",
+    fanwei: str = "daily_leaderboards",
     mingcheng: str | None = None,
     gupiao: str | None = None,
     shuliang: int | str | None = None,
@@ -816,7 +859,7 @@ def fenxi_xuangu(
         "dangu",
         "单股",
         "个股",
-    } or (gupiao and str(fanwei or "all_market").strip().lower() in {"", "all_market", "all", "quan_shichang", "全市场"}) else "unified_stock_selection"
+    } or (gupiao and str(fanwei or "daily_leaderboards").strip().lower() in {"", "daily_leaderboards", "all_market", "all", "quan_shichang", "全市场"}) else "unified_stock_selection"
     try:
         resolved_scope = FenxiFanwei.create(fanwei, mingcheng, gupiao)
         market_cap_condition = None

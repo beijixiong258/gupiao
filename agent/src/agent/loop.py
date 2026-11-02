@@ -305,26 +305,18 @@ def _analysis_run_status(payload: dict[str, Any] | None) -> str | None:
 
 
 def _removed_forecast_offer(content: str) -> bool:
-    """阻止分析回答继续邀请使用已经移除的预测功能。"""
-
-    text = "".join(str(content or "").split())
-    retired_horizons = ("T+2", "T＋2", "T+3", "T＋3")
-    if "预测" not in text and not any(marker in text for marker in retired_horizons):
-        return False
-    # 这些是安全边界说明，不是邀请；去掉后只要还出现“预测”，就交给
-    # 确定性单股摘要重写，避免模型用“如需/如果希望”绕过提示词。
-    for phrase in (
-        "不产生自动预测资格",
-        "不产生预测资格",
-        "不具备预测资格",
-        "不提供预测",
-        "预测功能已移除",
-        "不支持预测",
-        "不能预测",
-        "不可预测",
-    ):
-        text = text.replace(phrase, "")
-    return "预测" in text or any(marker in text for marker in retired_horizons)
+    """只拦截旧训练/多日预测功能的邀请；次日涨幅估计及限制说明属于现有功能。"""
+    retired = re.compile(r"T[+＋][23]|(?:未来)?[三3](?:个)?(?:交易)?[天日]|模型训练|训练模型|预测资格|预测确认")
+    invitation = re.compile(r"如需|如果.{0,12}(?:希望|需要|愿意)|可以|要不要|是否|启动|运行|开始|恢复|确认后|继续")
+    for sentence in re.split(r"[。！？；\n]", str(content or "")):
+        # 否定边界本身不能被当成提供旧功能；另一个分句的邀请仍单独检查。
+        clauses = re.split(r"[，,]|但是|但|不过", sentence)
+        for clause in clauses:
+            if re.search(r"不支持|不提供|不能|已(?:经)?移除|不产生|不具备|不训练", clause):
+                continue
+            if retired.search(clause) and invitation.search(clause):
+                return True
+    return False
 
 
 def _remove_removed_forecast_offer(content: str) -> str:
@@ -791,7 +783,7 @@ class AgentLoop:
         requested_count = tc.arguments.get("shuliang")
         if requested_count != intent.requested_count or isinstance(requested_count, bool):
             return "候选数量必须来自用户明确要求；未明确数量时传null或省略，不能擅自填1"
-        scope = tc.arguments.get("fanwei", "all_market")
+        scope = tc.arguments.get("fanwei", "daily_leaderboards")
         if intent.task_kind == "single_stock":
             if scope != "single_stock":
                 return "本次是单股分析，不能改为范围或全市场选股"

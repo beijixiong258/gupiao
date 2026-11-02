@@ -87,7 +87,7 @@ def _chijiuhua_fenxi_biaoji(message: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     scope_request = {
-        "fanwei": "single_stock" if single_stock else "main_board" if scope.get("scope_type") == "main_board" else "named_scope" if requested_name else "all_market",
+        "fanwei": "single_stock" if single_stock else "daily_leaderboards" if scope.get("scope_type") == "daily_leaderboards" else "main_board" if scope.get("scope_type") == "main_board" else "named_scope" if requested_name else "all_market",
         "mingcheng": requested_name or None,
     }
     if single_stock:

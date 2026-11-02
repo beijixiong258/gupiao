@@ -135,15 +135,13 @@ def _minute_evidence(
 
     vwap = None
     if "amount_yuan" in data.columns and "volume" in data.columns:
-        amount = _number(pd.to_numeric(data["amount_yuan"], errors="coerce").sum())
-        volume = _number(pd.to_numeric(data["volume"], errors="coerce").sum())
-        if amount is not None and volume is not None and volume > 0:
-            candidate = amount / volume
-            reference_price = _number(data.iloc[-1]["close"])
-            if reference_price is not None and candidate < reference_price * 0.1:
-                candidate *= 100.0
-            if reference_price is None or 0.1 * reference_price <= candidate <= 10 * reference_price:
-                vwap = candidate
+        amounts, volumes = data["amount_yuan"], data["volume"]
+        valid = np.isfinite(amounts) & np.isfinite(volumes) & amounts.ge(0) & volumes.ge(0)
+        valid &= amounts.eq(0).eq(volumes.eq(0))
+        if valid.all():
+            amount, volume = _number(amounts.sum()), _number(volumes.sum())
+            if amount is not None and volume is not None and volume > 0:
+                vwap = _number(amount / volume)  # 来源适配层已统一为元/股，不按价格大小猜单位。
     if vwap is None and "average_price" in data.columns:
         vwap = _number(data.iloc[-1]["average_price"])
     if vwap is not None:

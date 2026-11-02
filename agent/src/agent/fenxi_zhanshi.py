@@ -11,6 +11,26 @@ from src.ashare.yinzi_gongcheng import factor_definition
 
 # 展示词典只翻译已经取得的字段；不参与选股范围理解、指标计算或条件判断。
 _LABELS = {
+    "cross_section_rows": "本次日终横截面记录数", "leaderboard_size": "每榜固定入池数量",
+    "leaderboard_rules_fixed": "双榜规则是否固定", "leaderboard_rule": "双榜入池规则",
+    "leaderboard_tie_policy": "榜单边界并列处理", "historical_pool_rule": "双榜历史统计范围",
+    "gain_leaderboard_count": "涨幅榜实际入池数", "turnover_leaderboard_count": "成交额榜实际入池数",
+    "leaderboard_overlap_count": "双榜重叠股票数", "leaderboard_union_count": "双榜合并去重股票数",
+    "leaderboard_members": "本次双榜成员及入榜名次", "gain_rank": "当日涨幅榜名次",
+    "turnover_rank": "当日成交额榜名次", "leaderboard_unverified_codes": "榜单输入未核验记录",
+    "gain": "涨幅榜", "turnover": "成交额榜", "scope_definition": "本次比较范围",
+    "statistics_reference": "完整统计所在章节", "date_summaries_reference": "同状态逐日统计所在对象",
+    "scope_reference": "相同范围核验所在章节",
+    "cross_section_provenance": "入榜前全市场日终横截面来源及缺口",
+    "leaderboard_input_unverified_rows": "入榜前榜单输入未核验股票数",
+    "leaderboard_unranked_count": "榜单输入未核验且未入池股票数",
+    "leaderboard_partial_rank_member_count": "凭另一张有效榜入池但缺少一榜数值的股票数",
+    "leaderboard_input_note": "入榜前输入缺口与入榜后历史缺口的区别",
+    "signal_date": "信号日", "target_date": "目标交易日", "numeric_range_reasons": "数值范围异常原因",
+    "training_known_signal_dates": "当时样本的已知结果信号日期数",
+    "training_effective_signal_date_count": "当时按日期加权的有效样本量",
+    "training_latest_exit_date": "估计当时最新已到期结果日",
+    "evaluation_known_events": "该日已知实际涨幅事件数", "evaluation_unknown_events": "该日未知实际涨幅事件数",
     "status": "数据状态", "outcome": "结果状态", "reason": "原因", "error": "错误原因",
     "ownership_analysis": "持仓分析（通达信控盘指标）", "raw_value": "来源指标原值",
     "pe_static": "静态市盈率（来源年报口径）", "valuation_close": "估值来源日终收盘价",
@@ -45,7 +65,7 @@ _LABELS = {
     "summary": "综合解释", "reassessment_conditions": "重新评估条件", "evidence_gaps": "证据缺口",
     "missing_reason": "缺失原因", "missing_fields": "缺失字段", "missing_conditions": "无法核验条件",
     "unmet_conditions": "未满足条件", "failure_reasons": "未形成原因", "unavailable_items": "不可用项",
-    "state": "形态状态", "state_label": "形态说明", "eligible": "条件是否满足", "stage": "时段", "stage_label": "时段说明",
+    "state": "状态", "state_label": "状态说明", "eligible": "条件是否满足", "stage": "时段", "stage_label": "时段说明",
     "confirmation_level": "确认状态", "conditions": "条件核验", "actuals": "实际观测值", "metrics": "原始指标",
     "baseline_date": "基准日", "shrink_date": "缩量日", "breakout_date": "突破日", "risk_reference_price": "风险参考价格",
     "rule_semantics": "形态规则口径", "session_origin": "交易日计数起点",
@@ -88,40 +108,100 @@ _LABELS = {
     "data_as_of": "证据截止日", "daily_data_as_of": "日线截止日", "explanation": "口径说明", "reassess_when": "何时更新诊断",
     "result_confirmation": "结果确认状态", "session_status": "交易时段", "realtime_status": "实时核验状态",
     "selection_analysis": "选股条件核验", "meets_selection_conditions": "是否通过选股条件",
-    "recommendation_index_analysis": "未来5个交易日期望分与依据", "raw_values": "计算原始值",
+    "recommendation_index_analysis": "下一交易日期望分与依据", "raw_values": "计算原始值",
     "percentiles": "共同有效池中的名次分位", "price_group": "价格组分P（0–1）",
     "volume_group": "量价组分V（0–1）", "pool_size": "共同有效比较股票数N",
-    "equivalent_index_count": "期望净收益精确相同的并列对象数",
+    "equivalent_index_count": "预计次日涨幅精确相同的并列对象数",
     "recommendation_index_ready": "推荐指数有效数量", "recommendation_index_unavailable": "推荐指数证据不足数量",
     "recommendation_index_status": "推荐指数计算状态", "recommendation_index_missing_fields": "推荐指数缺失原始量",
     "up_probability": "上涨概率估计", "conditional_upside_mean": "上涨条件下平均涨幅估计",
-    "conditional_downside_mean": "非上涨条件下平均亏损幅度估计", "expected_gross_return": "期望毛参考收益",
-    "expected_net_return": "期望净参考收益", "composite_score_bps": "综合评分（期望净收益，基点）",
-    "current_state": "当前固定价量状态", "state_key": "价量状态标识", "statistics": "逐股核加权成熟事件统计",
-    "candidate_estimates": "逐股核估计", "state_statistics": "旧固定状态统计",
-    "stock_statistics": "逐股核估计与检查", "kernel_parameters": "核估计参数",
-    "kernel_features": "连续价量特征", "feature_center": "特征中心", "feature_scale": "特征尺度",
-    "constant_dimensions": "常量特征维度", "minimum_effective_events": "最低有效事件量（工程门槛）",
-    "distinct_expected_returns": "不同期望净收益数量", "largest_exact_tie_group": "最大精确并列组大小",
-    "kernel": "核函数", "radius": "固定核半径", "scale_rule": "尺度计算口径",
-    "distance_rule": "联合距离口径", "weight_formula": "核与时间联合权重公式",
-    "bandwidth_fitted_to_returns": "是否按收益拟合带宽", "state_role": "24状态用途",
+    "conditional_downside_mean": "非上涨条件下平均亏损幅度估计", "expected_gross_return": "内部次日收盘涨幅均值",
+    "expected_next_day_return": "预计次日收盘涨幅", "composite_score_bps": "综合评分（预计次日涨幅，基点）",
+    "prediction_reference": "次日涨幅核验基准", "baseline_date": "基准交易日", "target_date": "目标交易日",
+    "baseline_close": "基准收盘价（元）", "target_close": "次日收盘价（元）", "target_session_offset": "目标交易日间隔",
+    "price_basis": "价格口径", "costs_applied": "是否扣交易费用", "formula": "计算公式",
+    "same_source_qfq_close_ratio": "同源前复权收盘价比；事后核验沿用同一复权口径",
+    "missing_observation_count": "缺失交易日数", "missing_observation_dates": "缺失交易日",
+    "elapsed_sessions_after_baseline": "基准日后已过交易日数",
+    "current_state": "当前固定状态", "state_key": "固定状态标识", "statistics": "同状态成熟事件统计",
+    "candidate_estimates": "同状态估计", "state_statistics": "固定状态统计",
+    "stock_statistics": "同状态估计与检查",
+    "distinct_expected_returns": "不同预计次日涨幅数量", "largest_exact_tie_group": "最大精确并列组大小",
+    "state_role": "固定状态用途", "state_count": "固定状态总数",
+    "environment_analysis": "当前大盘与行业环境、原值及来源",
+    "current_environment": "当前大盘与行业环境", "environment_data": "大盘与行业环境数据覆盖及来源",
+    "individual_current_state": "当前个股价量状态", "individual_state_valid": "当前个股价量状态有效股数",
+    "current_environment_valid": "当前环境有效股数", "current_environment_missing": "当前环境证据缺失股数",
+    "current_environment_missing_by_code": "逐股当前环境缺失原因",
+    "historical_environment_missing_events": "评分窗口内环境证据缺失事件数",
+    "historical_environment_missing_known_events": "环境缺失但后续收益已知的事件数",
+    "historical_environment_missing_unknown_events": "环境及后续收益均缺失的事件数",
+    "older_environment_missing_events": "评分窗口以前环境证据缺失事件数",
+    "environment_missing_reason_counts": "历史环境缺失原因及事件数",
+    "environment_missing_reasons": "环境证据缺失原因", "environment_missing_events": "环境证据缺失事件数",
+    "environment_missing_signal_dates": "环境证据缺失的信号日期数", "environment_status": "环境证据状态",
+    "environment_missing_is_failed_condition": "是否把环境缺失判定为条件不满足",
+    "historical_environment_coverage_basis": "历史环境覆盖的统计范围",
+    "baseline_historical_events": "旧24状态对照的成熟事件数", "baseline_estimate_available": "旧24状态对照估计可用股数",
+    "environment_missing_policy": "环境缺失处理规则",
+    "baseline_estimate": "旧24价量状态对照估计（不参与新方法排序）",
+    "selection_method": "本次选股统计方法", "industry_code": "行业指数代码", "industry_name": "行业名称",
+    "market_state": "大盘20日方向状态", "industry_state": "行业20日相对大盘状态",
+    "market_direction": "沪深300近20日方向", "industry_relative_strength": "行业近20日相对沪深300强弱",
+    "individual_state_key": "24价量状态标识", "individual_state": "24价量状态原值分类",
+    "analysis_date": "分析交易日", "membership_verified": "信号日所属行业是否核验",
+    "membership_usable": "是否有可用行业参考", "membership_approximate": "本信号日行业归类是否近似",
+    "membership_basis": "行业归类依据", "membership_reference_date": "行业参考查证日期",
+    "historical_approximate_membership_events": "历史沿用近似行业归类的事件数",
+    "current_approximate_membership_stocks": "当前沿用近似行业归类的股票数",
+    "industry_reference_reuse_allowed": "是否允许复用有来源的行业参考",
+    "supplemental_missing_fields": "补充观察指标缺口", "relative_return_unit": "相对收益原值单位",
+    "stock_window_sessions": "个股收益覆盖的交易日位置数", "index_window_validation": "指数收益起止日核验方式",
+    "stock_return_required_closes": "个股区间收益所需有效收盘价数量", "return_missing_policy": "区间收益缺失处理规则",
+    "current_return_endpoints": "当前区间收益的起止日价格", "start_close": "起始日收盘价", "end_close": "截止日收盘价",
+    "required_calendar_sessions": "所需交易日历位置数", "required_return_endpoint_dates": "必需收益起止日",
+    "missing_return_endpoint_dates": "缺失或无效的收益起止日",
+    "observation_rank": "观察优先级名次（不改变预计涨幅）",
+    "observation_equivalent_count": "预计涨幅及两项观察指标均相同的对象数",
+    "comparison_to_cutoff": "与展示截止位置的比较", "cutoff_comparison": "展示边界及完整并列名单",
+    "first_decisive_field": "首次决定先后顺序的指标", "value_difference": "本股减比较对象的原值差",
+    "strictly_ahead_count": "严格领先于边界组的对象数", "boundary_rank": "边界组观察名次",
+    "boundary_members": "边界组完整成员", "displayed_boundary_members": "边界组中本次展示的成员",
+    "undisplayed_boundary_members": "边界组中未完整展示的成员", "unique_selection": "本次展示集合是否唯一",
+    "first_omitted": "第一只未完整展示的比较对象", "boundary_ties": "跨展示截止位置的完全并列成员",
+    "interpretation": "解释及边界",
+    "selection_concentration": "展示候选的行业及共享估计集中情况",
+    "industry_counts": "各行业展示对象数", "shared_estimate_groups": "各共享状态估计组的展示对象数",
+    "comparison_only": "仅用作对照", "used_for_ranking": "是否参与本次排序",
+    "classification": "行业分类体系", "industry_level": "行业分类层级", "by_code": "逐股环境来源核验",
+    "by_index": "逐行业指数来源核验", "point_in_time_verified": "是否取得历史当时公开快照",
+    "persistence": "数据持久化方式", "directory": "行业分类与指数映射目录", "membership_source": "行业归属来源",
+    "classification_source": "行业分类来源", "standard_source": "行业分类标准来源", "index_mapping_source": "行业指数映射来源",
+    "industry_reference": "可复用的行业归属参考", "reference_path": "行业参考笔记位置",
+    "reference_reused": "本次是否复用已查证行业参考", "reference_date": "行业参考查证日期",
+    "classification_note": "行业归类说明", "approximate": "是否近似归类",
+    "source_effective_date": "来源记载的归属起日", "source_update_date": "来源记载的更新日",
+    "reused_codes": "复用行业参考的股票", "fetched_codes": "本次新查询归属的股票", "missing_codes": "未取得行业参考的股票",
+    "approximate_membership_dates": "沿用近似行业归类的日期数", "membership_policy": "行业归类处理规则",
+    "verified_third_level_mappings": "已核验的三级分类映射数", "unverified_classification_codes": "未核验的行业分类代码",
+    "mapping_method": "行业分类映射方法", "source_rows": "来源记录数", "candidate_rows": "本次候选对应记录数",
+    "membership_records": "行业归属历史记录", "start_date": "生效起日", "end_date_exclusive": "生效止日（不含当日）",
+    "update_date": "来源更新日", "classification_codes": "来源行业分类代码",
+    "verified_membership_dates": "行业归属已核验日期数", "unverified_membership_dates": "行业归属未核验日期数",
+    "index_codes": "本股历史对应行业指数", "index_sources": "对应行业指数来源",
+    "current_environment_ready": "当前环境数据是否齐备", "valid_environment_dates": "环境数据有效日期数",
+    "requested_codes": "请求环境数据的股票数", "current_environment_ready_codes": "当前环境数据齐备股票数",
+    "requested_industry_indices": "请求行业指数数", "source_checks": "逐来源质量核验", "fallback_used": "是否使用备用来源",
+    "invalid_or_duplicate_rows": "无效或日期重复行数", "duplicate_date_rows": "日期重复行数",
+    "valid_calendar_rows": "权威交易日历内有效行情行数", "missing_calendar_dates": "权威交易日历内缺失日期",
+    "invalid_dates_in_requested_calendar": "请求区间内无效行情日期", "duplicate_dates_in_requested_calendar": "请求区间内重复行情日期",
+    "latest_21_session_missing_or_invalid_dates": "最近21个交易日窗口内缺失或无效日期",
+    "source_latest_date": "来源最新日期", "last_usable_date": "最后有效行情日期",
+    "return_definition": "收益计算口径", "price_quality_scope": "价格质量核验范围",
+    "ohlc_provided": "来源是否提供开高低收", "ohlc_used": "是否使用开高低收全部字段", "adjustment": "复权或指数口径",
     "known_count": "结果已知的成熟事件数", "unknown_count": "结果未知的成熟事件数",
     "up_count": "已知事件中上涨次数", "non_up_count": "已知事件中非上涨次数",
     "date_count": "成熟事件涉及信号日期数", "known_signal_dates": "有已知结果的不同信号日期数",
-    "sample_stability_rule": "日期集中度与删日稳定性门槛",
-    "minimum_effective_signal_dates": "最低有效日期量（工程门槛）",
-    "date_stability_check": "删除少数信号日期后的稳定性检查",
-    "maximum_removed_signal_dates": "每次最多移除的信号日期数",
-    "maximum_date_removal_relative_change": "删日后相对变化上限（比例，1表示100%）",
-    "maximum_relative_change_allowed": "允许相对变化上限（比例，1表示100%）",
-    "evaluated_removals": "已检查的日期移除组合数",
-    "full_expected_net_return": "完整样本均值（比例，1表示100%，仅供敏感性核验）",
-    "minimum_expected_net_return": "删日后的最低均值（比例，1表示100%）",
-    "maximum_expected_net_return": "删日后的最高均值（比例，1表示100%）",
-    "maximum_absolute_change": "删日后最大均值变化（收益比例，1表示100%）",
-    "maximum_relative_change": "删日后最大相对变化（比例，1表示100%）",
-    "most_influential_signal_dates": "造成最大变化的信号日期",
     "sample_support": "样本支持状态", "probability_missing_bounds": "历史未知标签所对应频率可能范围（非未来区间）",
     "uncertainty": "按信号日期考虑相关性的估计不确定性", "date_summaries": "逐信号日期统计",
     "event_counts": "参考事件状态计数", "signal_events": "完整历史参考事件",
@@ -132,18 +212,18 @@ _LABELS = {
     "minimum_distinct_known_signal_dates": "公开估计所需不同已知信号日期数（工程门槛）",
     "supported": "工程样本支持是否满足", "reference_coverage": "参考结果覆盖率", "return_coverage": "结果覆盖率",
     "up_probability_95_interval": "上涨频率历史样本探索区间（非未来概率保证）",
-    "expected_net_return_95_interval": "期望净收益历史样本探索区间（非未来收益范围）",
+    "expected_next_day_return_95_interval": "预计次日涨幅历史样本探索区间（非未来收益范围）",
     "chronological_subperiods": "按时间顺序划分的四个子期", "historical_events": "成熟历史事件数",
     "reference_known_events": "参考结果已知事件数", "reference_unknown_events": "参考结果未知事件数",
-    "current_state_valid": "当前价量状态有效股数", "estimate_available": "逐股核估计可用股数",
-    "estimate_unavailable": "逐股核估计不可用股数", "historical_state_missing_events": "历史状态输入不足事件数",
+    "current_state_valid": "当前价量状态有效股数", "estimate_available": "同状态估计可用股数",
+    "estimate_unavailable": "同状态估计不可用股数", "historical_state_missing_events": "历史状态输入不足事件数",
     "scheduled_signal_dates": "计划信号日期数", "mature_signal_dates": "已成熟信号日期数",
     "immature_signal_dates": "尚未成熟信号日期数", "roundtrip_reference_cost_rate": "参考往返损耗比例",
     "notional_yuan": "参考名义金额（元）", "actual_fill_or_broker_cost_verified": "实际成交与券商费用是否核实",
     "historical_identity_or_limit_rules_verified": "历史证券身份与涨跌停规则是否核实",
-    "cost_assumption": "参考成本假设", "methodology": "连续特征与统计口径", "coverage": "输入及事件覆盖",
+    "cost_assumption": "费用处理口径", "methodology": "固定状态与统计口径", "coverage": "输入及事件覆盖",
     "expected_gross_return_difference": "本股减下一候选的期望毛收益差",
-    "composite_score_bps_difference": "本股减下一候选的期望净收益综合分差（基点）",
+    "composite_score_bps_difference": "本股减下一候选的预计次日涨幅综合分差（基点）",
     "probability_estimation": "期望分的样本与有效性检查",
     "score_lookback_sessions": "评分样本上限（交易日）", "recency_half_life_sessions": "时间权重半衰期（交易日）",
     "recency_formula": "时间权重及到期条件", "age_basis": "样本年龄口径", "parameter_status": "参数来源与验证状态",
@@ -162,7 +242,7 @@ _LABELS = {
     "reference_only": "仅为参考价格统计", "execution_verified": "实际成交是否核验",
     "future_probability_calibrated": "未来概率是否经过校准验证",
     "historical_pool": "历史统计样本范围（当前存续且当前条件有效，非历史完整市场）",
-    "expected_net_return_difference": "本股减下一候选的期望净收益差",
+    "expected_next_day_return_difference": "本股减下一候选的预计次日涨幅差",
     "up_probability_difference": "本股减下一候选的上涨概率差",
     "conditional_upside_mean_difference": "本股减下一候选的上涨条件均幅差",
     "conditional_downside_mean_difference": "本股减下一候选的非上涨条件均亏差",
@@ -170,7 +250,7 @@ _LABELS = {
     "atr14": "14日真实波幅（元）",
     "atr_distance": "距MA20的ATR倍数", "amount_ratio_5_15": "最近5日与此前15日均成交额之比",
     "missing_reasons": "无法计算的原因",
-    "current_index": "本股期望净收益综合分（基点）", "next_index": "下一候选期望净收益综合分（基点）", "index_difference": "期望净收益综合分差（基点）",
+    "current_index": "本股预计次日涨幅综合分（基点）", "next_index": "下一候选预计次日涨幅综合分（基点）", "index_difference": "预计次日涨幅综合分差（基点）",
     "current_percentiles": "本股原始量名次分位", "next_percentiles": "下一候选原始量名次分位",
     "current_groups": "本股价格与量价组分", "next_groups": "下一候选价格与量价组分",
     "raw_advantages": "本股领先的原始量", "raw_tradeoffs": "本股落后的原始量",
@@ -219,36 +299,63 @@ _LABELS = {
     "size_matched_stocks": "行业与规模均可核验的同行数", "target_size_verified": "本股规模是否核验",
 }
 _STATUS = {
+    "daily_leaderboards": "固定日终双榜", "fixed_daily_leaderboards": "涨幅前100与成交额前100合并去重",
     "up_up": "近5日上涨且最近1日上涨", "up_nonup": "近5日上涨但最近1日非上涨",
     "nonup_up": "近5日非上涨但最近1日上涨", "nonup_nonup": "近5日和最近1日均非上涨",
     "at_or_below_ma20": "价格不高于MA20", "above_ma20_within_2_atr": "高于MA20且不超过2ATR",
     "above_ma20_over_2_atr": "高于MA20超过2ATR", "increased": "近期成交额增加", "not_increased": "近期成交额未增加",
-    "basis_points": "基点", "next_session_open_to_fifth_session_close": "次交易日开盘至第5交易日收盘",
+    "basis_points": "基点", "signal_session_close_to_next_session_close": "信号日收盘至下一交易日收盘",
     "current_request_currently_eligible_stocks_not_reconstructed_historical_full_market": "本次取得的当前存续且当前条件有效样本，未重建历史完整市场",
     "reference_known": "参考价格结果已知", "reference_unknown": "参考价格结果未知",
     "engineering_support_gate_not_return_effectiveness_or_calibration": "只满足工程支持门槛，不代表收益有效或未来概率已校准",
     "circular_signal_date_block_bootstrap": "按信号日期连续分块重抽样（历史样本探索）",
     "recency_weighted_circular_signal_date_block_bootstrap": "保留时间权重、按信号日期连续分块重抽样（探索性）",
-    "fixed_state_recent_weighted_expected_net_return": "旧固定价量状态下的五交易日期望分",
-    "stock_specific_recent_kernel_expected_net_return": "逐股连续价量特征核加权的五交易日期望分",
-    "kernel_time_weighted_circular_signal_date_block_bootstrap": "保留核与时间联合权重、按日期连续分块重抽样（探索性）",
-    "compact_biweight": "有限范围双权核",
-    "kernel_effective_events_below_ten": "局部有效事件不足10个，尚不支持公开估计",
-    "kernel_effective_signal_dates_below_minimum": "按日期权重折算的有效日期不足门槛，不发布排序估计",
-    "kernel_signal_date_removal_unstable": "估计过度依赖少数信号日期，不发布排序估计",
-    "kernel_signal_date_removal_unavailable": "日期移除检查所需有效样本不足，不发布排序估计",
-    "fixed_weight_leave_one_or_two_signal_dates_out": "固定其余权重，穷举移除1至2个完整信号日期",
+    "fixed_state_recent_weighted_next_day_return": "固定24状态的时间加权次日涨幅估计",
+    "environment_conditioned_recent_weighted_next_day_return": "固定96状态的大盘与行业环境条件次日涨幅估计",
+    "environment_96": "96状态环境条件估计", "legacy_24": "旧24价量状态对照方法",
+    "market_up": "沪深300近20日上涨", "market_nonup": "沪深300近20日非上涨",
+    "industry_outperforming": "行业近20日收益高于沪深300",
+    "industry_not_outperforming": "行业近20日收益不高于沪深300",
+    "return_fraction_difference": "收益比例之差；展示时乘100为百分点",
+    "provided_by_environment_data_adapter": "由本次环境数据来源按权威交易日历核验收益两端",
+    "valid_endpoints_on_authoritative_calendar; no_fill_or_calendar_compression": "按权威交易日历定位起止日，仅要求两端收盘价有效；不填价格，不删除缺失日期",
+    "boundary_tie": "展示截止位置存在完全并列对象", "resolved": "已确定",
+    "environment:membership_unverified": "信号日所属行业尚未核验",
+    "environment:membership_reference_missing": "尚无有公开来源的行业参考归类",
+    "public_membership_reference_missing": "尚无有公开来源的行业参考归类",
+    "public_current_reference": "沿用公开来源的当前行业归类；历史日期作为近似参考",
+    "verified_signal_date_reference": "按信号日期核验的行业参考",
+    "industry_references_only": "仅保存有来源的行业参考笔记；行情和统计结果每次重新获取计算",
+    "environment:industry_code_missing": "缺少可核验的所属行业指数代码",
+    "latest_industry_21_session_window_incomplete": "行业指数最近21个交易日的完整窗口缺失或含无效行情，无法核验当前20日收益",
+    "latest_industry_return_endpoints_missing": "行业指数当前20日收益的起止日价格缺失或无效",
+    "required_return_endpoints_missing": "当前20日收益的起止日价格缺失或无效",
+    "invalid_close_at_return_endpoint": "收益起止日收盘价无效",
+    "duplicate_date_at_return_endpoint": "收益起止日存在重复行情，未任选其中一条",
+    "current_membership_unverified": "当前所属行业尚未核验",
+    "current_industry_return_missing": "当前行业指数20日收益缺失或无法核验",
+    "current_market_return_missing": "当前沪深300指数20日收益缺失或无法核验",
+    "official_membership_missing": "官方来源未取得该股行业归属记录",
+    "official_membership_dates_or_code_invalid": "官方行业归属记录的日期或分类代码无效",
+    "conflicting_membership_at_same_start_date": "同一生效起日存在冲突的行业归属记录",
+    "classification_to_index_mapping_unverified": "行业分类与行业指数的对应关系尚未核验",
+    "SW2021": "申万2021行业分类", "L2": "二级行业", "official_price_index": "官方价格指数",
+    "same_index_close / close_n_authoritative_sessions_earlier - 1; entire_window_valid": "同一行业指数收盘价相对前N个权威交易日收盘价的涨幅；整个窗口必须有效",
+    "unique_valid_dates_and_positive_finite_close; entire_return_window_required": "日期有效且唯一、收盘价为有限正数，并核验完整收益窗口",
+    "same_index_close / close_n_authoritative_sessions_earlier - 1; valid_endpoints": "同一行业指数收盘价相对前N个权威交易日收盘价的涨幅，仅要求两端真实有效",
+    "close / close_n_authoritative_sessions_earlier - 1; valid_endpoints": "收盘价相对前N个权威交易日收盘价的涨幅，仅要求两端真实有效",
+    "unique_valid_dates_and_positive_finite_close; return_endpoints_required": "收益两端日期有效且唯一，收盘价为有限正数；内部缺口保留，不压缩日历",
     "stable": "通过样本敏感性检查", "unstable": "未通过样本敏感性检查",
-    "future_five_session_expectation_score_and_net_return_only": "只展示未来五交易日期望分与预计净收益，内部概率明细留作审计",
-    "training_sample_unsupported": "当时已经到期的局部相似样本未达到支持门槛",
+    "next_day_expectation_score_and_return_only": "展示次日期望分与预计次日涨幅，内部概率明细留作审计",
+    "training_sample_unsupported": "当时已经到期的同状态样本不足10个不同已知结果日期",
     "evaluation_reference_unavailable": "本期实际参考结果缺失，不能成对比较",
     "exploratory_observed_sample_distribution_not_future_guarantee": "描述已观测样本的探索性不确定性，不保证未来结果",
     "observed_mature_event_unknown_label_bounds_not_future_confidence_interval": "历史成熟事件未知标签的可能范围，不是未来概率区间",
-    "expected_net_return_descending_exact_ties": "未舍入期望净收益降序，精确同值并列",
+    "expected_next_day_return_descending_exact_ties": "未舍入预计次日涨幅降序，精确同值并列",
     "fewer_than_ten_distinct_known_signal_dates": "已知结果不足10个不同信号日期，尚不支持公开估计",
     "probability_interval_degenerate_boundary_all_known_labels_equal": "已知结果全涨或全非涨，重抽样概率区间退化，不发布零宽区间",
     "probability_interval_degenerate_empirical_resamples": "历史重抽样上涨频率无变化，探索区间不可用",
-    "net_return_interval_degenerate_empirical_resamples": "历史重抽样净收益无变化，探索区间不可用",
+    "next_day_return_interval_degenerate_empirical_resamples": "历史重抽样次日涨幅无变化，探索区间不可用",
     "lt": "低于（不含上限）", "le": "不超过（含上限）", "not_evaluated": "尚未核验",
     "ok": "可用", "success": "可用", "partial": "部分可用", "unavailable": "不可用", "insufficient_data": "数据不足",
     "error": "程序错误", "program_error": "程序错误", "failed": "未完成", "not_applicable": "当前不适用", "not_used": "未使用",
@@ -272,7 +379,7 @@ _STATUS = {
 }
 _METADATA_CONTAINERS = {"data_provenance", "data_quality", "sources", "method", "configuration"}
 _HIDDEN_KEYS = {
-    # 概率与条件幅度留在结构化计算结果供审计，公开选股报告只展示期望分及净收益。
+    # 概率与条件幅度留在结构化计算结果供审计，公开选股报告只展示次日期望分及预计次日涨幅。
     "up_probability", "conditional_upside_mean", "conditional_downside_mean", "up_count", "non_up_count",
     "up_probability_difference", "conditional_upside_mean_difference", "conditional_downside_mean_difference",
     "probability_missing_bounds", "up_probability_95_interval", "probability_missing_bounds_meaning",
@@ -288,13 +395,13 @@ _HIDDEN_KEYS = {
 }
 _LEGACY_TEXT = re.compile(r"评分|综合分|技术状态分|技术分|得分|分数|置信度|权重|排名分|适配分|(?:暂不)?建议买入")
 _INDEX_SCORE_TERM = re.compile(r"推荐指数(?:的)?(?:评分|得分|分数)?")
-_NET_RETURN_SCORE_TERM = re.compile(r"期望净收益(?:的)?(?:综合评分|综合分|得分|分数)|(?:综合评分|综合分)(?=（期望净收益[，、]基点）)|(?:综合评分|综合分)(?=[^。！？\n]*(?:为|等于|=)\s*10000\s*[×*]\s*期望净收益)|(?:综合评分|综合分)(?=（基点）|\s*(?:为|是|[:：])?\s*[+-]?\d+(?:\.\d+)?\s*基点)")
+_NET_RETURN_SCORE_TERM = re.compile(r"预计次日涨幅(?:的)?(?:综合评分|综合分|得分|分数)|(?:综合评分|综合分)(?=（预计次日涨幅[，、]基点）)|(?:综合评分|综合分)(?=[^。！？\n]*(?:为|等于|=)\s*10000\s*[×*]\s*预计次日涨幅)|(?:综合评分|综合分)(?=（基点）|\s*(?:为|是|[:：])?\s*[+-]?\d+(?:\.\d+)?\s*基点)")
 _INDEX_WEIGHT_TERM = re.compile(r"(?:固定(?:公式)?(?:组分)?|组分|价格组(?:内部)?|量价组(?:内部)?)(?:的)?权重")
 _RECENCY_WEIGHT_TERM = re.compile(r"(?:时间|样本|近期样本|衰减|核|相似度|联合|核与时间联合)(?:的)?权重|权重(?=每(?:隔)?20个交易日减半)")
 _NEGATED_LEGACY_TERM = re.compile(
     r"(?:不是|并非|不代表|不等于|不作为|不产生|不输出|不发布|不计算|不使用)"
-    r"(?:收益率[、，或和与及\s]*)?(?:上涨概率[、，或和与及\s]*)?"
-    r"(?:置信度(?:分)?|评分|综合分|得分|分数|权重)"
+    r"(?:(?:收益率|上涨概率|概率)[、，或和与及\s]*)*"
+    r"(?:置信度(?:分)?|信心评分|评分|综合分|得分|分数|权重)"
 )
 _PERCENTILE_CONTAINERS = {"percentiles", "current_percentiles", "next_percentiles"}
 _VALIDATION_TITLES = {
@@ -357,11 +464,14 @@ def _text(value: Any) -> str:
 
 
 def qingli_jiu_pingfen_biaoshu(content: str) -> str:
-    """剔除旧评价体系；保护明确绑定期望净收益基点的综合分与否定声明。"""
+    """剔除旧评价体系；保护明确绑定预计次日涨幅基点的综合分与否定声明。"""
     parts = re.split(r"(?<=[。！？\n])", str(content or ""))
+    next_day_context = any(term in str(content or "") for term in ("预计次日涨幅", "次日期望分", "预计下一交易日收盘涨幅"))
     retained: list[str] = []
     for part in parts:
         checked = _RECENCY_WEIGHT_TERM.sub("", _NET_RETURN_SCORE_TERM.sub("", _NEGATED_LEGACY_TERM.sub("", part)))
+        if next_day_context and any(term in part for term in ("并列", "同分", "精确相同")):
+            checked = checked.replace("分数", "")
         if "推荐指数" in part or "固定公式" in part:
             checked = _INDEX_SCORE_TERM.sub("", checked)
             checked = _INDEX_WEIGHT_TERM.sub("", checked)
@@ -371,6 +481,15 @@ def qingli_jiu_pingfen_biaoshu(content: str) -> str:
 
 
 def _label(key: str) -> str:
+    missing_input = re.fullmatch(r"(?:environment:)?([A-Za-z0-9_]+):missing_or_invalid_(continuous_input|return_input)", key)
+    if missing_input:
+        metric = missing_input.group(1)
+        definition = factor_definition(metric)
+        label = definition.get("label") or metric
+        if label == metric:
+            label = _LABELS.get(metric, metric.replace("_", " "))
+        reason = "所需连续交易日输入缺失或无效" if missing_input.group(2) == "continuous_input" else "必要收益输入缺失或无效，收益两端按权威交易日历核验"
+        return f"{label}：{reason}"
     definition = factor_definition(key)
     if definition.get("label") and definition["label"] != key:
         return definition["label"]
@@ -380,11 +499,15 @@ def _label(key: str) -> str:
         return f"{re.sub(r'[^0-9]', '', key)}日均线（元）"
     if re.fullmatch(r"\d+d", key):
         return f"近{key[:-1]}日收益（比例，1表示100%）"
-    return key.replace("_", " ")
+    return _STATUS.get(key, key.replace("_", " "))
 
 
 def _value(value: Any, *, field: str | None = None) -> str:
     if value is None:
+        if field == "first_decisive_field":
+            return "无（所有比较项精确相同）"
+        if field in {"first_omitted", "comparison_to_cutoff"}:
+            return "无（本次合格对象均已展示）"
         return "缺失（未取得或无法计算）"
     if isinstance(value, bool):
         return "是" if value else "否"
@@ -393,13 +516,17 @@ def _value(value: Any, *, field: str | None = None) -> str:
             return "缺失（不是有效有限数）"
         return str(value) if isinstance(value, int) else f"{value:.12g}"
     text = _text(value)
+    if re.fullmatch(r"(?:environment:)?[A-Za-z0-9_]+:missing_or_invalid_(?:continuous_input|return_input)", text):
+        return _label(text)
+    if field == "persistence" and text == "none":
+        return "不持久化市场数据"
     if field == "freshness":
         return {"fresh": "新近信号", "recent": "近期信号", "stale": "陈旧信号"}.get(text, text) or "未提供"
     if field == "timeliness_status" and text == "not_requested":
         return "本次未核验当前时效"
     if field in {"current_quote_status", "realtime_status"} and text == "not_required":
         return "本次不要求当前行情核验"
-    if field in {"raw_advantages", "raw_tradeoffs"}:
+    if field in {"raw_advantages", "raw_tradeoffs", "first_decisive_field", "supplemental_missing_fields"}:
         return _label(text)
     return _STATUS.get(text, text) or "未提供"
 
@@ -417,7 +544,7 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_
                 "percentile" if key in _PERCENTILE_CONTAINERS
                 else "historical_frequency_bound" if key == "probability_missing_bounds"
                 else "sample_probability_interval" if key == "up_probability_95_interval"
-                else "sample_return_interval" if key == "expected_net_return_95_interval"
+                else "sample_return_interval" if key == "expected_next_day_return_95_interval"
                 else "fraction_metadata" if key in {"return_coverage", "reference_coverage", "roundtrip_reference_cost_rate"}
                 else "coverage" if key == "feature_coverage"
                 else "metadata" if key in _METADATA_CONTAINERS
@@ -432,11 +559,19 @@ def _tree(value: Any, prefix: str = "", metric_key: str | None = None, *, value_
                 observation_key = f"ret_{value['window']}" if key == "price_return" else f"tdx_control_change_{value['window']}d"
             elif key in {"recommendation_index", "current_index", "next_index", "index_difference"}:
                 observation_key = "composite_score_bps"
+            elif key == "value_difference" and value.get("first_decisive_field"):
+                observation_key = str(value["first_decisive_field"])
+                if observation_key == "expected_next_day_return":
+                    observation_key = "expected_next_day_return_difference"
+            elif key == "value_difference" and "first_decisive_field" in value and value["first_decisive_field"] is None:
+                child = "不适用（所有比较项精确相同，没有决胜指标）"
             lines.extend(_tree(child, path, observation_key, value_kind=child_kind))
         return lines or ([f"- {prefix}：未返回可用字段。"] if prefix else [])
     if isinstance(value, (list, tuple)):
         if not value:
             return [f"- {prefix}：未列出项目。"]
+        if metric_key in {"date_summaries", "date_checks"} and all(isinstance(row, dict) for row in value):
+            return _dated_statistics_table(value, prefix)
         lines = []
         for index, child in enumerate(value, start=1):
             lines.extend(_tree(child, f"{prefix} {index}", metric_key, value_kind=value_kind))
@@ -529,13 +664,43 @@ def _identity(candidate: dict[str, Any], default: str) -> str:
     return f"{name}（{code}）" if name and code else name or code or default
 
 
-def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: bool) -> list[tuple[str, str]]:
+def _dated_statistics_table(records: list[dict[str, Any]], title: str) -> list[str]:
+    """每个日期的每个公开字段完整保留，列定义只展示一次。"""
+    fields = list(dict.fromkeys(key for row in records for key in row if key not in _HIDDEN_KEYS and not key.startswith("_")))
+    definitions = {key: factor_definition(key) for key in fields}
+    headers, notes = [], []
+    for key in fields:
+        definition = definitions[key]
+        known = definition.get("label") != key
+        unit = "%" if key == "return_coverage" else definition.get("unit") if known else None
+        headers.append(_label(key) + (f"（{unit}）" if unit else ""))
+        if known and definition.get("meaning"):
+            notes.append(f"{_label(key)}：{definition['meaning']}")
+    lines = [f"\n{title}（共{len(records)}个日期，保留全部记录）\n", "| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in fields) + " |"]
+    for row in records:
+        cells = []
+        for key in fields:
+            value = row.get(key)
+            definition = definitions[key]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                scale = 100 if key == "return_coverage" else definition.get("display_scale", 1)
+                value *= scale
+            if isinstance(value, (dict, list, tuple)):
+                value = "；".join(line.removeprefix("- ") for line in _tree(value))
+            cells.append(_table_cell(_value(value, field=key)))
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.extend(["", *notes])
+    return lines
+
+
+def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: bool,
+                        shared_statistics: dict[str, Any] | None = None) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     estimate_fields = {key: candidate[key] for key in (
-        "composite_score_bps", "expected_net_return",
+        "composite_score_bps", "expected_next_day_return",
     ) if key in candidate}
     if estimate_fields:
-        sections.append((identity + " / 未来5个交易日期望分与预计净收益", "\n".join(_tree(estimate_fields))))
+        sections.append((identity + " / 下一交易日期望分与预计次日涨幅", "\n".join(_tree(estimate_fields))))
     summary = candidate.get("diagnosis_summary")
     if candidate.get("research_question"):
         sections.append((identity + " / 用户观点核验", "\n".join(_tree(candidate["research_question"]))))
@@ -560,7 +725,16 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
         elif evidence_context is not None:
             sections.append((identity + " / 现有证据详解", "\n".join(_tree(evidence_context))))
     if "selection_analysis" in candidate:
-        sections.append((identity + " / 选股条件与比较依据", "\n".join(_tree(candidate["selection_analysis"]))))
+        selection = candidate["selection_analysis"]
+        analysis = selection.get("recommendation_index_analysis") if isinstance(selection, dict) else None
+        code = candidate.get("ts_code")
+        if (isinstance(analysis, dict) and shared_statistics and code in shared_statistics
+                and analysis.get("statistics") == shared_statistics[code]):
+            selection = {**selection, "recommendation_index_analysis": {
+                **{key: value for key, value in analysis.items() if key != "statistics"},
+                "statistics_reference": f"期望分的样本与有效性检查 / {code}；此处与该完整统计完全相同，不重复展开",
+            }}
+        sections.append((identity + " / 选股条件与比较依据", "\n".join(_tree(selection))))
     for key, title in (
         ("stock", "股票身份"), ("technical_summary", "技术指标与结构"),
         ("market_cap_check", "市值条件与原始值"),
@@ -594,15 +768,37 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
         identity = _identity(stock if isinstance(stock, dict) else {}, _text(payload.get("query")) or "当前股票")
         return _candidate_sections(payload, identity, single=True)
     sections: list[tuple[str, str]] = []
+    shared_statistics = (payload.get("probability_estimation") or {}).get("stock_statistics") or {}
     for key, title in (("scope", "选股范围及核验"), ("candidate_counts", "本次筛选与复核数量"),
                        ("market_cap_filter", "市值筛选条件及核验"),
                        ("user_conditions", "用户明确选股条件"), ("comparison_coverage", "实际比较覆盖"),
                        ("selection_limits", "复核范围与停止原因"), ("selection_outcome", "筛选结果"),
-                       ("selection_methodology", "选股方法"), ("probability_estimation", "期望分的样本与有效性检查"), ("diagnosis_validity", "诊断时点"),
+                       ("selection_methodology", "选股方法"), ("environment_data", "大盘与行业环境数据覆盖及来源"),
+                       ("cutoff_comparison", "展示边界及完整并列名单"),
+                       ("selection_concentration", "展示候选的行业及共享估计集中情况"),
+                       ("probability_estimation", "期望分的样本与有效性检查"), ("diagnosis_validity", "诊断时点"),
                        ("data_provenance", "公共数据来源"), ("filter_summary", "范围过滤记录")):
         if key in payload:
             kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
-            sections.append((title, "\n".join(_tree(payload[key], value_kind=kind))))
+            value = payload[key]
+            if key == "probability_estimation" and shared_statistics:
+                compact, seen_dates = {}, []
+                for code, stats in shared_statistics.items():
+                    if not isinstance(stats, dict):
+                        compact[code] = stats
+                        continue
+                    dates = stats.get("date_summaries")
+                    previous = next((other for other, rows in seen_dates if rows == dates), None) if dates else None
+                    compact[code] = ({**{field: child for field, child in stats.items() if field != "date_summaries"},
+                                      "date_summaries_reference": f"{previous}；同状态逐日统计完全相同，见该对象全部日期明细"}
+                                     if previous else stats)
+                    if dates and not previous:
+                        seen_dates.append((code, dates))
+                value = {**value, "stock_statistics": compact}
+            elif key == "data_provenance" and isinstance(value, dict) and value.get("scope") == payload.get("scope"):
+                value = {**{field: child for field, child in value.items() if field != "scope"},
+                         "scope_reference": "选股范围及核验；来源和逐股范围记录完全相同，不重复展开"}
+            sections.append((title, "\n".join(_tree(value, value_kind=kind))))
     targets: list[tuple[dict[str, Any], str]] = []
     if isinstance(payload.get("primary"), dict):
         targets.append((payload["primary"], "研究候选 1"))
@@ -612,7 +808,8 @@ def _report_sections(payload: dict[str, Any]) -> list[tuple[str, str]]:
     if not targets and isinstance(payload.get("diagnostic_candidates"), list):
         targets.extend((candidate, "观察对象（未通过选股条件）") for candidate in payload["diagnostic_candidates"][:1] if isinstance(candidate, dict))
     for candidate, role in targets:
-        sections.extend(_candidate_sections(candidate, role + "：" + _identity(candidate, "未命名股票"), single=False))
+        sections.extend(_candidate_sections(candidate, role + "：" + _identity(candidate, "未命名股票"), single=False,
+                                             shared_statistics=shared_statistics))
     return sections
 
 
@@ -734,7 +931,25 @@ def goujian_fenxi_anquan_huitui(payload: dict[str, Any] | None) -> str:
         if status == "partial":
             lead += "部分来源或指标缺失，以下保留可用证据和具体缺口。"
     elif payload.get("recommendation_available") is True:
-        lead = "以下候选按未来5个交易日期望分降序排列，期限为下一交易日开盘至第五交易日收盘。100分对应预计净收益1%；评分用最近120交易日内已到期事件，时间衰减半衰期为20交易日，并按各股连续价量特征的相似度赋权。有效日期不足10或删去任意1至2个信号日导致均值变化超过50%的估计不参与排序。只在精确同值时并列；近期逐股检查、当前依据及缺口见报告。"
+        methodology = payload.get("selection_methodology") or {}
+        probability_methodology = (payload.get("probability_estimation") or {}).get("methodology") or {}
+        method = methodology.get("method") or probability_methodology.get("method")
+        environment_method = method == "environment_conditioned_recent_weighted_next_day_return"
+        lead = "以下候选按未舍入预计次日涨幅降序排列，观察信号日收盘至下一交易日收盘的同源前复权价格变化，不扣交易费用。次日期望分100分对应预计涨幅1%；仅使用最近120交易日内已到期的同状态事件，时间权重半衰期20交易日，同状态至少10个不同已知结果日期才公开估计。"
+        if environment_method:
+            lead += (
+                "本次使用固定96状态：24种价量状态，结合沪深300近20日收益正／非正、申万2021二级行业指数近20日相对沪深300收益正／非正。"
+                "预计涨幅精确相同者保留并列收益名次，再依次按行业20日相对大盘收益、个股20日相对行业收益确定观察优先级；观察优先级不改变预测。"
+                "旧24价量状态估计单独作为对照，不与新估计混排；新环境或样本不足时不以旧估计补位。"
+            )
+            cutoff = payload.get("cutoff_comparison") or {}
+            if cutoff.get("unique_selection") is False:
+                lead += "展示截止位置仍存在预计涨幅和两项观察指标均相同的对象，完整并列名单见边界章节；本次展示不能称为唯一前几名。"
+        else:
+            lead += "本次统计方法以报告实际返回口径为准，同状态及其他预计涨幅精确同值明确并列，代码展示顺序不表示质量优劣。"
+        lead += "近期逐期检查、当前依据、比较原值及缺口见报告；历史估计不代表已验证的未来表现。"
+        if (payload.get("scope") or {}).get("scope_type") == "daily_leaderboards":
+            lead = "本次仅比较同一完整交易日涨幅前100与成交额前100合并去重的候选池，历史统计也只使用其中通过必要核验的股票；不代表全市场最优，不从榜外补位。" + lead
         if status == "partial":
             lead += "部分来源或补充证据缺失，报告保留具体缺口和实际复核范围。"
     else:

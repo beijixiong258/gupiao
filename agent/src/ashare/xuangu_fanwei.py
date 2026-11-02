@@ -18,9 +18,11 @@ from src.ashare.dongcai_api import DONGCAI_PUBLIC_TOKEN, dongcai_fenye_duqu
 from src.ashare.fanwei_faxian import BankuaiLeixing, ShichangFanwei
 from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 from src.ashare.wangluo_kehu import GongkaiShujuHTTPKehu
+from src.ashare.xuangu_bangdan import LEADERBOARD_NAME, LEADERBOARD_SCOPE, goujian_shuangbang_chi
 
 
 class FanweiLeixing(str, Enum):
+    SHUANGBANG = LEADERBOARD_SCOPE
     QUAN_SHICHANG = "all_market"
     ZHUBAN = "main_board"
     MINGMING_FANWEI = "named_scope"
@@ -42,7 +44,7 @@ class FenxiFanwei:
         mingcheng: str | None,
         gupiao: str | None = None,
     ) -> "FenxiFanwei":
-        key = str(leixing or "all_market").strip().lower()
+        key = str(leixing or LEADERBOARD_SCOPE).strip().lower()
         all_aliases = {"all", "all_market", "quan_shichang", "全市场"}
         single_aliases = {
             "single_stock",
@@ -65,13 +67,17 @@ class FenxiFanwei:
             "板块",
             "概念",
         }
-        if key in all_aliases and gupiao:
+        if key in all_aliases | {LEADERBOARD_SCOPE} and gupiao:
             query = " ".join(str(gupiao).split()) or None
             if not query:
                 raise ValueError("按单只股票分析时，请提供股票名称或 6 位股票代码")
             return cls(leixing=FanweiLeixing.DANGU_GUPIAO, gupiao=query)
         if key in all_aliases:
             return cls(leixing=FanweiLeixing.QUAN_SHICHANG)
+        if key == LEADERBOARD_SCOPE:
+            if mingcheng:
+                raise ValueError("固定双榜范围不能同时指定行业或其他命名范围")
+            return cls(leixing=FanweiLeixing.SHUANGBANG)
         if key == FanweiLeixing.ZHUBAN.value:
             if gupiao:
                 raise ValueError("整个沪深主板范围不能同时指定单只股票")
@@ -82,7 +88,7 @@ class FenxiFanwei:
                 raise ValueError("按单只股票分析时，请提供股票名称或 6 位股票代码")
             return cls(leixing=FanweiLeixing.DANGU_GUPIAO, gupiao=query)
         if key not in named_aliases:
-            raise ValueError("分析范围只能是全市场、整个沪深主板、单股或一个用日常语言描述的股票范围")
+            raise ValueError("分析范围只能是固定日终双榜、全市场、整个沪深主板、单股或一个用日常语言描述的股票范围")
         name = " ".join(str(mingcheng or "").split()) or None
         if not name:
             raise ValueError("按特定范围分析时，请提供一个日常名称")
@@ -136,6 +142,22 @@ class QuanShichangHouXuanChi:
                 "ambiguity_resolution": "not_applicable",
             },
         )
+
+
+class ShuangBangHouXuanChi:
+    def goujian(self, fanwei: YijiexiFenxiFanwei, context: FenxiShujuShangxiawen) -> HouXuanChiJieguo:
+        del fanwei
+        clock = context.shichang_shizhong()
+        if clock.get("session_status") not in {"post_close", "non_trading_day", "pre_market"}:
+            return HouXuanChiJieguo(pd.DataFrame(), {
+                "status": "unavailable", "scope_type": LEADERBOARD_SCOPE, "scope_name": LEADERBOARD_NAME,
+                "error_code": "leaderboard_market_not_closed", "retryable": True,
+                "error": "固定双榜只使用闭市后的完整日线；当前交易阶段尚不满足，需闭市后重试", "market_clock": clock,
+            })
+        as_of = context.zuixin_wanzheng_jiaoyiri()
+        data, metadata = context.zuixin_hengjiemian()
+        selected, scope_meta = goujian_shuangbang_chi(data, metadata, as_of)
+        return HouXuanChiJieguo(selected, scope_meta)
 
 
 def _jiaoyiban(value: Any) -> str | None:
@@ -321,6 +343,7 @@ class MingmingFanweiHouXuanChi:
 
 def huoqu_houxuanchi_celue(fanwei: YijiexiFenxiFanwei) -> HouXuanChiCelue:
     strategies: dict[FanweiLeixing, HouXuanChiCelue] = {
+        FanweiLeixing.SHUANGBANG: ShuangBangHouXuanChi(),
         FanweiLeixing.QUAN_SHICHANG: QuanShichangHouXuanChi(),
         FanweiLeixing.ZHUBAN: ZhubanHouXuanChi(),
         FanweiLeixing.MINGMING_FANWEI: MingmingFanweiHouXuanChi(),

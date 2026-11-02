@@ -86,12 +86,14 @@ def goujian_fenxi_yinzi_mianban(
     latest_only: bool = False,
     technical_summaries: dict[str, dict[str, Any]] | None = None,
     macd_structure_config: dict[str, Any] | None = None,
+    benchmark_output: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """从批量前复权日线构造不含未来标签的分析因子面板。"""
     try:
         return _goujian_fenxi_yinzi_mianban(
             histories, profiles, source=source, calendar=calendar, latest_only=latest_only,
             technical_summaries=technical_summaries, macd_structure_config=macd_structure_config,
+            benchmark_output=benchmark_output,
         )
     except FenxiJisuanYichang:
         raise
@@ -108,6 +110,7 @@ def _goujian_fenxi_yinzi_mianban(
     latest_only: bool,
     technical_summaries: dict[str, dict[str, Any]] | None,
     macd_structure_config: dict[str, Any] | None,
+    benchmark_output: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     profile_by_code = (
         profiles.drop_duplicates("ts_code").set_index("ts_code").to_dict("index")
@@ -161,6 +164,7 @@ def _goujian_fenxi_yinzi_mianban(
         panel,
         source=source,
         calendar=calendar,
+        benchmark_output=benchmark_output,
     )
     factor_meta = dict(factor_meta)
     factor_meta["warnings"] = warnings + [str(value) for value in factor_meta.get("warnings", [])]

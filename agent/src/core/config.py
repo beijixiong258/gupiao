@@ -17,6 +17,7 @@ _PACKAGED_CONFIG = Path(__file__).resolve().parents[1] / "lianghua_peizhi.json"
 # 保留源码根目录的显式配置覆盖，默认配置随 Python 包一同发布。
 DEFAULT_CONFIG_PATH = _SOURCE_CONFIG if _SOURCE_CONFIG.is_file() else _PACKAGED_CONFIG
 RECYCLE_BIN_PATH = Path.home() / "Desktop" / "智能体回收站" / "垃圾桶"
+INDUSTRY_REFERENCE_PATH = Path.home() / ".gupiaoyanjiu" / "industry_references.json"
 _ENV_CANDIDATES = (
     Path.home() / ".gupiaoyanjiu" / ".env",
     AGENT_DIR / ".env",

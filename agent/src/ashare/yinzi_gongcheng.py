@@ -211,47 +211,66 @@ def independent_factor_features(members: Iterable[str]) -> tuple[str, ...]:
         if feature not in FACTOR_ALIASES and feature not in FACTOR_DIAGNOSTIC_ONLY
     )
 
+ENVIRONMENT_FEATURES = tuple(f"{basis}_ret_{period}" for basis in
+    ("market", "industry", "stock", "industry_excess", "stock_excess") for period in (5, 20))
+
+
 def factor_definition(feature: str) -> dict[str, Any]:
     """指标名称和单位的唯一说明，数值仍完全由量化程序计算。"""
+    if feature in ENVIRONMENT_FEATURES:
+        basis, period_text = feature.rsplit("_ret_", 1)
+        period = int(period_text)
+        names = {"market": "沪深300", "industry": "申万2021二级行业指数", "stock": "个股",
+                 "industry_excess": "行业相对沪深300", "stock_excess": "个股相对所属行业"}
+        excess = basis.endswith("excess")
+        formula = (f"industry_ret_{period}-market_ret_{period}" if basis == "industry_excess"
+                   else f"stock_ret_{period}-industry_ret_{period}" if basis == "stock_excess"
+                   else f"{basis}.close[t]/{basis}.close[t-{period}]-1")
+        return {"label": f"{names[basis]}近{period}日{'收益差' if excess else '收益'}",
+                "unit": "百分点" if excess else "%", "display_scale": 100,
+                "meaning": "实际历史表现；行业绝对下跌但相对领先仅表示抗跌。两段相对收益存在代数关联，不作为独立确认或额外预测收益",
+                "formula": formula, "window": f"截至信号日的{period}个权威交易间隔",
+                "minimum_observations": f"权威日历覆盖{period + 1}个交易日位置，仅要求相隔{period}个交易日的两端收盘价有效；行业允许采用有公开来源的当前参考归类并标记历史近似，个股使用同源前复权价格，指数使用发布的价格指数",
+                "missing_rule": "起止日缺失、重复或价格无效，以及完全没有有据的行业参考时留空；历史行业精确归属缺失可沿用当前归类并标记近似；不填价格、不删除日历位置",
+                "source_basis": "独立行业指数与沪深300及本股日线；具体来源、分类修订和截止日见environment_data"}
     conditional_metrics = {
-        "up_probability": ("内部上涨机会估计", "%", 100, "sum(w*I(r>0))/sum(w)", "最近120个交易日内成熟事件按逐股特征相似度及20交易日半衰期联合加权的正收益占比；仅供内部计算审计，不在选股报告列出"),
-        "conditional_upside_mean": ("内部上涨条件平均涨幅", "%", 100, "sum(w*r | r>0)/sum(w | r>0)", "与总体估计采用同一核与时间联合权重；没有上涨样本时留空，仅供内部计算审计"),
-        "conditional_downside_mean": ("内部非上涨条件平均亏损幅度", "%", 100, "sum(w*(-r) | r<=0)/sum(w | r<=0)", "与总体估计采用同一核与时间联合权重，平盘损失计零；空条件组留空，仅供内部计算审计"),
-        "expected_gross_return": ("五交易日期望毛收益估计", "%", 100, "sum(w*r)/sum(w)=p*G-(1-p)*L", "最近120个交易日内成熟事件按逐股核权重及20交易日半衰期联合加权的毛收益均值；内部计算审计"),
-        "expected_net_return": ("未来5个交易日预计净收益", "%", 100, "sum(w*((1+r)*(1-reference_cost)-1))/sum(w)", "最近120个交易日内成熟事件按逐股核权重及20交易日半衰期联合加权，综合上涨机会、幅度、非上涨损失及成本；期限为下一交易日开盘至第五交易日收盘，属于估计而非保证"),
-        "composite_score_bps": ("未来5个交易日期望分", "基点", 1, "10000*expected_net_return", "100分对应预计净收益1%，可为负；仅按未舍入预计净收益排序，不是0—100评分"),
-        "recommendation_index": ("未来5个交易日期望分（兼容字段）", "基点", 1, "10000*expected_net_return", "与composite_score_bps相同，保留既有接口名称"),
-        "atr_distance": ("收盘距MA20的ATR距离", "倍", 1, "(close-MA20)/ATR14", "价格伸展的连续核估计特征；≤0、(0,2]、>2只用于状态说明，不是自动看跌或风险过滤"),
-        "amount_ratio_5_15": ("近5日与此前15日均额比", "倍", 1, "mean(amount[-5:])/mean(amount[-20:-5])", "比较互不重叠的两个真实成交额窗口；核估计取其自然对数，不假定越大收益越好"),
+        "up_probability": ("内部次日上涨频率估计", "%", 100, "sum(w*I(r>0))/sum(w)", "最近120交易日内成熟的同状态次日收盘涨幅，按20交易日半衰期加权；仅供内部审计，不在选股报告列出"),
+        "conditional_upside_mean": ("内部上涨条件平均涨幅", "%", 100, "sum(w*r | r>0)/sum(w | r>0)", "同状态样本采用相同时间权重；没有上涨样本时留空，仅供内部审计"),
+        "conditional_downside_mean": ("内部非上涨条件平均跌幅", "%", 100, "sum(w*(-r) | r<=0)/sum(w | r<=0)", "同状态样本采用相同时间权重，平盘计零；空条件组留空，仅供内部审计"),
+        "expected_gross_return": ("内部次日收盘涨幅均值", "%", 100, "sum(w*r)/sum(w)", "与expected_next_day_return相同，保留内部涨跌分解审计；不扣费用"),
+        "expected_next_day_return": ("预计次日涨幅", "%", 100, "sum(w*(next_session_close/signal_session_close-1))/sum(w)", "信号日收盘至下一权威交易日收盘，同源前复权价格比；最近120交易日内成熟同状态事件按20交易日半衰期加权，不扣费用，不代表实际交易收益"),
+        "composite_score_bps": ("次日期望分", "基点", 1, "10000*expected_next_day_return", "100分对应预计次日涨幅1%，可为负；只按未舍入预计次日涨幅排序，不是0—100评分"),
+        "recommendation_index": ("次日期望分（兼容字段）", "基点", 1, "10000*expected_next_day_return", "与composite_score_bps相同，保留既有接口名称"),
+        "atr_distance": ("收盘距MA20的ATR距离", "倍", 1, "(close-MA20)/ATR14", "按≤0、(0,2]、>2划分固定位置状态，不假定哪种状态更好"),
+        "amount_ratio_5_15": ("近5日与此前15日均额比", "倍", 1, "mean(amount[-5:])/mean(amount[-20:-5])", "比较互不重叠的真实成交额窗口，按>1和≤1划分状态，不预设收益方向"),
+        "log_amount_ratio_5_15": ("近5日与此前15日均额比的自然对数", "无量纲", 1, "ln(amount_ratio_5_15)", "历史诊断定义，不参与当前固定状态评分；均额比非正或缺失时不可用"),
     }
-    conditional_metrics["log_amount_ratio_5_15"] = ("近5日与此前15日均额比的自然对数", "无量纲", 1, "ln(amount_ratio_5_15)", "以自然对数表达连续成交额变化，供联合距离计算；均额比非正或缺失时不可用")
     check_metrics = {
-        "estimated_net_return": "逐期检查当时的预计净收益", "realized_net_return": "逐期检查实际参考净收益",
-        "mean_estimated_net_return": "逐期预计净收益均值", "mean_realized_net_return": "逐期实际参考净收益均值",
-        "prediction_error": "当时估计减实际参考净收益", "mean_prediction_error": "逐期估计误差均值",
-        "mean_absolute_error": "逐期估计绝对误差均值",
+        "estimated_next_day_return": "逐期检查当时的预计次日涨幅", "realized_next_day_return": "逐期检查实际次日涨幅",
+        "mean_estimated_next_day_return": "逐期预计次日涨幅均值", "mean_realized_next_day_return": "逐期实际次日涨幅均值",
+        "prediction_error": "当时预计涨幅减实际涨幅", "mean_prediction_error": "逐期涨幅估计误差均值",
+        "mean_absolute_error": "逐期涨幅估计绝对误差均值",
     }
     if feature in check_metrics:
         return {"label": check_metrics[feature], "unit": "百分点" if "error" in feature else "%", "display_scale": 100,
-                "formula": "当时仅用已到期样本估计，与该股随后五交易日实际参考净收益逐日期配对；各日期等权汇总",
-                "meaning": "最近60个交易日的固定口径逐期参考检查，追溯当前选中个股，保留当前存续资格池与事后选股偏差；不是策略或组合回测，也不是未来保证",
-                "window": "最近60交易日内已到期的五交易日参考事件", "minimum_observations": "每期局部估计至少10个不同已知结果日期及10个有效事件",
-                "missing_rule": "估计或对应实际参考结果缺失时，该期不进入成对误差汇总"}
+                "formula": "仅用当时已到期的同状态样本估计次日收盘涨幅，与实际次日收盘涨幅逐日配对；不扣费用，各日期等权汇总",
+                "meaning": "最近60交易日逐期检查当前选中个股，保留当前存续资格池与事后选股偏差；不能代替事前固定预计值后的核验",
+                "window": "最近60交易日内已到期的次日收盘涨幅事件", "minimum_observations": "每期同状态样本至少10个不同已知结果信号日期",
+                "missing_rule": "估计或实际结果缺失时，该期不进入成对误差汇总，未知不补零"}
     if feature.endswith("_difference") and feature.removesuffix("_difference") in conditional_metrics:
         original = factor_definition(feature.removesuffix("_difference"))
         return {**original, "label": original["label"] + "差值",
                 "unit": "百分点" if original["display_scale"] == 100 else original["unit"],
-                "meaning": "同一口径下本候选估计减去下一候选估计；点估计差不代表已证实的收益或概率优势",
+                "meaning": "同一口径下本候选估计减去下一候选估计；点估计差不代表已证实的未来涨幅优势",
                 "formula": "current." + feature.removesuffix("_difference") + "-next." + feature.removesuffix("_difference")}
     if feature in conditional_metrics:
         label, unit, scale, formula, meaning = conditional_metrics[feature]
         return {
-            "label": label, "unit": unit, "display_scale": scale, "meaning": meaning,
-            "formula": formula,
-            "window": "信号日状态使用20条连续日线；评分只用最近120交易日内已到期事件，联合权重w=2**(-信号年龄/20)*max(1-d_squared/9,0)**2，价格参考为次日开盘至第五交易日收盘",
-            "minimum_observations": "20条权威日历对齐的有效价量，ATR及成交额分母为正；概率和收益排序的局部样本至少10个不同已知信号日期及10个有效事件，这是工程支持口径而非收益验证",
-            "missing_rule": "必要状态或样本不足时不发布排序估计，不补50%或旧强势分；条件空组均值留空，不妨碍已知总体均值计算；未知事件单列",
-            "source_basis": "同一请求、同一核验资格池的真实OHLC和成交额；逐股连续特征核加权统计，24状态仅作说明，不训练、不寻优、不持久化市场输入",
+            "label": label, "unit": unit, "display_scale": scale, "meaning": meaning, "formula": formula,
+            "window": "状态使用20条连续日线；每日信号的次日收盘结果到期后才参与估计，信号年龄<120，权重w=2**(-信号年龄/20)",
+            "minimum_observations": "状态需20条权威日历对齐的有效OHLC与非负成交额，ATR及5/15日均额为正；公开涨幅估计需同状态至少10个不同已知结果日期，有效样本量不另设门槛",
+            "missing_rule": "必要状态或样本不足时不发布估计，不补50%或旧强势分；条件空组均值留空，不妨碍总体均值计算；未知事件单列",
+            "source_basis": "同一请求资格池的真实同源前复权OHLC和成交额；默认24价量状态与大盘、行业方向组成96种联合条件，旧24模式仅作独立对照。固定时间权重，不训练、不寻优、不落盘",
         }
     if feature == "tdx_control_raw" or feature == "tdx_control_range_position" or feature in {
         "tdx_control_change_1d", "tdx_control_change_5d", "tdx_control_change_20d",
@@ -362,7 +381,7 @@ def _calculation_definition(feature: str, meaning: str) -> dict[str, Any]:
     fixed = {
         "ma_trend_5_20": ("MA5/MA20-1", "5和20条日线", "20条连续有效收盘价"),
         "ma_5_20_gap_change": ("diff(close/MA5-close/MA20)", "连续两日的5和20日均线", "21条连续有效收盘价"),
-        "trend_slope_20": ("ln(close/close[-20])/20", "20个收益间隔", "21条连续有效收盘价"),
+        "trend_slope_20": ("ln(close/close[-20])/20", "20个收益间隔", "权威日历覆盖21个交易日位置，起止两端收盘价有效"),
         "trend_fit_quality_20": ("abs(ln(close/close[-20]))/(std(ret1,ddof=1)*sqrt(20))", "20个收益间隔", "21条连续收盘价且收益标准差大于零"),
         "directional_efficiency_20": ("(close-close[-20])/sum(abs(diff(close)),20)", "20个连续交易间隔", "21条经权威日历对齐的连续有效正收盘价且绝对路径大于零；全平窗口留空"),
         "up_amount_dominance_20": ("sum(amount_yuan*sign(diff(close)),20)/sum(amount_yuan,20)", "20个连续交易间隔及其后20日成交额", "21条经权威日历对齐的连续有效正收盘价、20条真实非负成交额且总额大于零；平盘方向贡献为零"),
@@ -404,7 +423,7 @@ def _calculation_definition(feature: str, meaning: str) -> dict[str, Any]:
         formula, window, minimum = fixed[feature]
     elif feature.startswith("ret_") and feature.removeprefix("ret_").isdigit():
         period = int(feature.rsplit("_", 1)[1])
-        formula, window, minimum = f"close/close[-{period}]-1", f"{period}个收益间隔", f"{period + 1}条连续有效收盘价"
+        formula, window, minimum = f"close/close[-{period}]-1", f"{period}个收益间隔", f"权威日历覆盖{period + 1}个交易日位置，相隔{period}个交易日的两端收盘价有效；内部缺日保留位置，不影响端点收益"
     elif feature.startswith("ma_gap_") and feature.removeprefix("ma_gap_").isdigit():
         period = int(feature.rsplit("_", 1)[1])
         formula, window, minimum = f"close/mean(close,{period})-1", f"{period}条日线", f"{period}条连续有效收盘价"
@@ -443,13 +462,19 @@ def _registry_rows() -> list[dict[str, Any]]:
     return rows
 
 
-FACTOR_REGISTRY: tuple[dict[str, Any], ...] = tuple(_registry_rows())
+FACTOR_REGISTRY: tuple[dict[str, Any], ...] = tuple(_registry_rows()) + tuple(
+    {"feature": feature, **factor_definition(feature), "group": "market_context", "role": "context",
+     "use": "environment_condition_or_observation_preference", "canonical_source": feature,
+     "frequency": "daily_k", "availability": "verified_signal_date"}
+    for feature in ENVIRONMENT_FEATURES
+)
 _FEATURE_TO_GROUP = {
     feature: group for group, members in FACTOR_GROUPS.items() for feature in members
 }
 # 旧字段实际描述 MA5 与 MA20 相对间距的日变化，并非 MACD 金叉。
 # 仅保留查询兼容，不再把旧名放入生产因子列表，避免同一证据重复计权。
 _FEATURE_TO_GROUP["golden_cross_speed"] = "trend_structure"
+_FEATURE_TO_GROUP.update({feature: "market_context" for feature in ENVIRONMENT_FEATURES})
 
 
 def factor_group(feature: str) -> str:
@@ -483,6 +508,16 @@ def _numeric(data: pd.DataFrame, column: str, default: float = np.nan) -> pd.Ser
     if column not in data.columns:
         return pd.Series(default, index=data.index, dtype=float)
     return pd.to_numeric(data[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def interval_return(close: pd.Series, periods: int) -> pd.Series:
+    """已按交易日历对齐的价格端点收益；调用方保留缺失日期，禁止压缩日历。"""
+    if periods < 1:
+        raise ValueError("收益间隔必须为正")
+    values = pd.to_numeric(close, errors="coerce")
+    values = values.where(np.isfinite(values) & values.gt(0))
+    result = values / values.shift(periods) - 1
+    return result.where(np.isfinite(result))
 
 
 def continuous_ewm(values: pd.Series, *, alpha: float, min_periods: int) -> pd.Series:
@@ -575,7 +610,7 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         residual = ret1 - (intercept + beta * amount_change)
         overnight_corr = gap.rolling(20, min_periods=10).corr(intraday)
         log_close = np.log(c.where(c > 0))
-        log_change = log_close.diff(20).where(c.rolling(21, min_periods=21).count().eq(21))
+        log_change = log_close.diff(20)
         slope = log_change / 20.0
         volatility = ret1.rolling(20, min_periods=20).std()
         fit_quality = _safe_div(log_change.abs(), volatility * math.sqrt(20.0))
@@ -585,7 +620,7 @@ def add_price_volume_factors(frame: pd.DataFrame) -> pd.DataFrame:
         ma_gap20 = _numeric(local, "ma_gap_20")
         position20 = _numeric(local, "position_20")
         ma_trend = _numeric(local, "ma_trend_5_20")
-        ret5 = c.pct_change(5, fill_method=None).where(c.rolling(6, min_periods=6).count().eq(6))
+        ret5 = interval_return(c, 5)
         pullback = (-ret5).clip(lower=0.0) * (1.0 - ratio).clip(lower=0.0) * ma_trend.clip(lower=0.0)
         stalling = position20 * anomaly.clip(lower=0.0) * (1.0 - location)
         ma_gap_change = (_numeric(local, "ma_gap_5") - ma_gap20).diff()

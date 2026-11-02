@@ -43,6 +43,9 @@ def _xiaoyan_fenxi_peizhi(value: dict[str, Any]) -> None:
     analysis = _peizhi_duixiang(value, "fenxi")
     # 旧显式配置的抽样上限仅兼容为取数批大小，不再截断候选或追加旧风险过滤。
     analysis.setdefault("history_batch_size", analysis.get("prefilter_limit", 240))
+    analysis.setdefault("selection_method", "environment_96")
+    if analysis["selection_method"] not in {"environment_96", "legacy_24"}:
+        raise ValueError("fenxi.selection_method 必须是 environment_96 或 legacy_24")
     positive_integer_bounds = {
         "history_calendar_days": (180, 1800),
         "history_batch_size": (1, 1000),

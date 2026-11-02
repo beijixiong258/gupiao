@@ -337,14 +337,14 @@ def pinggu_shangzhang_tiaojian(
 
 _SHOUYI_GUJI_FIELDS = (
     "up_probability", "conditional_upside_mean", "conditional_downside_mean",
-    "expected_gross_return", "expected_net_return", "composite_score_bps",
+    "expected_gross_return", "expected_next_day_return", "composite_score_bps",
 )
 
 
 def _dangqian_zhuangtai(
     item: dict[str, Any], ranking_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """当前特征与逐股核估计共享本次请求的日历和截止日。"""
+    """当前特征与同状态估计共享本次请求的日历和截止日。"""
     if ranking_context is None and isinstance(item.get("probability_state"), dict):
         return item["probability_state"]
     context = ranking_context if ranking_context is not None else {}
@@ -378,7 +378,9 @@ def _tongzhuangtai_tongji(
     key = (str(as_of), tuple(sorted((code, id(history)) for code, history in histories.items())))
     cache = context.setdefault("statistics_cache", {}) if ranking_context is not None else {}
     if key not in cache:
-        cache[key] = goujian_tongzhuangtai_tongji(histories, calendar, as_of)
+        cache[key] = goujian_tongzhuangtai_tongji(
+            histories, calendar, as_of, environment_by_code=context.get("environment_by_code"),
+        )
     if ranking_context is not None:
         ranking_context["latest_statistics"] = cache[key]
     return cache[key]
@@ -391,7 +393,8 @@ def paixu_shangzhang_houxuan(
     deep_reviewed: bool = False,
     ranking_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """近期相似价量样本核加权估计未来五交易日净收益，仅按未舍入期望排序。"""
+    """收益名次与观察优先级分开；环境缺失不回退旧24状态。"""
+    environment_enabled = (ranking_context or {}).get("environment_by_code") is not None
     prepared: list[dict[str, Any]] = []
     for item in items:
         result = dict(item)
@@ -406,8 +409,8 @@ def paixu_shangzhang_houxuan(
             "comparison_status": "unavailable" if missing or selection["missing_conditions"] else "pending" if selection["eligible"] else "not_applicable",
             "recommendation_index": None,
             **{field: None for field in _SHOUYI_GUJI_FIELDS},
-            "ranking_basis": "先完成用户明确条件、当前状态、日期身份和技术原值及适用成交核验；评分仅用最近120交易日内已到期的五交易日参考事件，20交易日半衰期与逐股连续特征相似度核权重相乘；不共享24状态组分数。有效日期不足10，或删除任意1至2个信号日期后均值变化超过原值绝对值50%时，不发布排序估计。未来5个交易日期望分=10000×预计净收益，100分对应1%；综合上涨机会、幅度、非上涨损失及成本，内部明细不在公开报告列出。仅按未舍入预计净收益降序，同值明确并列，代码只稳定展示。参数固定，不训练或寻优，估计未经未来收益有效性确认。",
-            "preference_order": ["expected_net_return_descending", "code_for_exact_ties"],
+            "ranking_basis": "先完成用户明确条件、当前状态、日期身份和技术原值及适用成交核验；评分仅用最近120交易日内已到期的同状态次日收盘涨幅事件，时间权重半衰期20交易日。至少10个不同已知结果信号日期才公开估计；有效样本量只描述集中程度，不作额外门槛。次日期望分=10000×预计次日涨幅，100分对应1%；不扣交易费用，不代表实际交易收益。仅按未舍入预计次日涨幅降序，同值并列，代码只稳定展示。不训练、不寻优，不保证未来结果。",
+            "preference_order": ["expected_next_day_return_descending", "code_for_exact_ties"],
         })
         result["selection"] = selection
         prepared.append(result)
@@ -418,69 +421,115 @@ def paixu_shangzhang_houxuan(
     for item in pool:
         selection = item["selection"]
         estimate = estimate_map.get(str(item["ts_code"])) or {
-            "status": "unavailable", "missing_reasons": ["该对象没有逐股核估计结果"], "statistics": {},
+            "status": "unavailable", "missing_reasons": ["该对象没有同状态估计结果"], "statistics": {},
         }
         stats = estimate.get("statistics") or {}
-        net = zhuan_you_xian_shuzhi(stats.get("expected_net_return"))
-        available = estimate.get("status") == "success" and net is not None
+        expected = zhuan_you_xian_shuzhi(stats.get("expected_next_day_return"))
+        available = estimate.get("status") == "success" and expected is not None
         selection["recommendation_index_analysis"] = {
-            **estimate, "current_state": item["probability_state"],
+            **estimate, "current_state": {key: estimate.get(key) for key in
+                ("state", "state_key", "raw_values", "analysis_date", "current_environment", "missing_reasons")},
+            "individual_current_state": item["probability_state"],
             "statistics_pool_size": len(pool), "score_unit": "basis_points",
-            "score_definition": "10000×近期相似价量样本核加权预计五交易日净收益；100分对应1%",
+            "score_definition": "10000×同状态时间加权预计次日收盘涨幅；100分对应1%，不扣费用",
         }
+        if environment_enabled:
+            selection["environment_analysis"] = {
+                **(estimate.get("current_environment") or {}),
+                "source": ((ranking_context or {}).get("environment_metadata", {}).get("by_code") or {}).get(str(item["ts_code"]), {}),
+            }
+            environment = selection["environment_analysis"]
+            raw_environment = environment.get("raw_values") or {}
+            counterevidence = []
+            for field, text in (
+                ("market_ret_20", "沪深30020日收益非正，当前市场参照没有形成同期上涨依据"),
+                ("industry_ret_20", "行业指数20日收益非正；即使相对大盘领先，也不能解释为行业绝对上涨"),
+                ("stock_ret_20", "个股20日收益非正；正的次日估计不等于已有上涨趋势"),
+            ):
+                value = zhuan_you_xian_shuzhi(raw_environment.get(field))
+                if value is not None and value <= 0:
+                    counterevidence.append({field: value, "meaning": text})
+            environment["counterevidence"] = counterevidence
+            environment["reassessment_conditions"] = [
+                "个股24价量状态、大盘20日收益正负或行业20日相对收益正负发生变化时，重新匹配联合状态历史样本",
+                "预测精确同值时，行业或个股20日相对收益的先后关系变化会改变观察顺序，不单独改变预测值",
+                "必要行情日期或价量窗口失效时暂停新估计；行业参考有新公开依据时更新归类并重新计算，允许沿用已标记的近似行业参考",
+            ]
+            selection["baseline_estimate"] = estimate.get("baseline_estimate")
+            selection["preference_order"] = list(_OBSERVATION_FIELDS)
+            selection["ranking_basis"] = (
+                "固定24价量状态与沪深30020日方向、申万2021二级行业20日相对方向共同匹配历史；"
+                "最近120交易日、20交易日半衰期，至少10个不同已知结果日期。收益按未舍入估计降序；"
+                "精确同值仍为收益并列，观察顺序依次比较行业相对大盘、个股相对行业的20日收益差。"
+                "观察偏好不改变预测，不证明额外收益；全部相同保留边界并列，代码仅稳定展示。"
+            )
         selection["comparison_pool_size"] = len(pool)
         selection["statistics_pool_size"] = len(pool)
         selection["comparison_status"] = "complete" if available else "unavailable"
         selection["comparison_state_values"] = dict(item["probability_state"].get("raw_values") or {})
         if available:
             selection.update({field: zhuan_you_xian_shuzhi(stats.get(field)) for field in _SHOUYI_GUJI_FIELDS})
-            # 兼容既有字段名，但综合分语义由期望净收益明确决定。
-            selection["composite_score_bps"] = 10000.0 * net
+            # 兼容既有字段名，但综合分语义由预计次日涨幅明确决定。
+            selection["composite_score_bps"] = 10000.0 * expected
             selection["recommendation_index"] = selection["composite_score_bps"]
             selection["comparison_values"] = {field: selection[field] for field in _SHOUYI_GUJI_FIELDS}
+            if environment_enabled:
+                raw = selection["environment_analysis"].get("raw_values") or {}
+                selection["comparison_values"].update({field: raw.get(field) for field in _OBSERVATION_FIELDS[1:]})
             selection["comparison_missing_fields"] = []
         else:
             selection["conditions"].append({
-                "key": "recommendation_statistics", "label": "逐股核加权五交易日期望分可估计",
+                "key": "recommendation_statistics", "label": "同状态次日涨幅可估计",
                 "status": "unavailable", "values": {"statistics_pool_size": len(pool),
                     "known_count": stats.get("known_count"), "known_signal_dates": stats.get("known_signal_dates"),
                     "effective_signal_date_count": stats.get("effective_signal_date_count"),
-                    "sample_support": stats.get("sample_support"),
-                    "date_stability_check": stats.get("date_stability_check")},
-                "reason": "；".join(estimate.get("missing_reasons") or ["局部事件样本或期望净收益不可估计"]),
+                    "sample_support": stats.get("sample_support")},
+                "reason": "；".join(estimate.get("missing_reasons") or ["同状态样本或次日涨幅不可估计"]),
             })
             selection["missing_conditions"].append("recommendation_statistics")
             selection.update(eligible=False, status="partial", outcome="evidence_unavailable")
 
     def display_order(item: dict[str, Any]) -> tuple[Any, ...]:
         selection = item["selection"]
-        net = selection["expected_net_return"]
-        category = 0 if selection["eligible"] and net is not None else 1 if not selection["unmet_conditions"] else 2
-        return (category, -net if net is not None else math.inf, str(item.get("ts_code") or ""))
+        expected = selection["expected_next_day_return"]
+        category = 0 if selection["eligible"] and expected is not None else 1 if not selection["unmet_conditions"] else 2
+        strength = tuple(
+            -value if (value := zhuan_you_xian_shuzhi(selection["comparison_values"].get(field))) is not None else math.inf
+            for field in _OBSERVATION_FIELDS[1:]
+        ) if environment_enabled else ()
+        return (category, -expected if expected is not None else math.inf, *strength, str(item.get("ts_code") or ""))
 
     ordered = sorted(prepared, key=display_order)
     eligible_pool = [item for item in ordered if item["selection"]["eligible"]]
-    equivalent_counts = Counter(item["selection"]["expected_net_return"] for item in eligible_pool)
+    equivalent_counts = Counter(item["selection"]["expected_next_day_return"] for item in eligible_pool)
+    observation_counts = Counter(_observation_values(item["selection"], environment_enabled) for item in eligible_pool)
+    previous_observation, observation_rank = None, 0
     previous_value, comparison_rank = None, 0
     for index, item in enumerate(eligible_pool):
         selection = item["selection"]
-        if selection["expected_net_return"] != previous_value:
+        if selection["expected_next_day_return"] != previous_value:
             comparison_rank = index + 1
         selection["comparison_rank"] = comparison_rank
-        previous_value = selection["expected_net_return"]
+        previous_value = selection["expected_next_day_return"]
         selection["comparison_pool_size"] = len(eligible_pool)
-        selection["equivalent_index_count"] = equivalent_counts[selection["expected_net_return"]]
+        selection["equivalent_index_count"] = equivalent_counts[selection["expected_next_day_return"]]
+        observation = _observation_values(selection, environment_enabled)
+        if observation != previous_observation:
+            observation_rank = index + 1
+        previous_observation = observation
+        selection["observation_rank"] = observation_rank
+        selection["observation_equivalent_count"] = observation_counts[observation]
         selection["absolute_performance"] = (
-            "未来五交易日净收益点估计为正，尚非收益保证" if selection["expected_net_return"] > 0
-            else "未来五交易日净收益点估计非正；排名靠前仍缺少正收益依据"
+            "下一交易日涨幅点估计为正，尚非收益保证" if selection["expected_next_day_return"] > 0
+            else "下一交易日涨幅点估计非正；排名靠前仍缺少正收益依据"
         )
         other = eligible_pool[index + 1] if index + 1 < len(eligible_pool) else None
         if other is not None:
             right = other["selection"]
-            equal = selection["expected_net_return"] == right["expected_net_return"]
+            equal = selection["expected_next_day_return"] == right["expected_next_day_return"]
             reason = (
-                "预计净收益完全相同，明确并列；代码仅用于稳定展示，没有额外优劣次序"
-                if equal else "按近期相似价量事件核加权后的未舍入预计净收益取舍，已综合上涨机会、幅度、非上涨损失和成本"
+                "预计次日涨幅完全相同，明确并列；代码仅用于稳定展示，没有额外优劣次序"
+                if equal else "按同状态历史次日涨幅的时间加权未舍入估计排序，包含上涨与非上涨结果，不扣交易费用"
             )
             differences = {
                 field + "_difference": selection[field] - right[field]
@@ -493,13 +542,65 @@ def paixu_shangzhang_houxuan(
                                                 "current_index": selection["recommendation_index"], "next_index": right["recommendation_index"],
                                                 "index_difference": selection["recommendation_index"] - right["recommendation_index"],
                                                 "index_unit": "basis_points", **differences,
-                                                "current_state": item["probability_state"].get("state"),
-                                                "next_state": other["probability_state"].get("state"),
-                                                "raw_advantages": [field for field in ("expected_net_return",)
+                                                "current_state": (selection.get("recommendation_index_analysis") or {}).get("state"),
+                                                "next_state": (right.get("recommendation_index_analysis") or {}).get("state"),
+                                                "raw_advantages": [field for field in ("expected_next_day_return",)
                                                     if selection[field] is not None and right[field] is not None and selection[field] > right[field]],
-                                                "raw_tradeoffs": [field for field in ("expected_net_return",)
+                                                "raw_tradeoffs": [field for field in ("expected_next_day_return",)
                                                     if selection[field] is not None and right[field] is not None and selection[field] < right[field]]}
+            selection["comparison_to_next"].update(bijiao_houxuan(item, other, environment_enabled=environment_enabled))
     return ordered
+
+
+_OBSERVATION_FIELDS = ("expected_next_day_return", "industry_excess_ret_20", "stock_excess_ret_20")
+
+
+def _observation_values(selection: dict[str, Any], environment_enabled: bool = True) -> tuple:
+    values = selection.get("comparison_values") or {}
+    return tuple(values.get(field) for field in (_OBSERVATION_FIELDS if environment_enabled else _OBSERVATION_FIELDS[:1]))
+
+
+def bijiao_houxuan(left: dict[str, Any], right: dict[str, Any], *, environment_enabled: bool = True) -> dict[str, Any]:
+    """返回首个决定顺序的真实字段，供相邻比较和截断边界共用。"""
+    a, b = left["selection"], right["selection"]
+    fields = _OBSERVATION_FIELDS if environment_enabled else _OBSERVATION_FIELDS[:1]
+    av, bv = a["comparison_values"], b["comparison_values"]
+    decisive = next((field for field in fields if av.get(field) != bv.get(field)), None)
+    reasons = {
+        "expected_next_day_return": "预计次日涨幅的未舍入点估计更高；数值差异不等于统计上显著优于对方",
+        "industry_excess_ret_20": "收益预测精确相同；按固定观察偏好，所在行业20日相对沪深300更强，预测值不变",
+        "stock_excess_ret_20": "收益预测与行业相对强弱相同；按固定观察偏好，个股20日相对所属行业更强，预测值不变",
+    }
+    return {"ts_code": right["ts_code"], "name": right.get("name"),
+            "first_decisive_field": decisive, "current_values": {key: av.get(key) for key in fields},
+            "next_values": {key: bv.get(key) for key in fields},
+            "value_difference": av[decisive] - bv[decisive] if decisive and av.get(decisive) is not None and bv.get(decisive) is not None else None,
+            "reason": reasons.get(decisive, "所有比较项精确相同，保持并列；代码顺序不构成入选依据"),
+            "role": "comparison_reference"}
+
+
+def goujian_jiequ_bijiao(items: list[dict[str, Any]], count: int, *, environment_enabled: bool = True) -> dict[str, Any]:
+    """公开第N名的整个并列边界；详细报告上限不制造独立前N名结论。"""
+    if not items:
+        return {"status": "unavailable", "unique_selection": False, "boundary_members": []}
+    boundary = items[min(count, len(items)) - 1]
+    key = _observation_values(boundary["selection"], environment_enabled)
+    group = [item for item in items if _observation_values(item["selection"], environment_enabled) == key]
+    shown = {item["ts_code"] for item in items[:count]}
+    def record(item):
+        return {"ts_code": item["ts_code"], "name": item.get("name"),
+                "comparison_values": {field: item["selection"]["comparison_values"].get(field) for field in
+                                      (_OBSERVATION_FIELDS if environment_enabled else _OBSERVATION_FIELDS[:1])}}
+    omitted = items[count] if len(items) > count else None
+    for item in items[:count]:
+        item["selection"]["comparison_to_cutoff"] = bijiao_houxuan(item, omitted, environment_enabled=environment_enabled) if omitted else None
+    undisplayed = [record(item) for item in group if item["ts_code"] not in shown]
+    return {"status": "boundary_tie" if undisplayed else "resolved", "unique_selection": not undisplayed,
+            "strictly_ahead_count": sum(item["selection"]["observation_rank"] < boundary["selection"]["observation_rank"] for item in items),
+            "boundary_rank": boundary["selection"]["observation_rank"], "boundary_members": [record(item) for item in group],
+            "displayed_boundary_members": [record(item) for item in group if item["ts_code"] in shown],
+            "undisplayed_boundary_members": undisplayed, "first_omitted": record(omitted) if omitted else None,
+            "interpretation": "边界未解决时，已展示的边界对象仅为受报告数量限制的并列示例，不能称为唯一优选；完整并列名单均已列出"}
 
 
 def goujian_kejiaoyixing_zhaiyao(
@@ -753,7 +854,7 @@ def goujian_houxuan_zhaiyao(
     *,
     rank: int,
 ) -> dict[str, Any]:
-    """投影完整诊断、期望净收益和显式条件，内部概率与幅度保留供审计。"""
+    """投影完整诊断、预计次日涨幅和显式条件，内部概率与幅度保留供审计。"""
     selection = dict(item.get("selection") or {})
     conditions = selection.get("conditions") or []
     positive = [f"{condition['label']}：{condition['reason']}" for condition in conditions if condition.get("status") == "met"]
@@ -792,12 +893,13 @@ def goujian_houxuan_zhaiyao(
     return {
         "rank": selection.get("comparison_rank", rank),
         "recommendation_index": selection.get("recommendation_index"),
-        "recommendation_index_semantics": "composite_score_bps_expected_net_return",
+        "recommendation_index_semantics": "composite_score_bps_expected_next_day_return",
         **{field: selection.get(field) for field in _SHOUYI_GUJI_FIELDS},
         "diagnosis_summary": diagnosis,
         "ts_code": item["ts_code"],
         "name": item["name"],
-        "industry": item.get("industry"),
+        # 展示与本次环境比较同口径的行业；原目录标签仍保留在原始资料中。
+        "industry": (selection.get("environment_analysis") or {}).get("industry_name") or item.get("industry"),
         "selection_analysis": selection,
         "meets_selection_conditions": bool(selection.get("eligible")),
         "positive_evidence": list(dict.fromkeys(positive)),

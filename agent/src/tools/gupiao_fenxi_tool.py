@@ -10,7 +10,7 @@ from src.agent.tools import BaseTool
 from src.tools.gupiao_analysis_state import analysis_session_store
 
 
-FenxiScope = Literal["all_market", "main_board", "named_scope", "single_stock"]
+FenxiScope = Literal["daily_leaderboards", "all_market", "main_board", "named_scope", "single_stock"]
 
 _CHECK_SCHEMA = {
     "type": "object",
@@ -65,9 +65,9 @@ def _mianxiang_zhinengti_jieguo(result: dict[str, Any]) -> dict[str, Any]:
         # 不在此复制标签、单位、公式，也不修改原始指标组的组成或观测数。
         estimate_features = (
             "up_probability", "conditional_upside_mean", "conditional_downside_mean",
-            "expected_gross_return", "expected_net_return", "composite_score_bps",
+            "expected_gross_return", "expected_next_day_return", "composite_score_bps",
         )
-        for feature in (*estimate_features, "recommendation_index", "atr_distance", "amount_ratio_5_15", "log_amount_ratio_5_15",
+        for feature in (*estimate_features, "recommendation_index", "atr_distance", "amount_ratio_5_15",
                         *(f"{feature}_difference" for feature in estimate_features)):
             definitions[feature] = factor_definition(feature)
     if definitions:
@@ -106,24 +106,28 @@ class GupiaoFenxiTool(BaseTool):
         "to retrieve all currently analyzable stock evidence, including every raw daily-factor value and missing field, technical "
         "structure, financials and valuation context, pattern and late-session conditions, supplemental diagnostics, execution "
         "constraints and source provenance. Optional source failure yields a partial report, never a forced buy/no-buy label. "
-        "Use all_market, main_board (all Shanghai/Shenzhen main-board A-shares), or named_scope for rule-based selection; "
+        "Default selection uses daily_leaderboards: the same completed day's gain top 100 union turnover top 100, deduplicated. "
+        "Only this pool supplies selection and same-state historical samples; no off-list backfill. The five-day test keeps these rules fixed. "
+        "Use all_market only for an explicitly exhaustive market request, main_board (all Shanghai/Shenzhen main-board A-shares), or named_scope for an explicit narrower scope; "
         "main_board is a listing-market scope, not an industry/concept catalog entry. Named scopes are dynamically discovered and verified. "
         "Always state shizhi explicitly: none only when no market-cap constraint was requested, unresolved when the user "
         "says small-cap without a confirmed basis and limit, or upper_limit with the user's exact bound. "
         "Unresolved constraints return a clarification before fetching market data. Never substitute unrestricted selection. "
-        "Selection compares all obtainable scope members with stock-specific continuous-feature kernel estimates from mature five-session events; 24-state labels are diagnostic only. "
-        "The score uses only signals from the last 120 trading sessions, weighted jointly by a 20-session half-life and local feature similarity (fixed biweight radius 3; origin-only IQR scales, no return fitting). "
-        "Display future-five-session expectation scores and estimated net returns; probability and conditional gain/loss fields "
-        "stay in structured audit data and must not be listed in public reports. Read the returned chronological check and limits. Order only by unrounded "
-        "expected_net_return descending; composite_score_bps and compatibility recommendation_index equal 10000 times that return. "
-        "Exact net-return ties are explicit, with code used only for stable display; do not rank secondarily by probability or upside. "
-        "Read returned state, observations, samples, dates, coverage, uncertainty, costs and limits; never recompute or change values. "
-        "Local estimates require at least 10 known signal dates and 10 effective events as engineering support; unsupported estimates stay unavailable, without 50% or an old-index fallback. Historical unknown-label bounds are not future intervals. "
-        "No default ST, age, volatility or amount preference. Only explicit extra conditions belong in tiaojian. "
-        "The supported reference event is next trading-day open to fifth trading-day close. Requests for this horizon's probability "
-        "and expected return estimates are supported, but guarantees, actual future maximum return and other horizons remain untestable. "
-        "Preserve the whole objective in yanjiu_wenti.question and unsupported parts in unverifiable_parts. Never substitute past ret_5 "
-        "or silently replace another horizon. Kernel conditional estimates are not certified future outcomes or execution guarantees. "
+        "Selection defaults to 96 joint states: 24 stock price/amount states times CSI300 20-session direction times SW2021 level-two industry 20-session relative direction. "
+        "The explicit legacy_24 configuration preserves the old five-day observation; baseline estimates are comparisons only, never mixed into environment rankings. "
+        "Only SAME-state signals from the last 120 verified trading sessions whose next-session close is already known enter the estimate; "
+        "use daily signals and weights 2**(-signal_age_sessions/20), without kernel similarity, additional effective-sample gates or date-removal gates. "
+        "Display next-session expectation scores and expected_next_day_return; historical probabilities and conditional gain/loss fields stay in structured audit data. "
+        "Return ranks use unrounded expected_next_day_return descending; composite_score_bps and compatibility recommendation_index equal 10000 times that return. "
+        "Exact return ties keep their return rank; observation preference then compares industry_excess_ret_20 followed by stock_excess_ret_20, without changing forecasts. "
+        "Preserve cutoff_comparison boundary ties and explain the first decisive field; code only stabilizes display and cannot establish unique top-N superiority. "
+        "Read returned observations, dates, coverage, uncertainty, price basis and chronological checks; never recompute or change values. "
+        "At least 10 distinct known-result SAME-state signal dates are an engineering support gate, not calibration; effective sample sizes describe concentration only. "
+        "Unsupported estimates stay unavailable, without 50% or an old-index fallback. No default ST, age, volatility or amount preference. "
+        "Only explicit restrictions belong in tiaojian. The supported target is next trading-session close divided by signal-session close minus one, "
+        "with a consistent same-source adjusted-price basis, no fees and no claimed trading profit. Weekend selection uses the latest complete trading session. "
+        "Requests for this horizon's probability or expected change are supported; guarantees, future maximum return and other horizons remain unsupported. "
+        "Preserve the whole objective in yanjiu_wenti.question and unsupported parts in unverifiable_parts. Never substitute past ret_5 or silently replace another horizon. "
         "Old R/E/U and 20/5-day Pareto are diagnostics/research comparators only. Do not invent scores, weights, risk deductions or train models."
     )
     parameters = {
@@ -138,7 +142,7 @@ class GupiaoFenxiTool(BaseTool):
             },
             "yanjiu_wenti": {
                 "type": ["object", "null"],
-                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. The supported five-session kernel conditional probability estimate is allowed; guarantees, other horizons, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
+                "description": "Preserve an explicit user conjecture/question for single-stock or scope research. Convert only faithfully defined observable parts into checks; expose definitions and list the remainder in unverifiable_parts. A generic breakout is not the specific limit-up pullback pattern. The supported next-session close-to-close fixed-state estimate is allowed; guarantees, other horizons, causality and undefined claims cannot be established by substituting indicator signs. Omit when no conjecture was stated; do not force a clarification.",
                 "properties": {"question": {"type": "string"},
                                "checks": {"type": "array", "maxItems": 12, "items": _CHECK_SCHEMA},
                                "unverifiable_parts": {"type": "array", "items": {"type": "string"}}},
@@ -147,12 +151,12 @@ class GupiaoFenxiTool(BaseTool):
             "fanwei": {
                 "type": "string",
                 "enum": list(get_args(FenxiScope)),
-                "default": "all_market",
-                "description": "Use single_stock for one stock, all_market when no narrower scope was requested, main_board for the entire Shanghai/Shenzhen main-board A-share market, or named_scope for an ordinary industry/theme phrase. main_board bypasses industry/concept discovery; preserve the user's wording in mingcheng. Never broaden a requested listing-market scope.",
+                "default": "daily_leaderboards",
+                "description": "Default to daily_leaderboards: fixed completed-day gain top 100 union turnover top 100, deduplicated (not the final output count). The same pool supplies historical statistics. Use single_stock for one stock, all_market only when exhaustive full-market comparison is explicit, main_board for the entire Shanghai/Shenzhen main-board market, or named_scope for an ordinary industry/theme phrase. Preserve named scope wording in mingcheng; omit mingcheng for daily_leaderboards/all_market.",
             },
             "mingcheng": {
                 "type": "string",
-                "description": "The user's ordinary-language scope phrase, such as 电子板块. Omit it for all_market; do not translate it into a professional taxonomy.",
+                "description": "The user's ordinary-language scope phrase, such as 电子板块. Omit it for daily_leaderboards/all_market; do not translate it into a professional taxonomy.",
             },
             "gupiao": {
                 "type": "string",
@@ -207,7 +211,7 @@ class GupiaoFenxiTool(BaseTool):
         from src.ashare.shichang_shuju import FenxiShujuShangxiawen
 
         request = dict(
-            fanwei=str(kwargs.get("fanwei") or "all_market"),
+            fanwei=str(kwargs.get("fanwei") or "daily_leaderboards"),
             mingcheng=str(kwargs.get("mingcheng") or "").strip() or None,
             gupiao=str(kwargs.get("gupiao") or "").strip() or None,
             shuliang=kwargs.get("shuliang"),
@@ -276,7 +280,7 @@ class GupiaoFenxiTool(BaseTool):
                 "scope": (
                     "已整理当前可取得的候选证据；部分来源或条件尚未完成核验"
                     if stored_result.get("status") == "partial"
-                    else "候选范围核验、原始证据、显式条件与期望净收益比较已完成"
+                    else "候选范围核验、原始证据、显式条件与预计次日涨幅比较已完成"
                 ),
                 "next_step": (
                     "说明候选的量化依据、证据缺口、主要风险与重新评估条件"

@@ -1567,6 +1567,22 @@ def _qfq_history_from_eastmoney(
     )
 
 
+def heyan_fuquan_yinzi(data: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+    """按交易日期一对一核验复权因子；缺失、非正及重复均不猜补。"""
+    prices = data.copy()
+    prices["trade_date"] = pd.to_datetime(prices["trade_date"], errors="coerce").dt.normalize()
+    factor_table = factors[["trade_date", "adj_factor"]].copy()
+    factor_table["trade_date"] = pd.to_datetime(factor_table["trade_date"], errors="coerce").dt.normalize()
+    factor_table["adj_factor"] = pd.to_numeric(factor_table["adj_factor"], errors="coerce")
+    if prices.empty or prices["trade_date"].isna().any() or factor_table["trade_date"].isna().any():
+        raise ValueError("复权价格或因子的交易日期无效")
+    merged = prices.merge(factor_table, on="trade_date", how="left", validate="one_to_one").sort_values("trade_date").reset_index(drop=True)
+    valid = np.isfinite(merged["adj_factor"]) & merged["adj_factor"].gt(0)
+    if not valid.all():
+        raise ValueError("复权因子缺失或无效，不能跨日填充")
+    return merged
+
+
 def _qfq_history_from_tushare(
     codes: tuple[str, ...],
     *,
@@ -1588,17 +1604,8 @@ def _qfq_history_from_tushare(
                 raise RuntimeError("日线为空")
             if factors is None or factors.empty:
                 raise RuntimeError("复权因子为空")
-            data = daily.copy()
-            data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.normalize()
-            factor_table = factors[["trade_date", "adj_factor"]].copy()
-            factor_table["trade_date"] = pd.to_datetime(factor_table["trade_date"], errors="coerce").dt.normalize()
-            factor_table["adj_factor"] = pd.to_numeric(factor_table["adj_factor"], errors="coerce")
-            data = data.merge(factor_table, on="trade_date", how="left").sort_values("trade_date").reset_index(drop=True)
-            data["adj_factor"] = data["adj_factor"].ffill().bfill()
-            latest_factor = pd.to_numeric(data["adj_factor"], errors="coerce").dropna()
-            if latest_factor.empty or float(latest_factor.iloc[-1]) <= 0:
-                raise RuntimeError("复权因子无效")
-            multiplier = data["adj_factor"] / float(latest_factor.iloc[-1])
+            data = heyan_fuquan_yinzi(daily, factors)
+            multiplier = data["adj_factor"] / float(data["adj_factor"].iloc[-1])
             for column in ("open", "high", "low", "close", "pre_close"):
                 data[column] = pd.to_numeric(data.get(column), errors="coerce") * multiplier
             data["volume"] = pd.to_numeric(data.get("vol"), errors="coerce") * 100.0
@@ -1634,7 +1641,7 @@ def _jiancha_qfq_lishi_zhiliang(
     expected_dates: frozenset[pd.Timestamp],
     minimum_rows: int,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """核验来源日期和末端必要价格窗口；整段历史覆盖率仅披露。"""
+    """按请求核验必要价量窗口；单股仍仅要求目标日价格有效。"""
     data = frame.copy()
     dates = pd.to_datetime(
         data.get("trade_date", pd.Series(index=data.index, dtype="datetime64[ns]")),
@@ -1664,16 +1671,26 @@ def _jiancha_qfq_lishi_zhiliang(
     required_window = sorted(expected_dates)[-minimum_rows:]
     if not reasons:
         prices = data.set_index("trade_date")
-        closes = pd.to_numeric(
-            prices.get("close", pd.Series(np.nan, index=prices.index)), errors="coerce",
-        ).reindex(required_window)
-        if len(required_window) < minimum_rows or not (np.isfinite(closes) & closes.gt(0)).all():
+        window = prices.reindex(index=required_window, columns=["open", "high", "low", "close", "amount_yuan"])
+        window = window.apply(pd.to_numeric, errors="coerce")
+        ohlc = window[["open", "high", "low", "close"]]
+        valid_prices = (np.isfinite(ohlc) & ohlc.gt(0)).all(axis=1)
+        valid_prices &= window["low"].le(window[["open", "close"]].min(axis=1))
+        valid_prices &= window[["open", "close"]].max(axis=1).le(window["high"])
+        if len(required_window) < minimum_rows or not valid_prices.all():
             reasons.append("required_price_window_incomplete")
-        latest_prices = pd.to_numeric(
-            prices.loc[required_latest].reindex(["open", "high", "low", "close"]), errors="coerce",
-        )
-        if not (np.isfinite(latest_prices) & latest_prices.gt(0)).all():
-            reasons.append("latest_price_fields_invalid")
+        if minimum_rows >= 20:
+            amounts = window["amount_yuan"].tail(20)
+            if not (np.isfinite(amounts) & amounts.ge(0)).all():
+                reasons.append("required_amount_window_incomplete")
+            elif amounts.tail(5).mean() <= 0 or amounts.iloc[-20:-5].mean() <= 0:
+                reasons.append("required_amount_means_nonpositive")
+            if not reasons:
+                # 与后续固定状态计算共用公式，避免主源通过后才发现ATR等必要输入不可用。
+                from src.ashare.tuijian_gailv import jisuan_dangqian_zhuangtai
+                state = jisuan_dangqian_zhuangtai(data, trading_calendar=sorted(expected_dates), as_of=required_latest)
+                if state["status"] != "success":
+                    reasons.append("required_state_input_invalid")
     observed_rows = int(len(data))
     missing_sessions = sorted(relevant - actual_dates)
     if missing_sessions and not reasons:
@@ -1687,6 +1704,7 @@ def _jiancha_qfq_lishi_zhiliang(
         "latest_date": latest.strftime("%Y-%m-%d") if latest is not None else None,
         "required_latest_date": required_latest.strftime("%Y-%m-%d") if required_latest is not None else None,
         "required_continuous_prices": minimum_rows,
+        "required_continuous_amounts": 20 if minimum_rows >= 20 else 0,
         "reasons": reasons,
     }
 
@@ -1898,10 +1916,13 @@ def huoqu_fenzhong_xingqing(
         for column in ("open", "close", "high", "low", "volume", "amount_yuan", "average_price"):
             if column in data.columns:
                 data[column] = pd.to_numeric(data[column], errors="coerce")
+        if "volume" in data.columns:
+            data["volume"] *= 100.0  # 东财分钟接口为手；内部行情统一为股。
         data = data.dropna(subset=["trade_time"]).sort_values("trade_time").reset_index(drop=True)
         return data, {
             "status": "ok",
             "source": "akshare_eastmoney_5min",
+            "volume_unit": "share", "amount_unit": "CNY",
             "captured_at": captured.strftime("%Y-%m-%d %H:%M:%S"),
             "rows": int(len(data)),
             **capability,

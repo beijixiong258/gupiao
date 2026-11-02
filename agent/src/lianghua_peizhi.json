@@ -27,6 +27,7 @@
     "same_industry_stocks": 16
   },
   "fenxi": {
+    "selection_method": "environment_96",
     "history_calendar_days": 420,
     "history_batch_size": 240,
     "deep_analysis_limit": 10,
