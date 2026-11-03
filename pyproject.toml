@@ -27,26 +27,24 @@ gpyj = "cli:main"
 gpyj-mcp = "mcp_server:main"
 
 [tool.setuptools]
-package-dir = {"" = "agent"}
-py-modules = ["cli", "mcp_server"]
+py-modules = ["cli", "mcp_server", "config"]
 include-package-data = false
 
 [tool.setuptools_scm]
 
 [tool.setuptools.packages.find]
-where = ["agent"]
-include = ["src", "src.*"]
+where = ["."]
+include = ["ashare", "ashare.*", "duihua", "duihua.*", "providers", "providers.*", "tools", "tools.*"]
 exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"src" = ["lianghua_peizhi.json"]
-"src.providers" = ["llm_providers.json"]
+"providers" = ["llm_providers.json"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-src = ["agent"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]

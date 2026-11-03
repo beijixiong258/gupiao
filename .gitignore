@@ -9,7 +9,3 @@ __pycache__/
 build/
 dist/
 .task-*/
-
-.env
-agent/.env
-agent/runs/

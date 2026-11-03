@@ -1,0 +1,1322 @@
+"""AgentLoop: intent recognition followed by bounded ReAct tool execution.
+
+Five-layer context management:
+  Layer 1 (microcompact)     — silently prunes old tool results each iteration
+  Layer 2 (context_collapse) — folds long text blocks without LLM call (zero cost)
+  Layer 3 (auto_compact)     — LLM structured summary with token-budget tail protection
+  Layer 4 (compact tool)     — model explicitly calls the compact tool to trigger L3
+  Layer 5 (iterative update) — Nth compression updates previous summary instead of starting fresh
+
+Tool execution:
+  - Read/write batching: consecutive readonly tools run in parallel via threads
+"""
+
+from __future__ import annotations
+
+import copy
+import concurrent.futures
+import json
+import logging
+import os
+import re
+import time as _time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from config import RUNS_DIR
+from duihua.clarification import (
+    ClarificationRequest,
+    build_scope_clarification,
+)
+from duihua.context import ContextBuilder
+from duihua.intent import IntentDecision, IntentRecognitionError, recognize_intent
+from duihua.memory import WorkspaceMemory
+from tools.base import ToolRegistry
+from duihua.trace import TraceWriter
+from duihua.state import RunStateStore
+from duihua.run_policy import redact_for_log
+from providers.chat import ChatLLM
+
+TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "40000"))
+KEEP_RECENT = 3
+
+# Layer 2: Context collapse thresholds
+COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
+COLLAPSE_PRESERVE_RECENT = 6
+COLLAPSE_TEXT_MIN = 2400
+COLLAPSE_HEAD = 900
+COLLAPSE_TAIL = 500
+
+# Layer 3: Token-budget tail protection
+TAIL_TOKEN_BUDGET = 20_000
+
+logger = logging.getLogger(__name__)
+
+
+class _TransientMessage(dict[str, Any]):
+    """Message visible to the current LLM run but excluded from saved history."""
+
+
+def _export_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a detached conversation history without the system message."""
+    return [
+        copy.deepcopy(message)
+        for message in messages
+        if (
+            isinstance(message, dict)
+            and not isinstance(message, _TransientMessage)
+            and message.get("role") in {"user", "assistant", "tool"}
+        )
+    ]
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count estimate (~4 chars/token).
+
+    Args:
+        messages: Message list.
+
+    Returns:
+        Estimated token count.
+    """
+    return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+
+
+def _microcompact(messages: list) -> None:
+    """Layer 1: silently prune old tool results, keeping the most recent N intact.
+
+    Args:
+        messages: Message list (mutated in place).
+    """
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    if len(tool_msgs) <= KEEP_RECENT:
+        return
+    for msg in tool_msgs[:-KEEP_RECENT]:
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > 100:
+            msg["content"] = "[cleared]"
+
+
+def _context_collapse(messages: list) -> None:
+    """Layer 2: fold long text blocks in older messages without LLM call.
+
+    Preserves head + tail of large text, collapses the middle.
+    Zero API cost — pure string operation.
+
+    Args:
+        messages: Message list (mutated in place).
+    """
+    if len(messages) <= COLLAPSE_PRESERVE_RECENT + 1:
+        return
+    for msg in messages[1:-COLLAPSE_PRESERVE_RECENT]:
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= COLLAPSE_TEXT_MIN:
+            continue
+        if content == "[cleared]":
+            continue
+        head = content[:COLLAPSE_HEAD]
+        tail = content[-COLLAPSE_TAIL:]
+        trimmed = len(content) - COLLAPSE_HEAD - COLLAPSE_TAIL
+        msg["content"] = f"{head}\n\n...[{trimmed} chars collapsed]...\n\n{tail}"
+
+
+def _fix_tool_pairs(messages: list) -> None:
+    """Repair orphaned tool_call / tool_result pairs after compression.
+
+    Two fixes:
+      1. Remove tool results whose matching tool_call was compressed away.
+      2. Insert stub results for tool_calls whose results were compressed away.
+
+    Args:
+        messages: Message list (mutated in place).
+    """
+    # Collect all tool_call IDs from assistant messages
+    call_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []):
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    call_ids.add(tc_id)
+
+    # Remove orphaned tool results
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "tool" and msg.get("tool_call_id") not in call_ids:
+            messages.pop(i)
+        else:
+            i += 1
+
+    # Collect existing result IDs
+    result_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id", "")
+            if tcid:
+                result_ids.add(tcid)
+
+    # Insert stub results for orphaned tool_calls
+    inserts: list[tuple[int, dict]] = []
+    for idx, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []):
+            tc_id = tc.get("id", "")
+            if tc_id and tc_id not in result_ids:
+                stub = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": tc.get("function", {}).get("name", "unknown"),
+                    "content": "[Result from earlier context — see summary above]",
+                }
+                inserts.append((idx + 1, stub))
+                result_ids.add(tc_id)
+
+    for pos, stub in reversed(inserts):
+        messages.insert(pos, stub)
+
+
+# -- Structured summary templates ------------------------------------------
+
+_STRUCTURED_SUMMARY_PROMPT = """\
+Summarize this conversation for handoff to a fresh context window.
+This summary is the ONLY context available — omitted information is lost.
+
+Use EXACTLY this structure:
+
+## Goal
+What the user is trying to accomplish.
+
+## Constraints & Preferences
+User-stated requirements: risk tolerance, strategy parameters, asset preferences.
+
+## Progress
+### Done
+- Completed steps with key results and specific numbers.
+### In Progress
+- Current work when compression triggered.
+
+## Key Decisions
+Choices made and rationale.
+
+## Resolved Questions
+Questions already answered — do NOT re-answer these.
+
+## Pending User Asks
+Unfinished requests still needing action.
+
+## Relevant Files
+File paths, run_dir, signal engines, artifact locations.
+
+## Remaining Work
+What still needs to be done (background reference, NOT active instructions).
+
+## Critical Context
+Specific numbers, parameters, error messages, configuration values.
+
+## Tools & Patterns
+Which tools worked, what failed, effective approaches.
+
+IMPORTANT: This is a handoff — background reference, NOT active instructions.
+Preserve ALL specific numbers, file paths, and parameter values.
+{focus_section}
+Conversation to summarize:
+"""
+
+_FOCUS_SECTION = """
+FOCUS TOPIC: {topic}
+Allocate 60-70% of the summary budget to content related to this topic.
+Aggressively compress unrelated content to make room.
+"""
+
+_ITERATIVE_UPDATE_PROMPT = """\
+Update the existing summary with new conversation turns.
+
+PREVIOUS SUMMARY:
+{previous_summary}
+
+NEW TURNS TO INCORPORATE:
+{new_turns}
+
+Rules:
+- PRESERVE all existing information from the previous summary.
+- ADD new progress, decisions, and findings.
+- Move "In Progress" items to "Done" when completed.
+- Move answered questions to "Resolved Questions".
+- Keep the same section structure.
+- Do NOT drop any critical context from the previous summary.
+{focus_section}"""
+
+
+def _is_tool_success(result: str) -> bool:
+    """Return True only when a structured result is not an incomplete/failure state."""
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").strip().lower()
+            if status in {
+                "error",
+                "failed",
+                "unavailable",
+                "insufficient_data",
+                "blocked",
+                "cancelled",
+                "clarification_required",
+                "scope_review_required",
+                "reanalysis_required",
+            }:
+                return False
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return True
+
+
+def _business_run_status(payload: dict[str, Any] | None, tool_name: str) -> str | None:
+    """分析业务状态映射，成功必须满足当前分析契约。"""
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if status in {"ok", "partial"}:
+        # ``ok`` 只表示工具自己声称成功。缺少当前契约所需的完成标记时，
+        # 外层不能把一段模型说明文字当成一次真正完成的量化分析。
+        if tool_name == "gupiao_fenxi":
+            if not ContextBuilder.is_compatible_analysis_result(payload):
+                return "failed"
+        if status == "partial":
+            return "information_partial"
+        return "no_recommendation" if outcome == "no_recommendation" else "success"
+    if status == "insufficient_data":
+        return "information_insufficient"
+    if status == "scope_review_required":
+        return "clarification_required"
+    if status in {"clarification_required", "reanalysis_required", "cancelled"}:
+        return status
+    if status in {"unavailable", "data_unavailable"}:
+        return "data_unavailable"
+    if status in {"error", "failed", "blocked"}:
+        return "failed"
+    return None
+
+
+def _analysis_run_status(payload: dict[str, Any] | None) -> str | None:
+    return _business_run_status(payload, "gupiao_fenxi")
+
+
+def _removed_forecast_offer(content: str) -> bool:
+    """只拦截旧训练/多日预测功能的邀请；次日涨幅估计及限制说明属于现有功能。"""
+    retired = re.compile(r"T[+＋][23]|(?:未来)?[三3](?:个)?(?:交易)?[天日]|模型训练|训练模型|预测资格|预测确认")
+    invitation = re.compile(r"如需|如果.{0,12}(?:希望|需要|愿意)|可以|要不要|是否|启动|运行|开始|恢复|确认后|继续")
+    for sentence in re.split(r"[。！？；\n]", str(content or "")):
+        # 否定边界本身不能被当成提供旧功能；另一个分句的邀请仍单独检查。
+        clauses = re.split(r"[，,]|但是|但|不过", sentence)
+        for clause in clauses:
+            if re.search(r"不支持|不提供|不能|已(?:经)?移除|不产生|不具备|不训练", clause):
+                continue
+            if retired.search(clause) and invitation.search(clause):
+                return True
+    return False
+
+
+def _remove_removed_forecast_offer(content: str) -> str:
+    """移除已下线功能的邀请段，保留已核验的分析理由。"""
+
+    paragraphs = str(content or "").split("\n\n")
+    kept: list[str] = []
+    removed = False
+    for paragraph in paragraphs:
+        if _removed_forecast_offer(paragraph):
+            removed = True
+            continue
+        if paragraph.strip():
+            kept.append(paragraph.strip())
+    cleaned = "\n\n".join(kept).strip()
+    if not removed or _removed_forecast_offer(cleaned):
+        return ""
+    return cleaned
+
+
+def _replace_single_stock_classification_code(content: str, payload: dict[str, Any]) -> str:
+    """用结构结果自带的中文标签替换模型可能照抄的内部分类代码。"""
+
+    technical = payload.get("technical_summary")
+    structure = technical.get("macd_structure") if isinstance(technical, dict) else None
+    classification = structure.get("structure_classification") if isinstance(structure, dict) else None
+    if not isinstance(classification, dict):
+        return content
+    code = str(classification.get("code") or "").strip()
+    label = str(classification.get("label") or "").strip()
+    if not code or not label:
+        return content
+    return re.sub(rf"\b{re.escape(code)}\b", label, str(content or ""))
+
+
+def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) -> dict[str, Any]:
+    """Normalize ``run_dir`` in tool args to an absolute path when possible.
+
+    If the model supplies a relative ``run_dir`` (for example ``"."`` or
+    ``"risk_parity_run"``), resolve it against the active run directory.
+    """
+    normalized = dict(args)
+    if not memory_run_dir:
+        return normalized
+
+    if "run_dir" not in normalized:
+        normalized["run_dir"] = memory_run_dir
+        return normalized
+
+    run_dir_value = str(normalized["run_dir"]).strip()
+    if not run_dir_value:
+        normalized["run_dir"] = memory_run_dir
+        return normalized
+
+    candidate = Path(run_dir_value)
+    if run_dir_value.startswith("/"):
+        return normalized
+    if not candidate.is_absolute():
+        normalized["run_dir"] = str((Path(memory_run_dir) / candidate).resolve())
+    return normalized
+
+
+class AgentLoop:
+    """ReAct Agent core loop.
+
+    Attributes:
+        registry: Tool registry.
+        llm: ChatLLM client.
+        memory: Workspace memory.
+        max_iterations: Maximum number of iterations.
+    """
+
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        llm: ChatLLM,
+        memory: Optional[WorkspaceMemory] = None,
+        event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        max_iterations: int = 50,
+        persistent_memory: Optional[Any] = None,
+    ) -> None:
+        """Initialize AgentLoop.
+
+        Args:
+            registry: Tool registry.
+            llm: ChatLLM client.
+            memory: Workspace memory (created fresh if not provided).
+            event_callback: Event callback (event_type, data).
+            max_iterations: Maximum number of loop iterations.
+            persistent_memory: PersistentMemory for cross-session recall.
+        """
+        self.registry = registry
+        self.llm = llm
+        self.memory = memory or WorkspaceMemory()
+        self._event_callback = event_callback
+        self.max_iterations = max_iterations
+        self._called_ok: set[str] = set()
+        self._pending_clarification: ClarificationRequest | None = None
+        self._pending_scope_review: dict[str, Any] | None = None
+        self._latest_analysis_payload: dict[str, Any] | None = None
+        self._latest_business_result: tuple[str, dict[str, Any]] | None = None
+        self._intent: IntentDecision | None = None
+        self._cancelled: bool = False
+        self._previous_summary: str = ""
+        self._persistent_memory = persistent_memory
+
+    def cancel(self) -> None:
+        """Cancel the current loop.
+
+        The main loop exits on the next iteration check.
+        """
+        self._cancelled = True
+
+    def run(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None, session_id: str = "") -> Dict[str, Any]:
+        """Run the ReAct loop synchronously.
+
+        Args:
+            user_message: User message.
+            history: Prior conversation messages.
+            session_id: Session ID.
+
+        Returns:
+            Execution result dict.
+        """
+        # Reset per-run state (safe for reuse across multiple run() calls)
+        self._cancelled = False
+        self._called_ok = set()
+        self._pending_clarification = None
+        self._pending_scope_review = None
+        reset_scope_request = getattr(self.registry.get("gupiao_fenxi"), "reset_request", lambda: None)
+        reset_scope_request()
+        self._latest_analysis_payload = None
+        self._latest_business_result = None
+        self._intent = None
+        self._previous_summary = ""
+
+        state_store = RunStateStore()
+        if state_store.policy.enabled:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        self.memory.run_dir = None
+        self.memory.counters.clear()
+        run_dir = state_store.create_run_dir(RUNS_DIR)
+        self.memory.run_dir = str(run_dir)
+
+        state_store.save_request(run_dir, user_message, {"session_id": session_id})
+
+        context = ContextBuilder(self.registry, self.memory,
+                                  persistent_memory=self._persistent_memory)
+        messages = context.build_messages(user_message, history)
+        react_trace: List[Dict[str, Any]] = []
+        durable_history = _export_history(messages)
+
+        trace = TraceWriter(run_dir, policy=state_store.policy)
+        trace.write({"type": "start", "prompt": user_message[:500]})
+
+        iteration = 0
+        final_content = ""
+        try:
+            # Node 1 only identifies the request; no business tools are exposed or executed.
+            self._emit("intent_start", {})
+            intent_started = _time.perf_counter()
+            self._intent = recognize_intent(self.llm, messages[1:])
+            intent_metadata = {
+                "elapsed_ms": int((_time.perf_counter() - intent_started) * 1000),
+                "task_kind": self._intent.task_kind,
+                "requires_market_data": self._intent.requires_market_data,
+                "has_stock_query": self._intent.stock_query is not None,
+                "has_scope_text": self._intent.scope_text is not None,
+                "scope_kind": self._intent.scope_kind,
+                "condition_count": len(self._intent.explicit_conditions),
+                "has_research_question": self._intent.research_question is not None,
+                "missing_information_count": len(self._intent.missing_information),
+                "requested_count": self._intent.requested_count,
+                "unverifiable_requirement_count": len(self._intent.unverifiable_requirements),
+            }
+            trace.write({"type": "intent", "status": "ok", **intent_metadata})
+            react_trace.append({"type": "intent", **intent_metadata})
+            self._emit("intent", intent_metadata)
+            messages[0] = {
+                "role": "system",
+                "content": context.build_system_prompt(user_message, self._intent),
+            }
+            tool_definitions = [
+                definition for definition in self.registry.get_definitions()
+                if definition["function"]["name"] in self._intent.allowed_tool_names
+            ]
+
+            # Node 2 executes only tools permitted by that decision, then interprets results.
+            while iteration < self.max_iterations:
+                if self._cancelled:
+                    trace.write({"type": "cancelled", "iter": iteration})
+                    logger.info("AgentLoop cancelled by user")
+                    break
+
+                iteration += 1
+
+                # Layer 1: microcompact (every iteration)
+                _microcompact(messages)
+
+                # Layer 2: context collapse (fold long text, zero API cost)
+                tokens = estimate_tokens(messages)
+                if tokens > COLLAPSE_THRESHOLD:
+                    _context_collapse(messages)
+                    tokens = estimate_tokens(messages)
+
+                # Layer 3: auto_compact (token threshold exceeded)
+                if tokens > TOKEN_THRESHOLD:
+                    logger.info(f"Auto compact triggered: {tokens} tokens > {TOKEN_THRESHOLD}")
+                    self._auto_compact(messages, run_dir, trace)
+
+                logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
+
+                # Streaming output + collect thinking text
+                thinking_chunks: List[str] = []
+
+                def _on_text_chunk(delta: str) -> None:
+                    thinking_chunks.append(delta)
+                    self._emit("text_delta", {"delta": delta, "iter": iteration})
+
+                response = self.llm.stream_chat(
+                    messages,
+                    tools=tool_definitions,
+                    on_text_chunk=_on_text_chunk,
+                )
+                if self._cancelled:
+                    trace.write({"type": "cancelled", "iter": iteration})
+                    break
+
+                thinking_text = "".join(thinking_chunks)
+                if thinking_text:
+                    trace.write({"type": "thinking", "iter": iteration, "content": thinking_text[:2000]})
+                    self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
+
+                if not response.has_tool_calls:
+                    if (
+                        (self._intent.requires_market_data or self._intent.task_kind == "clarification")
+                        and self._latest_business_result is None
+                    ):
+                        raise ValueError("本次请求尚未完成必要的分析或结构化澄清，不能直接作为已完成回答")
+                    if self._pending_scope_review is not None:
+                        final_content = self._finish_scope_review(context)
+                        answer_message = {"role": "assistant", "content": final_content}
+                        messages.append(answer_message)
+                        durable_history.append(copy.deepcopy(answer_message))
+                        trace.write({"type": "answer", "iter": iteration, "content": final_content})
+                        react_trace.append({"type": "answer", "content": final_content})
+                        break
+                    if context.contains_unexpected_script(response.content):
+                        from duihua.fenxi_zhanshi import goujian_fenxi_anquan_huitui
+
+                        logger.warning("Blocked user-facing answer containing an unexpected script")
+                        final_content = goujian_fenxi_anquan_huitui(
+                            self._latest_analysis_payload
+                        )
+                    else:
+                        final_content = context.sanitize_user_facing_content(response.content)
+                        single_stock_payload = (
+                            self._latest_analysis_payload
+                            if isinstance(self._latest_analysis_payload, dict)
+                            and self._latest_analysis_payload.get("analysis_type") == "single_stock_analysis"
+                            else None
+                        )
+                        if single_stock_payload is not None:
+                            final_content = _replace_single_stock_classification_code(
+                                final_content,
+                                single_stock_payload,
+                            )
+                        if self._latest_analysis_payload is not None and _removed_forecast_offer(final_content):
+                            from duihua.fenxi_zhanshi import goujian_fenxi_anquan_huitui
+
+                            cleaned_content = _remove_removed_forecast_offer(final_content)
+                            if cleaned_content:
+                                logger.warning("Removed an offer for the retired forecast feature")
+                                final_content = cleaned_content
+                            else:
+                                logger.warning("Rebuilt analysis after an inseparable retired-feature offer")
+                                final_content = goujian_fenxi_anquan_huitui(
+                                    self._latest_analysis_payload
+                                )
+                    from duihua.fenxi_zhanshi import buquan_zhengju_baogao
+
+                    if (
+                        self._intent.unverifiable_requirements
+                        and isinstance(self._latest_analysis_payload, dict)
+                        and self._latest_analysis_payload.get("status") in {"ok", "partial"}
+                    ):
+                        limitation = context.sanitize_user_facing_content(
+                            "以下为已取得证据支持的研究参考，尚不能核验原始要求："
+                            + "；".join(self._intent.unverifiable_requirements) + "。"
+                        )
+                        final_content = limitation + "\n\n" + final_content
+                    final_content = buquan_zhengju_baogao(
+                        final_content, self._latest_analysis_payload,
+                    )
+                    answer_message = {"role": "assistant", "content": final_content}
+                    messages.append(answer_message)
+                    durable_history.append(copy.deepcopy(answer_message))
+                    trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})
+                    react_trace.append({"type": "answer", "content": final_content[:500]})
+                    break
+
+                assistant_tool_message = context.format_assistant_tool_calls(
+                    response.tool_calls,
+                    content=response.content,
+                    reasoning_content=response.reasoning_content or thinking_text or None,
+                    provider_data=response.provider_data,
+                )
+                messages.append(assistant_tool_message)
+                durable_history.append(copy.deepcopy(assistant_tool_message))
+
+                # Execute tools with read/write batching
+                compact_requested, focus_topic = self._process_tool_calls(
+                    response.tool_calls, context, messages, durable_history, trace, react_trace, iteration,
+                )
+
+                if self._pending_clarification is not None:
+                    request = self._pending_clarification
+                    interactive = getattr(self.registry.get("clarify"), "has_interactive_handler", False)
+                    final_content = "请先确认分析条件，再继续筛选。" if interactive else context.sanitize_user_facing_content(request.question)
+                    if request.choices and not interactive:
+                        final_content += "\n\n" + "\n".join(
+                            f"{index}. {choice.label}" for index, choice in enumerate(request.choices, 1)
+                        )
+                    answer_message = {"role": "assistant", "content": final_content}
+                    messages.append(answer_message)
+                    durable_history.append(copy.deepcopy(answer_message))
+                    trace.write({"type": "answer", "iter": iteration, "content": final_content})
+                    react_trace.append({"type": "answer", "content": final_content})
+                    break
+
+                # Layer 3: compress after all tools have executed
+                if compact_requested:
+                    logger.info("Manual compact triggered by model")
+                    self._auto_compact(messages, run_dir, trace, focus_topic=focus_topic)
+
+        except Exception as exc:
+            reset_scope_request()
+            failure_status = "cancelled" if self._cancelled else "failed"
+            failure_reason = "cancelled by user" if self._cancelled else str(exc)
+            if self._cancelled:
+                logger.info("AgentLoop cancelled during a model call")
+            else:
+                logger.exception(f"AgentLoop error: {exc}")
+            if isinstance(exc, IntentRecognitionError) and not self._cancelled:
+                trace.write({"type": "intent", "status": "failed"})
+                final_content = "未能可靠识别本次请求，尚未执行行情分析。请重新说明要分析的股票或选股范围。"
+            trace.write({"type": "end", "status": failure_status, "reason": failure_reason, "iterations": iteration})
+            trace.close()
+            state_store.mark_status(run_dir, failure_status, failure_reason)
+            state_store.save_response(
+                run_dir,
+                {
+                    "status": failure_status,
+                    "content": final_content,
+                    "reason": failure_reason,
+                    "iterations": iteration,
+                    "react_trace": react_trace,
+                    "history": durable_history,
+                },
+            )
+            public_run_dir, public_run_id = state_store.public_location(run_dir)
+            state_store.cleanup_ephemeral(run_dir)
+            return {
+                "status": failure_status,
+                "reason": failure_reason,
+                "run_dir": public_run_dir,
+                "run_id": public_run_id,
+                "content": final_content,
+                "react_trace": react_trace,
+                "history": durable_history,
+                "intent": self._intent.to_dict() if self._intent is not None else None,
+            }
+
+        if self._pending_scope_review is not None and not self._cancelled:
+            final_content = self._finish_scope_review(context)
+            durable_history.append({"role": "assistant", "content": final_content})
+        reset_scope_request()
+        # Determine final status without treating an LLM fallback sentence as business success.
+        business_payload = self._latest_business_result[1] if self._latest_business_result else None
+        reason = ""
+        if self._cancelled:
+            state_store.mark_status(run_dir, "cancelled", "cancelled by user")
+            final_status = "cancelled"
+        elif self._latest_business_result is not None:
+            tool_name, business_payload = self._latest_business_result
+            final_status = _business_run_status(business_payload, tool_name) or "failed"
+            reason = (
+                str(business_payload.get("error") or "")
+                if final_status not in {"success", "no_recommendation"}
+                else ""
+            )
+            state_store.mark_status(run_dir, final_status, reason)
+        elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
+            state_store.mark_status(run_dir, "success")
+            final_status = "success"
+        else:
+            state_store.mark_failure(run_dir, "pipeline did not complete")
+            final_status = "failed"
+
+        trace.write({"type": "end", "status": final_status, "iterations": iteration})
+        trace.close()
+        clarification = (
+            self._pending_clarification.to_dict()
+            if final_status in {"success", "clarification_required"}
+            and self._pending_clarification is not None
+            else None
+        )
+        business_outcome = (
+            str(business_payload.get("outcome") or final_status)
+            if business_payload is not None
+            else None
+        )
+        state_store.save_response(
+            run_dir,
+            {
+                "status": final_status,
+                "content": final_content,
+                "reason": reason,
+                "iterations": iteration,
+                "react_trace": react_trace,
+                "history": durable_history,
+                "clarification": clarification,
+                "business_outcome": business_outcome,
+            },
+        )
+
+        public_run_dir, public_run_id = state_store.public_location(run_dir)
+        state_store.cleanup_ephemeral(run_dir)
+
+        return {
+            "status": final_status,
+            "run_dir": public_run_dir,
+            "run_id": public_run_id,
+            "content": final_content,
+            "reason": reason,
+            "react_trace": react_trace,
+            "history": durable_history,
+            "clarification": clarification,
+            "business_outcome": business_outcome,
+            "intent": self._intent.to_dict() if self._intent is not None else None,
+        }
+
+    # -- Tool execution with read/write batching --------------------------------
+
+    def _intent_tool_rejection(self, tc: Any) -> str | None:
+        """Enforce routing before any special-case, serial or parallel execution."""
+        intent = self._intent
+        if intent is None or tc.name not in intent.allowed_tool_names:
+            return "该工具不属于本次已识别请求允许的执行范围"
+        if not isinstance(tc.arguments, dict):
+            return "工具参数必须是结构化对象"
+        if tc.name != "gupiao_fenxi":
+            return None
+        if intent.research_question is not None:
+            research = tc.arguments.get("yanjiu_wenti")
+            if not isinstance(research, dict) or research.get("question") != intent.research_question:
+                return "必须将本次研究问题原文保留在分析参数中，不能省略或替换"
+            unverified = research.get("unverifiable_parts")
+            if intent.unverifiable_requirements and (
+                not isinstance(unverified, list)
+                or any(part not in unverified for part in intent.unverifiable_requirements)
+            ):
+                return "必须保留无法核验的原始目标，不能把未来持有期收益替换成历史表现"
+        requested_count = tc.arguments.get("shuliang")
+        if requested_count != intent.requested_count or isinstance(requested_count, bool):
+            return "候选数量必须来自用户明确要求；未明确数量时传null或省略，不能擅自填1"
+        scope = tc.arguments.get("fanwei", "daily_leaderboards")
+        if intent.task_kind == "single_stock":
+            if scope != "single_stock":
+                return "本次是单股分析，不能改为范围或全市场选股"
+            if intent.stock_query is not None and tc.arguments.get("gupiao") != intent.stock_query:
+                return "单股分析对象必须保留本次识别的股票原文"
+        elif intent.task_kind == "selection":
+            expected_scope = intent.scope_kind
+            if scope != expected_scope:
+                return "选股范围必须与本次识别结果一致，不能扩大、替换或改为单股分析"
+            if intent.scope_text is not None and tc.arguments.get("mingcheng") != intent.scope_text:
+                return "命名范围必须保留用户原文，再由现有业务流程动态核验"
+        return None
+
+    def _finish_scope_review(self, context: ContextBuilder) -> str:
+        """智能体未完成范围选择时，保留真实澄清状态，不能靠一段文字变成成功。"""
+        payload = {**(self._pending_scope_review or {}), "status": "clarification_required", "outcome": "clarification_required"}
+        self._pending_scope_review = None
+        self._latest_analysis_payload = payload
+        self._latest_business_result = ("gupiao_fenxi", payload)
+        request = build_scope_clarification(payload)
+        self._pending_clarification = request
+        if request is None:
+            return "范围仍需确认，请补充具体的行业或主题。"
+        text = context.sanitize_user_facing_content(request.question)
+        if request.choices and not getattr(self.registry.get("clarify"), "has_interactive_handler", False):
+            text += "\n\n" + "\n".join(f"{index}. {choice.label}" for index, choice in enumerate(request.choices, 1))
+        return text
+
+    def _process_tool_calls(
+        self,
+        tool_calls: list,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> tuple[bool, str]:
+        """Pre-process tool calls: handle compact, filter duplicates, batch execute.
+
+        Args:
+            tool_calls: Raw tool calls from LLM response.
+            context: ContextBuilder for formatting messages.
+            messages: Conversation messages (appended in place).
+            trace: TraceWriter.
+            react_trace: React trace list.
+            iteration: Current iteration number.
+
+        Returns:
+            Tuple of (compact_requested, focus_topic).
+        """
+        compact_requested = False
+        focus_topic = ""
+        to_execute = []
+        clarification_requested_in_batch = any(tool_call.name == "clarify" for tool_call in tool_calls)
+
+        for tc in tool_calls:
+            rejection = self._intent_tool_rejection(tc)
+            if rejection is not None:
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={"status": "blocked", "error_code": "intent_tool_mismatch", "error": rejection},
+                    reason="intent_tool_mismatch", context=context, messages=messages,
+                    durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                )
+                continue
+            # Layer 4: compact tool — mark then defer execution
+            if tc.name == "compact":
+                compact_requested = True
+                focus_topic = tc.arguments.get("focus_topic", "")
+                compact_result = context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}')
+                messages.append(compact_result)
+                durable_history.append(copy.deepcopy(compact_result))
+                trace.write({"type": "compact_requested", "iter": iteration})
+                continue
+
+            if tc.name == "gupiao_fenxi" and clarification_requested_in_batch:
+                self._record_skipped_tool_call(
+                    tc=tc, payload={"status": "blocked", "error": "先澄清本次条件，再重新发起分析"},
+                    reason="clarification_precedes_analysis", context=context, messages=messages,
+                    durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                )
+                continue
+
+            if tc.name == "clarify" and self._pending_clarification is not None:
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "status": "blocked",
+                        "error_code": "structured_clarification_managed_by_client",
+                        "error": "交互客户端会在本轮回答后显示当前结构化选择窗口；此处不要重复询问",
+                    },
+                    reason="structured_clarification_managed_by_client",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
+            if tc.name == "gupiao_yuce":
+                removed_result = {
+                    "status": "blocked",
+                    "outcome": "feature_removed",
+                    "error_code": "feature_removed",
+                    "error": "预测功能已移除，当前只提供股票分析与诊断",
+                }
+                self._latest_business_result = (tc.name, removed_result)
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload=removed_result,
+                    reason="feature_removed",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
+            tool_def = self.registry.get(tc.name)
+            is_repeatable = tool_def.repeatable if tool_def else False
+            if tc.name in self._called_ok and not is_repeatable:
+                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
+                self._record_skipped_tool_call(
+                    tc=tc,
+                    payload={
+                        "skipped": True,
+                        "reason": f"{tc.name} already completed successfully. Use the previous result.",
+                    },
+                    reason="already_completed",
+                    context=context,
+                    messages=messages,
+                    durable_history=durable_history,
+                    trace=trace,
+                    react_trace=react_trace,
+                    iteration=iteration,
+                )
+                continue
+
+            to_execute.append(tc)
+
+        if not to_execute:
+            return compact_requested, focus_topic
+
+        # Batch execute: consecutive readonly → parallel, write → serial
+        if len(to_execute) == 1:
+            self._execute_single(to_execute[0], context, messages, durable_history, trace, react_trace, iteration)
+        else:
+            self._batch_execute(to_execute, context, messages, durable_history, trace, react_trace, iteration)
+
+        return compact_requested, focus_topic
+
+    @staticmethod
+    def _record_skipped_tool_call(
+        *,
+        tc: Any,
+        payload: dict[str, Any],
+        reason: str,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Record one policy-blocked tool call through the normal tool-result protocol."""
+        skip_message = json.dumps(payload, ensure_ascii=False)
+        skipped_result = context.format_tool_result(tc.id, tc.name, skip_message)
+        messages.append(skipped_result)
+        durable_history.append(copy.deepcopy(skipped_result))
+        trace.write(
+            {
+                "type": "tool_skipped",
+                "iter": iteration,
+                "tool": tc.name,
+                "reason": reason,
+            }
+        )
+        react_trace.append({"type": "tool_skipped", "tool": tc.name, "reason": reason})
+
+    def _batch_execute(
+        self,
+        tool_calls: list,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Execute tools with read/write batching.
+
+        Consecutive readonly tools run in parallel via ThreadPoolExecutor.
+        Write tools run serially between readonly batches.
+
+        Args:
+            tool_calls: Tool calls to execute.
+            context: ContextBuilder.
+            messages: Conversation messages.
+            trace: TraceWriter.
+            react_trace: React trace list.
+            iteration: Current iteration.
+        """
+        # Split into batches: consecutive readonly → parallel, write → serial
+        batches: list[tuple[str, list]] = []
+        current_ro: list = []
+
+        for tc in tool_calls:
+            tool_def = self.registry.get(tc.name)
+            if tool_def and tool_def.is_readonly:
+                current_ro.append(tc)
+            else:
+                if current_ro:
+                    batches.append(("parallel", current_ro))
+                    current_ro = []
+                batches.append(("serial", [tc]))
+        if current_ro:
+            batches.append(("parallel", current_ro))
+
+        for mode, batch in batches:
+            if self._pending_clarification is not None:
+                for tc in batch:
+                    self._record_skipped_tool_call(
+                        tc=tc, payload={"status": "blocked", "error": "请先回答当前澄清，不能跳过条件继续分析"},
+                        reason="clarification_required", context=context, messages=messages,
+                        durable_history=durable_history, trace=trace, react_trace=react_trace, iteration=iteration,
+                    )
+                continue
+            if mode == "parallel" and len(batch) > 1:
+                self._execute_parallel(batch, context, messages, durable_history, trace, react_trace, iteration)
+            else:
+                for tc in batch:
+                    self._execute_single(tc, context, messages, durable_history, trace, react_trace, iteration)
+
+    def _execute_parallel(
+        self,
+        tool_calls: list,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Execute readonly tools in parallel using threads.
+
+        Args:
+            tool_calls: Readonly tool calls to execute in parallel.
+            context: ContextBuilder.
+            messages: Conversation messages.
+            trace: TraceWriter.
+            react_trace: React trace list.
+            iteration: Current iteration.
+        """
+        # Prepare args + emit events
+        runnable: list[tuple] = []
+        for tc in tool_calls:
+            args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
+            self._emit("tool_call", {"tool": tc.name, "arguments": {k: str(v)[:200] for k, v in args.items()}, "iter": iteration})
+            trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "args": {k: str(v)[:200] for k, v in args.items()}})
+            runnable.append((tc, args))
+
+        # Execute in parallel
+        def _run(tc_args: tuple) -> tuple:
+            tc, args = tc_args
+            t0 = _time.perf_counter()
+            result = self.registry.execute(tc.name, args)
+            elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+            return tc, result, elapsed_ms
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(runnable), 8)) as pool:
+            futures = [pool.submit(_run, item) for item in runnable]
+            results = []
+            for i, f in enumerate(futures):
+                try:
+                    results.append(f.result())
+                except Exception as exc:
+                    tc = runnable[i][0]
+                    results.append((tc, json.dumps({"status": "error", "error": str(exc)}), 0))
+
+        # Process results in order
+        for tc, result, elapsed_ms in results:
+            self._finalize_tool_result(
+                tc, result, elapsed_ms, context, messages, durable_history, trace, react_trace, iteration
+            )
+
+    def _execute_single(
+        self,
+        tc: Any,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Execute a single tool call.
+
+        Args:
+            tc: Tool call object.
+            context: ContextBuilder.
+            messages: Conversation messages.
+            trace: TraceWriter.
+            react_trace: React trace list.
+            iteration: Current iteration.
+        """
+        args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
+
+        self._emit("tool_call", {"tool": tc.name, "arguments": {k: str(v)[:200] for k, v in args.items()}, "iter": iteration})
+        trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "args": {k: str(v)[:200] for k, v in args.items()}})
+        logger.info(f"Tool call: {tc.name}({list(args.keys())})")
+
+        t0 = _time.perf_counter()
+        result = self.registry.execute(tc.name, args)
+        elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+
+        self._finalize_tool_result(
+            tc, result, elapsed_ms, context, messages, durable_history, trace, react_trace, iteration
+        )
+
+    def _finalize_tool_result(
+        self,
+        tc: Any,
+        result: str,
+        elapsed_ms: int,
+        context: ContextBuilder,
+        messages: list,
+        durable_history: list[dict[str, Any]],
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> None:
+        """Record a tool result: update memory, append message, write trace, emit event.
+
+        Args:
+            tc: Tool call object.
+            result: Raw tool result string.
+            elapsed_ms: Execution time in milliseconds.
+            context: ContextBuilder.
+            messages: Conversation messages.
+            trace: TraceWriter.
+            react_trace: React trace list.
+            iteration: Current iteration.
+        """
+        self._update_memory(tc.name)
+
+        success = _is_tool_success(result)
+        if tc.name in {"gupiao_fenxi", "gupiao_yuce", "clarify"}:
+            try:
+                parsed = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            payload = parsed if isinstance(parsed, dict) else {
+                "status": "error",
+                "outcome": "program_error",
+                "error": "业务工具没有返回有效的结构化结果",
+            }
+            if tc.name == "clarify":
+                getattr(self.registry.get("gupiao_fenxi"), "reset_request", lambda: None)()
+                self._latest_analysis_payload = None
+                if payload.get("status") == "ok":
+                    payload = {**payload,
+                               "status": "cancelled" if payload.get("cancelled") else "reanalysis_required",
+                               "outcome": "cancelled" if payload.get("cancelled") else "reanalysis_required"}
+            self._latest_business_result = (tc.name, payload)
+            self._pending_scope_review = payload if payload.get("status") == "scope_review_required" else None
+            success = _business_run_status(payload, tc.name) in {"success", "no_recommendation", "information_partial"}
+            if tc.name == "gupiao_fenxi":
+                self._latest_analysis_payload = payload
+        if tc.name in {"gupiao_fenxi", "clarify"}:
+            self._pending_clarification = (
+                build_scope_clarification(result) if not success else None
+            )
+        if success:
+            self._called_ok.add(tc.name)
+
+        status = "ok" if success else "error"
+        tool_result_message = context.format_tool_result(tc.id, tc.name, result)
+        messages.append(tool_result_message)
+        durable_history.append(copy.deepcopy(tool_result_message))
+
+        trace.write({"type": "tool_result", "iter": iteration, "tool": tc.name, "status": status, "elapsed_ms": elapsed_ms, "preview": result[:200]})
+        react_trace.append({"type": "tool_call", "tool": tc.name, "result_preview": result[:200]})
+        self._emit("tool_result", {"tool": tc.name, "status": status, "elapsed_ms": elapsed_ms, "preview": result[:200]})
+
+    # -- Context compression ---------------------------------------------------
+
+    def _auto_compact(self, messages: list, run_dir: Path, trace: TraceWriter,
+                      focus_topic: str = "") -> None:
+        """Layer 3/4/5: structured LLM summary with token-budget tail protection.
+
+        Upgrades over the original:
+          - Token-budget tail: keeps ~20K tokens of recent messages (not a fixed count).
+          - Structured summary template: preserves goal, progress, decisions, files, etc.
+          - Iterative update: Nth compression updates previous summary, zero info decay.
+          - Tool pair fix: repairs orphaned tool_call/tool_result after compression.
+          - Focus-topic: optionally prioritize specific topic in summary.
+
+        Args:
+            messages: Message list (replaced in place).
+            run_dir: Run directory.
+            trace: TraceWriter.
+            focus_topic: Optional topic to prioritize in the summary.
+        """
+        # 完整对话只在用户明确选择 full_redacted 时落盘；默认元数据策略下
+        # 压缩仍可在内存完成，不能绕过运行记录隐私配置。
+        transcript_reference = "not persisted by current run-log policy"
+        if trace.policy.enabled and trace.policy.content_mode == "full_redacted":
+            transcript_path = run_dir / f"transcript_{int(_time.time())}.jsonl"
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    safe_message = redact_for_log(msg)
+                    f.write(json.dumps(safe_message, default=str, ensure_ascii=False) + "\n")
+            transcript_reference = str(transcript_path)
+        else:
+            trace.write(
+                {
+                    "type": "transcript_not_saved",
+                    "message_count": len(messages),
+                    "policy": trace.policy.content_mode,
+                }
+            )
+
+        system_msg = messages[0]
+        body = messages[1:]
+
+        # Token-budget tail: walk backward to find how many recent messages to preserve
+        accumulated = 0
+        cut_idx = len(body)
+        for i in range(len(body) - 1, -1, -1):
+            content = body[i].get("content", "")
+            msg_tokens = (len(str(content)) // 4) + 10
+            if accumulated + msg_tokens > TAIL_TOKEN_BUDGET:
+                cut_idx = i + 1
+                break
+            accumulated += msg_tokens
+            cut_idx = i
+
+        # Don't split in the middle of a tool_call/tool_result pair
+        while 0 < cut_idx < len(body) and body[cut_idx].get("role") == "tool":
+            cut_idx += 1
+
+        head = body[:cut_idx]
+        tail = body[cut_idx:]
+
+        if not head:
+            # All body fits in tail budget — force a split to avoid infinite loop
+            if len(body) > 2:
+                cut_idx = max(1, len(body) // 2)
+                head = body[:cut_idx]
+                tail = body[cut_idx:]
+            else:
+                logger.warning("Auto compact: nothing to compress (body too small)")
+                return
+
+        # Build focus section
+        focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
+
+        # Build summary prompt (structured template or iterative update)
+        conv_text = json.dumps(head, default=str, ensure_ascii=False)[:80000]
+
+        if self._previous_summary:
+            prompt = _ITERATIVE_UPDATE_PROMPT.format(
+                previous_summary=self._previous_summary,
+                new_turns=conv_text,
+                focus_section=focus_section,
+            )
+        else:
+            prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
+
+        summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+        summary = summary_resp.content or ""
+        self._previous_summary = summary
+
+        tokens_before = estimate_tokens(messages)
+        trace.write({"type": "compact", "tokens_before": tokens_before, "summary": summary[:500],
+                      "focus_topic": focus_topic or "(none)"})
+        self._emit("compact", {"tokens_before": tokens_before, "summary": summary[:200]})
+
+        # Reconstruct: system + summary + acknowledge + preserved tail
+        state_summary = self.memory.to_summary()
+        compressed = (
+            "[Conversation compressed — handoff summary. "
+            f"Transcript: {transcript_reference}]\n\n{summary}"
+        )
+        if state_summary and state_summary != "(empty state)":
+            compressed += f"\n\nCurrent agent state:\n{state_summary}"
+
+        messages.clear()
+        messages.append(system_msg)
+        messages.append({"role": "user", "content": compressed})
+        messages.append({"role": "assistant", "content": "Understood. Continuing from the summary."})
+        messages.extend(tail)
+
+        # Fix orphaned tool pairs in the reconstructed message list
+        _fix_tool_pairs(messages)
+        # 摘要模型可能只看到截断的旧范围审查消息。以本轮真实完成载荷补回状态、
+        # 原始值和反证；完整组件仍由本地展示层从原载荷补齐，不交给摘要模型决定状态。
+        payload = self._latest_analysis_payload
+        if isinstance(payload, dict) and payload.get("status") in {"ok", "partial"}:
+            anchor = {key: payload[key] for key in (
+                "status", "outcome", "selection_outcome", "analysis_type", "analysis_id", "as_of", "generated_at",
+                "scope", "candidate_counts", "selection_limits", "recommendation_available", "no_recommendation_reason",
+                "comparison_coverage", "selection_methodology", "user_conditions", "market_cap_filter",
+                "indicator_definitions",
+            ) if key in payload}
+            candidates = [payload] if payload.get("analysis_type") == "single_stock_analysis" else [
+                payload.get("primary"), *(payload.get("alternatives") or []), *(payload.get("diagnostic_candidates") or []),
+            ]
+            anchor["completed_reports"] = [{
+                **{key: item[key] for key in ("stock", "name", "ts_code", "diagnosis_summary", "research_question", "selection_analysis", "market_cap_check", "risks", "evidence_gaps", "data_quality", "reassessment_conditions") if key in item},
+                "raw_factor_groups": {key: {field: value for field, value in group.items() if field != "metric_definitions"}
+                                      for key, group in (item.get("daily_factor_analysis") or {}).get("groups", {}).items()},
+            } for item in candidates if isinstance(item, dict)]
+            messages.append(_TransientMessage(role="user", content=(
+                "本轮分析已完成，以下是程序保留的当前结果，优先于可能遗漏状态的对话摘要。直接解释结果和缺口；"
+                "不要重新选范围、重复分析或再确认。按所附指标定义解释，不能根据英文缩写猜测含义。"
+                "合格数量统计全部已复核对象，与展示数不同；按实际覆盖说明优选依据和局限，不能遗漏用户明确条件。"
+                "正文简洁归纳支持、反证、缺口和复评条件；完整指标公式及组件将由展示层补齐。\n" + json.dumps(anchor, ensure_ascii=False)
+            )))
+
+    def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Fire an event via the callback."""
+        if self._event_callback:
+            try:
+                self._event_callback(event_type, data)
+            except Exception:
+                pass
+
+    def _update_memory(self, tool_name: str) -> None:
+        """Update workspace memory counters after tool execution."""
+        self.memory.increment(tool_name)
