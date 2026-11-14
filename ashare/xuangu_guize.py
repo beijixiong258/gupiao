@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 import numpy as np
@@ -42,74 +41,29 @@ def zhuan_json_zhi(value: Any) -> Any:
     return value
 
 
-def _limit_price(previous_close: float, rate: float) -> float:
-    return float(
-        (Decimal(str(previous_close)) * (Decimal("1") + Decimal(str(rate)))).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP,
-        )
-    )
-
-
 def shibie_yizijia_zhangting(
     quote: pd.Series | dict[str, Any],
     *,
-    code: str,
-    name: str,
     tolerance_yuan: float,
 ) -> str | None:
-    """识别无法合理假设成交的一字或近似一字涨停。"""
-    previous_close = zhuan_you_xian_shuzhi(quote.get("previous_close"))
-    current_price = zhuan_you_xian_shuzhi(
-        quote.get("last_price")
-        if quote.get("last_price") is not None
-        else quote.get("latest_price")
-    )
-    open_price = zhuan_you_xian_shuzhi(quote.get("open"))
-    high = zhuan_you_xian_shuzhi(quote.get("high"))
-    low = zhuan_you_xian_shuzhi(quote.get("low"))
-    if previous_close is None or previous_close <= 0:
+    """以核验过的日限价和原价判断一字板。"""
+    if quote.get("price_limit_status") not in {"reported", "calculated"}:
         return None
-    if any(value is None for value in (current_price, open_price, high, low)):
+    upper = zhuan_you_xian_shuzhi(quote.get("limit_up_price"))
+    values = [zhuan_you_xian_shuzhi(quote.get(f"raw_{key}")) for key in ("open", "high", "low", "close")]
+    if upper is None or upper <= 0 or any(value is None or value <= 0 for value in values):
         return None
-    rule = huoqu_zhangdieting_guize(code, name)
-    if rule.limit_rate is None:
-        return None
-    upper = _limit_price(previous_close, rule.limit_rate)
-    if min(float(open_price), float(high), float(low), float(current_price)) >= upper - tolerance_yuan:
+    if all(abs(value - upper) <= tolerance_yuan for value in values):
         return "一字或近似一字涨停，不能合理假设成交"
     return None
-
-
-def shishi_ying_guolv(
-    snapshot: dict[str, Any],
-    *,
-    code: str,
-    name: str,
-    config: dict[str, Any],
-) -> list[str]:
-    """单股与范围选股共用当前行情的硬拦截及错误口径。"""
-    try:
-        reason = shibie_yizijia_zhangting(
-            snapshot,
-            code=code,
-            name=name,
-            tolerance_yuan=float(config.get("xingtai", {}).get("limit_up_tolerance_yuan", 0.005)),
-        )
-    except ValueError:
-        reason = "股票代码不满足程序已有的 A 股市场规则"
-    return [f"已核验行情为{reason}"] if reason else []
 
 
 def jichu_ying_guolv(
     row: pd.Series,
     *,
-    analysis_date: pd.Timestamp,
-    config: dict[str, Any],
     quote_is_completed: bool,
 ) -> list[str]:
     reasons: list[str] = []
-    name = str(row.get("name") or "")
     price = zhuan_you_xian_shuzhi(row.get("latest_price"))
     volume = zhuan_you_xian_shuzhi(row.get("volume"))
     amount = zhuan_you_xian_shuzhi(row.get("amount_yuan"))
@@ -119,18 +73,6 @@ def jichu_ying_guolv(
         reasons.append("成交量字段无效或疑似停牌")
     if quote_is_completed and (amount is None or amount <= 0):
         reasons.append("完整日线成交额缺失、无效或当日没有成交")
-    if quote_is_completed:
-        try:
-            one_price_reason = shibie_yizijia_zhangting(
-                row,
-                code=str(row.get("ts_code")),
-                name=name,
-                tolerance_yuan=float(config.get("xingtai", {}).get("limit_up_tolerance_yuan", 0.005)),
-            )
-            if one_price_reason:
-                reasons.append(f"最近完整交易日为{one_price_reason}")
-        except ValueError:
-            reasons.append("股票代码不满足程序已有的 A 股市场规则")
     return reasons
 
 
@@ -308,9 +250,15 @@ def pinggu_shangzhang_tiaojian(
         if current_required and not current_verified:
             trade_status = "unavailable"
             reason = "当前行情尚未核验，历史日线不能替代盘中成交核验"
-        elif hard_blocks or feasible is False:
+        elif hard_blocks:
             trade_status = "unmet"
             reason = "；".join(hard_blocks) or "当前可交易性检查未通过"
+        elif tradability.get("limit_check_required") and not tradability.get("limit_check_verified"):
+            trade_status = "unavailable"
+            reason = "一字涨停待核验，缺少同日原价或实际涨跌停依据"
+        elif feasible is False:
+            trade_status = "unmet"
+            reason = "当前可交易性检查未通过"
         elif feasible is True:
             trade_status = "met"
             reason = (
@@ -775,6 +723,11 @@ def goujian_zhengju_quekou(item: dict[str, Any]) -> list[dict[str, Any]]:
     if late.get("status") == "unavailable":
         append("late_session_evidence_missing", "尾盘证据", str(late.get("reason") or "尾盘数据不可用"),
                "在适用时段取得有效尾盘数据后复核")
+    pattern = item.get("pattern") or {}
+    if pattern.get("status") in {"partial", "unavailable"}:
+        append("pattern_limit_evidence_missing", "涨停回马枪",
+               "，".join(pattern.get("failure_reasons") or []) or "形态所需同日原价、限价或连续日线未核验",
+               "补齐对应交易日的原价、限价和连续观察窗口后复核")
     for block in (item.get("supplemental_diagnostics") or {}).get("blocks", []):
         if not isinstance(block, dict) or block.get("status") == "ok":
             continue
@@ -877,9 +830,14 @@ def goujian_houxuan_zhaiyao(
         *[str(value) for value in item.get("risks") or []],
     ]))
     name = str(item.get("name") or "")
-    if "ST" in name.upper():
+    risk_status = item.get("risk_status") or {}
+    if risk_status.get("is_st") is True:
+        risks.append("已核验分析日处于风险警示状态")
+    elif risk_status.get("is_st") is None and "ST" in name.upper():
         risks.append("本次股票简称含ST标记；保留事实，不作为未提出的选股排除条件")
-    if "退" in name:
+    if risk_status.get("is_delisting") is True:
+        risks.append("已核验分析日处于退市整理期")
+    elif risk_status.get("is_delisting") is None and "退" in name:
         risks.append("本次股票简称含退市标记，须结合有来源的退市安排解释")
     diagnosis = goujian_dangu_zhaiyao(
         technical=technical, fundamentals=item.get("fundamental") or {}, risks=risks,
@@ -915,6 +873,7 @@ def goujian_houxuan_zhaiyao(
         "late_session_analysis": late,
         "technical_summary": technical,
         "tradability": item.get("tradability"),
+        **({"risk_status": risk_status} if risk_status else {}),
         "snapshot": item.get("snapshot"),
         "data_quality": item.get("data_quality"),
         "risks": risks,
@@ -934,7 +893,6 @@ __all__ = [
     "pinggu_shangzhang_tiaojian",
     "paixu_shangzhang_houxuan",
     "shibie_yizijia_zhangting",
-    "shishi_ying_guolv",
     "xuyao_shishi_kuaizhao",
     "zhuan_json_zhi",
     "zhuan_you_xian_shuzhi",

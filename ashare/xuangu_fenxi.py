@@ -12,7 +12,9 @@ from ashare.ciri_fuhe import goujian_ciri_yuce_jilu
 from ashare.fanwei_faxian import shencha_fanwei_houxuan
 from ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
-from ashare.fenxi_wenti import jiexi_xuangu_tiaojian, jiexi_yanjiu_wenti, pinggu_yanjiu_wenti
+from ashare.fengxian_jingshi_yuan import huoqu_fengxian_jingshi
+from ashare.fenxi_wenti import fengxian_tiaojian_ziduan, jiexi_xuangu_tiaojian, jiexi_yanjiu_wenti, pinggu_yanjiu_wenti
+from ashare.lishi_jiaoyi import KNOWN_LIMIT_STATUSES, LIMIT_EVIDENCE_FIELDS, RAW_FIELDS
 from ashare.dangu_fenxi import DANGU_ANALYSIS_TYPE, fenxi_dangu
 from ashare.fenxi_yinzi import (
     FenxiJisuanYichang,
@@ -45,7 +47,7 @@ from ashare.xuangu_guize import (
     jichu_ying_guolv,
     paixu_shangzhang_houxuan,
     pinggu_shangzhang_tiaojian,
-    shishi_ying_guolv,
+    shibie_yizijia_zhangting,
     xuyao_shishi_kuaizhao,
     zhuan_json_zhi,
     zhuan_you_xian_shuzhi,
@@ -106,6 +108,93 @@ def xianzhi_xuangu_jieguo(result: dict[str, Any], requested_count: Any) -> dict[
     if isinstance(result.get("candidate_counts"), dict):
         limited["candidate_counts"] = {**result["candidate_counts"], "displayed": len(selected)}
     return limited
+
+
+def _heyan_houxuan_xingtai(
+    item: dict[str, Any], *, context: FenxiShujuShangxiawen, analysis_date: pd.Timestamp,
+    clock: dict[str, Any], config: dict[str, Any],
+) -> dict[str, Any]:
+    """仅为出具详报的股票补原始日线限价，保留既有技术日线口径。"""
+    history = item["history"]
+    # D14 内可成立的基准和少量已失效形态同时保留。
+    window = int(config["breakout_deadline_sessions"]) + 1
+    inspection = history.tail(2 * window)
+    profile = item["profile"]
+    code = item["ts_code"]
+    realtime_quote = item["snapshot"] if (clock.get("session_status") in {"trading", "midday_break"}
+                                          and item["tradability"]["current_quote_verified"]) else None
+    if code.endswith(".BJ") or profile.get("market") in {"创业板", "科创板", "北交所"}:
+        return fenxi_zhangting_huimaqiang(inspection, code=code, name=item["name"], config=config,
+                                        historical_trading=pd.DataFrame(), verified_board="other_board")
+    trading, metadata = item.pop("limit_history", (None, None))
+    if trading is None:
+        trading, metadata = _houxuan_xianjia_rili(context, item, inspection.iloc[0]["trade_date"], analysis_date)
+    verified_board = (metadata.get("profile") or {}).get("board")
+    pattern = fenxi_zhangting_huimaqiang(
+        inspection, code=code, name=item["name"], config=config, realtime_quote=realtime_quote,
+        historical_trading=trading, verified_board=verified_board or "unknown",
+    )
+    target = trading.loc[trading["trade_date"].eq(analysis_date)] if not trading.empty else trading
+    current = target.iloc[0] if not target.empty else {}
+    pattern["limit_provenance"] = {
+        "start_date": inspection.iloc[0]["trade_date"].strftime("%Y-%m-%d"),
+        "end_date": analysis_date.strftime("%Y-%m-%d"),
+        "verified_board": verified_board, "attempts": metadata.get("attempts", []),
+        "conflicts": metadata.get("conflicts", []), "fetched_at": metadata.get("fetched_at"),
+        **({"error": metadata["error"]} if metadata.get("error") else {}),
+        "analysis_date_limit": {field: zhuan_json_zhi(current.get(field)) for field in LIMIT_EVIDENCE_FIELDS},
+    }
+    return pattern
+
+
+def _houxuan_xianjia_rili(
+    context: FenxiShujuShangxiawen, item: dict[str, Any], start: pd.Timestamp, end: pd.Timestamp,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    profile = {**item["profile"], "risk_status": item.get("risk_status")}
+    try:
+        return context.lishi_jiaoyi(item["ts_code"], start_date=start.strftime("%Y%m%d"),
+                                   end_date=end.strftime("%Y%m%d"), profile=profile, trading_only=True)
+    except (RuntimeError, OSError, ValueError) as exc:
+        return pd.DataFrame(), {"attempts": [], "error": str(exc)}
+
+
+def _yizi_xianjia_fuhe(
+    item: dict[str, Any], *, context: FenxiShujuShangxiawen, analysis_date: pd.Timestamp, settings: dict[str, Any],
+) -> None:
+    """可疑一字价先取同日原价和已核验限价，再决定基础成交条件。"""
+    quote, check = item["snapshot"], item["tradability"]
+    if not (check["current_quote_verified"] or check["historical_quote_verified"]):
+        return
+    tolerance = float(settings.get("limit_up_tolerance_yuan", 0.005))
+    previous = zhuan_you_xian_shuzhi(quote.get("previous_close"))
+    prices = [zhuan_you_xian_shuzhi(quote.get(key)) for key in ("open", "high", "low", "last_price")]
+    if (previous is None or any(value is None for value in prices)
+            or max(prices) - min(prices) > tolerance or min(prices) <= previous):
+        return
+    date = pd.Timestamp(check["quote_time_verification"]["provider_trade_date"])
+    if check["current_quote_verified"]:
+        evidence, metadata = context.dangri_xianjia_kuaizhao(item["ts_code"], date=date, snapshot=quote)
+    else:
+        break_window = int(settings["breakout_deadline_sessions"]) + 1
+        start = item["history"].tail(2 * break_window).iloc[0]["trade_date"]
+        trading, metadata = _houxuan_xianjia_rili(context, item, start, analysis_date)
+        target = trading.loc[trading["trade_date"].eq(date)] if not trading.empty else trading
+        evidence = target.iloc[0].to_dict() if not target.empty else {}
+        # 参与排除的价格必须与候选横截面的同日原价核对。
+        if not all((value := zhuan_you_xian_shuzhi(evidence.get(field))) is not None
+                   and abs(price - value) <= tolerance for price, field in zip(prices, RAW_FIELDS)):
+            evidence = {}
+        item["limit_history"] = (trading, metadata)
+    verified = evidence.get("price_limit_status") in KNOWN_LIMIT_STATUSES
+    check.update(limit_check_required=True, limit_check_verified=verified,
+                 applicable_limit={field: zhuan_json_zhi(evidence.get(field)) for field in LIMIT_EVIDENCE_FIELDS},
+                 limit_check_source={key: metadata[key] for key in ("attempts", "fetched_at", "error") if key in metadata})
+    block = shibie_yizijia_zhangting(evidence, tolerance_yuan=tolerance)
+    if block:
+        check["hard_blocks"].append(block)
+        check.update(status="blocked", basic_execution_feasible=False)
+    elif not verified and not check["hard_blocks"]:
+        check.update(status="unavailable", basic_execution_feasible=None)
 
 
 class XuanguFenxiFuWu:
@@ -189,8 +278,6 @@ class XuanguFenxiFuWu:
         for index, row in data.iterrows():
             reasons = jichu_ying_guolv(
                 row,
-                analysis_date=analysis_date,
-                config=self._config,
                 quote_is_completed=quote_is_completed,
             )
             if reasons:
@@ -404,6 +491,15 @@ class XuanguFenxiFuWu:
             and analysis_date.normalize() == pd.Timestamp(self._context.reference.date())
         )
         profiles_by_code = profile_subset.set_index("ts_code", drop=False)
+        status_fields = fengxian_tiaojian_ziduan((user_conditions or []) + ((research_question or {}).get("checks") or []))
+        risk_status, risk_metadata = {}, {"status": "not_requested"}
+        if status_fields:
+            risk_status, risk_metadata = huoqu_fengxian_jingshi(
+                {code: name.strip() for code, name in profiles_by_code["name"].fillna("").astype(str).items()
+                 if name.strip() and code in factor_map},
+                status_fields, target=analysis_date, current_completed_date=self._context.zuixin_wanzheng_jiaoyiri(),
+                allow_current_list=clock.get("session_status") in {"post_close", "non_trading_day"},
+            )
         preliminary: list[dict[str, Any]] = []
         factor_limit = len(factor_map)
         factor_order = sorted(factor_map)
@@ -441,22 +537,6 @@ class XuanguFenxiFuWu:
                 reference_time=self._context.reference,
                 market_clock=clock,
             )
-            realtime_blocks = shishi_ying_guolv(
-                snapshot if quote_check["current_quote_verified"] or quote_check["historical_quote_verified"] else {},
-                code=code,
-                name=name,
-                config=self._config,
-            )
-            if realtime_blocks:
-                quote_check["hard_blocks"].extend(realtime_blocks)
-                quote_check.update(status="blocked", basic_execution_feasible=False)
-            pattern = fenxi_zhangting_huimaqiang(
-                histories[code],
-                code=code,
-                name=name,
-                config=self._config["xingtai"],
-                realtime_quote=snapshot if str(clock.get("session_status")) in {"trading", "midday_break"} and quote_check["current_quote_verified"] else None,
-            )
             late = fenxi_weipan(
                 histories[code],
                 snapshot=snapshot,
@@ -474,7 +554,7 @@ class XuanguFenxiFuWu:
                 "snapshot": snapshot,
                 "factor": factor,
                 "fundamental": fundamental,
-                "pattern": pattern,
+                "risk_status": risk_status.get(code),
                 "late": late,
                 "technical": {},
                 "user_conditions": user_conditions or [],
@@ -486,6 +566,7 @@ class XuanguFenxiFuWu:
                     "realtime_source": snapshot.get("source"),
                 },
             }
+            _yizi_xianjia_fuhe(item, context=self._context, analysis_date=analysis_date, settings=self._config["xingtai"])
             preliminary.append(item)
         preliminary = paixu_shangzhang_houxuan(preliminary, config=self._config, ranking_context=ranking_context)
         # 完整比较与技术核验先完成；展示数量只限制昂贵的财务和分钟补充报告。
@@ -531,6 +612,9 @@ class XuanguFenxiFuWu:
         ]
         for index, item in enumerate(deep_candidates):
             if not technical_errors:
+                item["pattern"] = _heyan_houxuan_xingtai(
+                    item, context=self._context, analysis_date=analysis_date, clock=clock, config=self._config["xingtai"],
+                )
                 try:
                     fundamentals = self._context.jibenmian(
                         item["ts_code"],
@@ -618,6 +702,11 @@ class XuanguFenxiFuWu:
             {
                 "ts_code": item["ts_code"], "name": item["name"],
                 "technical_reviewed": item["ts_code"] in reviewed_codes,
+                **({"risk_status_checks": [check for check in item["selection"]["conditions"]
+                       if check.get("rule") and fengxian_tiaojian_ziduan([check["rule"]])]} if status_fields else {}),
+                **({"limit_check": {key: item["tradability"].get(key) for key in (
+                    "limit_check_verified", "applicable_limit", "limit_check_source",
+                )}} if item["tradability"].get("limit_check_required") else {}),
                 "missing_conditions": item["selection"]["missing_conditions"],
                 "unmet_conditions": item["selection"]["unmet_conditions"],
                 "recommendation_index": item["selection"].get("recommendation_index"),
@@ -813,6 +902,7 @@ class XuanguFenxiFuWu:
                 "factor_panel": panel_meta,
                 "realtime_snapshot": realtime_meta,
                 "environment": environment_meta,
+                "risk_status": risk_metadata,
             },
             "selection_methodology": {
                 "method": (probability_statistics.get("methodology") or {}).get("method", "fixed_state_recent_weighted_next_day_return"),

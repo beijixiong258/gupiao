@@ -20,9 +20,13 @@ _LIQUIDITY_REPORT_FIELDS = (
 )
 RAW_FIELDS = tuple(f"raw_{field}" for field in PRICE_FIELDS)
 LIMIT_FIELDS = ("limit_up_price", "limit_down_price")
+LIMIT_EVIDENCE_FIELDS = (
+    *RAW_FIELDS, "limit_reference_price", *LIMIT_FIELDS, "price_limit_status", "limit_source", "limit_reference_source",
+)
 RULES_2026 = pd.Timestamp("2026-07-06")
 EXECUTED_STATUSES = ("traded", "intraday_halt")
 KNOWN_LIMIT_STATUSES = ("reported", "calculated", "no_limit")
+RISK_STATUS_FIELDS = ("is_st", "is_delisting")
 EXCHANGE_RULES = {
     "SH": {"2026": "https://www.sse.com.cn/lawandrules/sselawsrules2025/trade/universal/c/c_20260424_10816492.shtml",
            "previous": "https://www.sse.com.cn/lawandrules/sselawsrules2025/repeal/rules/c/c_20250612_10824490.shtml"},
@@ -45,6 +49,33 @@ def lishi_shuzhi(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def rixian_chengjiao_biaozhi(frame: pd.DataFrame) -> pd.Series:
+    """用日线量、额和已有停牌证据核验真实成交，保留首个失败原因。"""
+    volume, amount = (pd.to_numeric(frame.get(key, pd.Series(np.nan, index=frame.index)), errors="coerce").astype(float)
+                      for key in ("volume", "amount_yuan"))
+    suspended = (frame.get("is_suspended", pd.Series(False, index=frame.index)).eq(True)
+                 | frame.get("trade_status", pd.Series(None, index=frame.index)).eq("suspended")).fillna(False)
+    invalid_amount = ~np.isfinite(volume) | ~np.isfinite(amount) | volume.lt(0) | amount.lt(0)
+    return pd.Series(np.select(
+        [suspended, invalid_amount, volume.eq(0) & amount.eq(0), volume.eq(0) | amount.eq(0)],
+        ["confirmed_suspension", "turnover_missing_or_invalid", "observed_zero_volume_and_amount", "volume_amount_inconsistent_zero"],
+        default="verified"), index=frame.index)
+
+
+def rixian_shoupan_huibao(
+    baseline: float | None, target: float | None, baseline_trade: str, target_trade: str,
+) -> tuple[float | None, list[str]]:
+    """用同一行情序列的两个真实成交日收盘计算无费用涨幅。"""
+    reasons = [f"{side}:{status}" for side, status in (("baseline", baseline_trade), ("target", target_trade))
+               if status != "verified"]
+    if any(value is None or not math.isfinite(value) or value <= 0 for value in (baseline, target)):
+        reasons.append("baseline_or_next_session_close_missing_or_invalid")
+    if reasons:
+        return None, reasons
+    change = float(target / baseline - 1)
+    return (change, []) if math.isfinite(change) else (None, ["reference_return_nonfinite_after_price_ratio"])
 
 
 def zhengli_lishi_rili(frame: pd.DataFrame) -> pd.DataFrame:
@@ -99,7 +130,7 @@ def lishi_xingming_zhuangtai(frame: pd.DataFrame, names: list[dict[str, Any]]) -
             continue
         frame.loc[day, ["historical_name", "is_st", "st_source"]] = [name, is_st, item["source"]]
         if name.startswith("退市") or name.endswith("退"):
-            frame.loc[day, "is_delisting"] = True
+            frame.loc[day, ["is_delisting", "delisting_status_source"]] = [True, item["source"]]
     return conflicts
 
 
@@ -142,7 +173,8 @@ def _dingshi_jiaoyi(
     return "calculated", 0.05 if row["is_st"] else 0.10
 
 
-def _round_limits(reference: float, rate: float) -> tuple[float, float]:
+def jisuan_xianjia(reference: float, rate: float) -> tuple[float, float]:
+    """按交易所的最小价位和分位舍入，计算已知比例对应的上下限。"""
     base = Decimal(str(reference))
     change = Decimal(str(rate))
     cent = Decimal("0.01")
@@ -180,7 +212,7 @@ def zhengli_jiaoyi_zhengju(
         frame[field] = pd.to_numeric(frame.get(field, pd.Series(index=frame.index, dtype=float)), errors="coerce")
         frame[field] = frame[field].replace([np.inf, -np.inf], np.nan)
     frame["adj_factor"] = frame["adj_factor"].where(frame["adj_factor"].gt(0))
-    for field in ("is_suspended", "is_st", "is_delisting", "st_source", "suspension_source", "limit_source",
+    for field in ("is_suspended", "is_st", "is_delisting", "st_source", "delisting_status_source", "suspension_source", "limit_source",
                   "raw_price_source", "factor_source", "limit_reference_source"):
         frame[field] = frame.get(field, pd.Series(None, index=frame.index, dtype=object)).astype(object)
     frame["reported_is_st"] = frame["is_st"]
@@ -218,6 +250,7 @@ def zhengli_jiaoyi_zhengju(
                 frame.loc[covered, "historical_name"] = event["new_name"]
         elif event["kind"] == "delisting_period":
             frame.loc[covered, "is_delisting"] = True
+            frame.loc[covered, "delisting_status_source"] = event["source"]
             frame.loc[covered, "delisting_start"] = event["start_date"]
             frame.loc[covered, "delisting_first_session_no_limit"] = event["first_session_no_limit"]
             frame.loc[covered, "delisting_limit_rate"] = event["limit_rate"]
@@ -253,7 +286,8 @@ def zhengli_jiaoyi_zhengju(
     active = profile.get("listing_status") == "listed" and pd.notna(listed) and pd.isna(delisted)
     if active:
         frame.loc[traded & frame["is_delisting"].isna(), "is_delisting"] = False
-        frame.loc[traded & frame["is_delisting"].eq(False), "delisting_status_source"] = profile.get("identity_source")
+        inferred = traded & frame["is_delisting"].eq(False) & frame["delisting_status_source"].isna()
+        frame.loc[inferred, "delisting_status_source"] = profile.get("identity_source")
     consecutive = traded.shift(1, fill_value=False)
     frame["ordinary_session_verified"] = consecutive & active & frame["is_delisting"].ne(True)
     exchange = profile["ts_code"].rsplit(".", 1)[-1]
@@ -278,7 +312,7 @@ def zhengli_jiaoyi_zhengju(
                 frame.at[day, "price_limit_status"] = status
                 frame.at[day, "limit_source"] = rule_source
             elif rate is not None and ref is not None and ref > 0 and pd.notna(row.get("limit_reference_source")):
-                limits = _round_limits(ref, rate)
+                limits = jisuan_xianjia(ref, rate)
                 if row["raw_high"] <= limits[0] + 1e-8 and row["raw_low"] >= limits[1] - 1e-8:
                     frame.loc[day, list(LIMIT_FIELDS)] = limits
                     frame.at[day, "price_limit_status"] = status

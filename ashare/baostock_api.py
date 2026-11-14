@@ -8,11 +8,14 @@ import sys
 from typing import Any
 
 
-def bao_gupiao_shuju(code: str, start: str, end: str, *, timeout: float) -> dict[str, Any]:
+def bao_gupiao_shuju(code: str, start: str, end: str, *, timeout: float, include_factors: bool = True) -> dict[str, Any]:
     """BaoStock SDK 使用全局 TCP 会话与标准输出，子进程限定总耗时。"""
     try:
+        command = [sys.executable, "-B", "-m", "ashare.baostock_api", code, start, end]
+        if not include_factors:
+            command.append("--skip-factors")
         result = subprocess.run(
-            [sys.executable, "-B", "-m", "ashare.baostock_api", code, start, end],
+            command,
             capture_output=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -22,7 +25,7 @@ def bao_gupiao_shuju(code: str, start: str, end: str, *, timeout: float) -> dict
     return json.loads(result.stdout)
 
 
-def _bao_public_query(code: str, start: str, end: str) -> dict[str, Any]:
+def _bao_public_query(code: str, start: str, end: str, *, include_factors: bool = True) -> dict[str, Any]:
     import socket
     from contextlib import redirect_stdout
 
@@ -44,12 +47,13 @@ def _bao_public_query(code: str, start: str, end: str) -> dict[str, Any]:
             raise RuntimeError(str(login.error_msg))
         try:
             data: dict[str, Any] = {"errors": {}}
-            queries = (
+            queries = [
                 ("daily", bs.query_history_k_data_plus, (code, "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,isST", start, end),
                  {"adjustflag": "3"}),
                 ("profile", bs.query_stock_basic, (code,), {}),
-                ("factors", bs.query_adjust_factor, (code, "1990-12-19", end), {}),
-            )
+            ]
+            if include_factors:
+                queries.append(("factors", bs.query_adjust_factor, (code, "1990-12-19", end), {}))
             for field, query, args, kwargs in queries:
                 try:
                     data[field] = rows(query(*args, **kwargs))
@@ -62,7 +66,7 @@ def _bao_public_query(code: str, start: str, end: str) -> dict[str, Any]:
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(_bao_public_query(*sys.argv[1:]), ensure_ascii=True))
+        print(json.dumps(_bao_public_query(*sys.argv[1:4], include_factors="--skip-factors" not in sys.argv[4:]), ensure_ascii=True))
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)

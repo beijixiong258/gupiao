@@ -7,12 +7,14 @@ import operator
 from functools import lru_cache
 from typing import Any
 
+from ashare.lishi_jiaoyi import RISK_STATUS_FIELDS
+
 
 _OPERATORS = {"gt": operator.gt, "gte": operator.ge, "lt": operator.lt,
               "lte": operator.le, "eq": operator.eq}
 _SYMBOLS = {"gt": ">", "gte": "≥", "lt": "<", "lte": "≤", "eq": "="}
 _PROFILE_FIELDS = {
-    "is_st": ("简称含ST标记", "0/1"), "is_delisting": ("简称含退市标记", "0/1"),
+    "is_st": ("分析日是否有风险警示", "0/1"), "is_delisting": ("分析日是否处于退市整理期", "0/1"),
     "listing_days": ("已核验上市自然日数", "日"), "amount_yuan": ("最近完整日线成交额", "元"),
 }
 _FINANCIAL_FIELDS = {"roe_pct": "净资产收益率", "net_profit_yoy_pct": "净利润同比",
@@ -87,6 +89,10 @@ def jiexi_yanjiu_wenti(value: Any) -> dict[str, Any] | None:
             "unverifiable_parts": unavailable}
 
 
+def fengxian_tiaojian_ziduan(rules: list[dict[str, Any]]) -> set[str]:
+    return {rule.get(field) for rule in rules for field in ("metric", "reference_metric")}.intersection(RISK_STATUS_FIELDS)
+
+
 def _observation(metric: str, item: dict[str, Any]) -> dict[str, Any]:
     factor = item.get("factor") or {}
     date = factor.get("trade_date") or (item.get("data_quality") or {}).get("as_of")
@@ -109,12 +115,15 @@ def _observation(metric: str, item: dict[str, Any]) -> dict[str, Any]:
     if metric in _PROFILE_FIELDS:
         profile = item.get("profile") or {}
         result.update(label=_PROFILE_FIELDS[metric][0], unit=_PROFILE_FIELDS[metric][1], family="profile")
-        name = str(item.get("name", profile.get("name", ""))).strip()
-        if name.lower() in {"", "none", "nan", "<na>", "未知"} or name == str(item.get("ts_code") or "") or name.isdigit():
-            name = ""
-        if metric in {"is_st", "is_delisting"} and name:
-            result["value"] = float("ST" in name.upper() if metric == "is_st" else "退" in name)
-            result["source_basis"] = "本次已核验股票身份的简称；不是对公告内容的推断"
+        if metric in RISK_STATUS_FIELDS:
+            observation = item.get("risk_status") or (item.get("historical_trading") or {}).get("target_session") or {}
+            source = observation.get("st_source" if metric == "is_st" else "delisting_status_source")
+            value = observation.get(metric)
+            result.update(source_basis=source, evidence_date=observation.get("trade_date"),
+                          date_basis=observation.get(f"{metric}_date_basis"), fetched_at=observation.get("fetched_at"),
+                          conflict=observation.get(f"{metric}_conflict"))
+            if isinstance(value, bool) and source and date and str(observation.get("trade_date"))[:10] == str(date)[:10]:
+                result["value"] = float(value)
         elif metric == "listing_days":
             import pandas as pd
             listed, as_of = pd.to_datetime(str(profile.get("list_date", "")), errors="coerce"), pd.to_datetime(date, errors="coerce")
@@ -138,7 +147,7 @@ def _observation(metric: str, item: dict[str, Any]) -> dict[str, Any]:
         state = pattern.get("state")
         result.update(label="涨停回马枪形态已收盘确认", unit="0/1", family="pattern",
                       source_basis="本次形态程序的当前适用与确认状态", state=state)
-        if state and pattern.get("status") not in {"error", "unavailable"}:
+        if state == "close_confirmed" or (state and pattern.get("status") in {"ok", "not_applicable"}):
             result["value"] = float(bool(pattern.get("eligible")) and state == "close_confirmed")
     result["reason"] = "" if result["value"] is not None else "本次未取得该条件所需的有效证据"
     return result

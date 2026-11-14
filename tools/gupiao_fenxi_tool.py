@@ -15,7 +15,7 @@ FenxiScope = Literal["daily_leaderboards", "all_market", "main_board", "named_sc
 _CHECK_SCHEMA = {
     "type": "object",
     "properties": {
-        "metric": {"type": "string", "description": "Exact raw metric from the returned registry, e.g. ma_gap_20, ma_trend_5_20, ret_5, ret_20, macd_hist_pct, volume_ratio_5_20, excess_vs_csi300_ret_20, volatility_20. Selection also supports is_st/is_delisting (0/1), listing_days and amount_yuan. Research additionally supports roe_pct, net_profit_yoy_pct, revenue_yoy_pct, debt_to_assets_pct and pattern_close_confirmed (only the specific limit-up pullback pattern)."},
+        "metric": {"type": "string", "description": "Exact raw metric from the returned registry, e.g. ma_gap_20, ma_trend_5_20, ret_5, ret_20, macd_hist_pct, volume_ratio_5_20, excess_vs_csi300_ret_20, volatility_20. Selection also supports is_st (official risk warning, 0/1), is_delisting (active delisting period before removal, 0/1), listing_days and amount_yuan. Use risk status filters only if explicitly requested. Research additionally supports roe_pct, net_profit_yoy_pct, revenue_yoy_pct, debt_to_assets_pct and pattern_close_confirmed (only the specific limit-up pullback pattern)."},
         "operator": {"type": "string", "enum": ["gt", "gte", "lt", "lte", "eq"]},
         "value": {"type": "number", "description": "Raw units: returns/volatility use fractions (5%=0.05), volume ratio uses times, amount uses yuan, financial *_pct uses percentage points. Supply exactly one of value/reference_metric."},
         "reference_metric": {"type": "string", "description": "Another supported observable in the same units instead of a numeric threshold."},

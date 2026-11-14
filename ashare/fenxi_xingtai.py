@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ashare.lishi_jiaoyi import LIMIT_EVIDENCE_FIELDS, RAW_FIELDS, jisuan_xianjia
+
 
 class HuimaqiangZhuangtai(str, Enum):
     WU_XINGTAI = "none"
@@ -154,6 +156,7 @@ def _fenxi_jizhunri(
     baseline_index: int,
     realtime_quote: dict[str, Any] | None,
     config: dict[str, Any],
+    limit_evidence: dict[str, Any] | None = None,
 ) -> HuimaqiangJieguo:
     baseline = data.iloc[baseline_index]
     baseline_date = pd.Timestamp(baseline["trade_date"]).strftime("%Y-%m-%d")
@@ -183,6 +186,7 @@ def _fenxi_jizhunri(
         "breakout_volume_sufficient": None,
     }
     actuals: dict[str, Any] = {
+        **({"baseline_limit_evidence": limit_evidence} if limit_evidence else {}),
         "baseline_open": round(baseline_open, 3),
         "baseline_high": round(baseline_high, 3),
         "baseline_close": round(float(baseline["close"]), 3),
@@ -401,22 +405,28 @@ def fenxi_zhangting_huimaqiang(
     config: dict[str, Any],
     realtime_quote: dict[str, Any] | None = None,
     historical_trading: pd.DataFrame | None = None,
+    verified_board: str | None = None,
 ) -> dict[str, Any]:
     """识别最近一次回马枪尝试，并公开每个规则的实际命中值。"""
-    eligible, reason = _hefa_biaodi(code, name)
+    board_confirmed = historical_trading is None or verified_board != "unknown"
+    if historical_trading is None or verified_board is None:
+        eligible, reason = _hefa_biaodi(code, name)
+    else:
+        eligible = verified_board == "main_board"
+        reason = "该形态适用于正常 10% 涨跌幅的沪深主板股票"
     if not eligible:
         return HuimaqiangJieguo(
-            state=HuimaqiangZhuangtai.WU_XINGTAI,
+            state=HuimaqiangZhuangtai.WU_XINGTAI if board_confirmed else HuimaqiangZhuangtai.XINXI_BUZU,
             eligible=False,
 
             baseline_date=None,
             shrink_date=None,
             breakout_date=None,
             risk_reference_price=None,
-            actuals={},
-            conditions={"normal_10pct_main_board": False},
+            actuals={} if board_confirmed else {"missing_observation_count": 1},
+            conditions={"normal_10pct_main_board": False if board_confirmed else None},
             evidence=(),
-            failure_reasons=(str(reason),),
+            failure_reasons=(str(reason) if board_confirmed else "缺少经核验的交易板身份，无法核对该形态",),
         ).to_dict(config=config)
     data = _zhengli_lishi(history)
     if len(data) < 2:
@@ -428,15 +438,19 @@ def fenxi_zhangting_huimaqiang(
             shrink_date=None,
             breakout_date=None,
             risk_reference_price=None,
-            actuals={"history_rows": int(len(data))},
+            actuals={"history_rows": int(len(data)), "missing_observation_count": 1},
             conditions={"normal_10pct_main_board": True},
             evidence=(),
             failure_reasons=("完整日线不足，无法识别形态",),
         ).to_dict(config=config)
     tolerance = float(config.get("limit_up_tolerance_yuan", 0.005))
-    baselines: list[int] = []
+    baselines: dict[int, dict[str, Any] | None] = {}
     unknown_limits = 0
     execution = historical_trading.set_index("trade_date") if historical_trading is not None and not historical_trading.empty else None
+    if execution is not None:
+        unavailable = execution["trade_status"].eq("suspended")
+        data.loc[data["trade_date"].isin(execution.index[unavailable]), ["open", "high", "low", "close", "volume"]] = np.nan
+    data.loc[data["volume"].le(0), ["open", "high", "low", "close", "volume"]] = np.nan
     for index, row in data.iterrows():
         if row[["open", "high", "low", "close", "volume"]].isna().any() or row["volume"] <= 0:
             continue
@@ -446,27 +460,38 @@ def fenxi_zhangting_huimaqiang(
                 unknown_limits += 1
                 continue
             observed = execution.loc[day]
-            if observed["price_limit_status"] == "no_limit" or observed["trade_status"] == "suspended":
+            if observed["price_limit_status"] == "no_limit":
                 continue
-            limit, close, opening, reference = (_number(observed[key]) for key in (
-                "limit_up_price", "raw_close", "raw_open", "limit_reference_price",
+            limit, lower, close, opening, reference = (_number(observed.get(key)) for key in (
+                "limit_up_price", "limit_down_price", "raw_close", "raw_open", "limit_reference_price",
             ))
-            if not observed["raw_bar_valid"] or any(value is None for value in (limit, close, opening, reference)) or reference <= 0:
+            if (observed["price_limit_status"] not in {"reported", "calculated"} or not observed["raw_bar_valid"]
+                    or any(value is None or value <= 0 for value in (limit, lower, close, opening, reference))
+                    or lower > limit):
                 unknown_limits += 1
                 continue
-            if abs(limit - _zhangtingjia(reference)) <= 0.005 and abs(close - limit) <= 1e-8 and close > opening:
-                baselines.append(int(index))
+            expected_up, expected_down = jisuan_xianjia(reference, 0.10)
+            if (abs(limit - expected_up) > 0.005 or abs(lower - expected_down) > 0.005
+                    or abs(close - limit) > 1e-8 or close <= opening):
+                continue
+            adjusted = np.array([row[field] for field in ("open", "high", "low", "close")], dtype=float)
+            raw = np.array([_number(observed.get(field)) for field in RAW_FIELDS], dtype=float)
+            # 腾讯等来源的前复权日线按分舍入。验证原价与分析 K 线是同一观测。
+            if not np.isfinite(raw).all() or not np.allclose(adjusted, raw * (adjusted[-1] / close), rtol=0, atol=0.021):
+                unknown_limits += 1
+                continue
+            baselines[int(index)] = {key: observed.get(key) for key in LIMIT_EVIDENCE_FIELDS}
             continue
         previous_close = _number(row.get("pre_close"))
         if previous_close is None or previous_close <= 0:
             continue
         legal_limit = _zhangtingjia(previous_close)
         if float(row["close"]) >= legal_limit - tolerance and float(row["close"]) > float(row["open"]):
-            baselines.append(int(index))
+            baselines[int(index)] = None
     if not baselines:
         missing_count = int(data[["open", "high", "low", "close", "volume"]].isna().any(axis=1).sum()) + unknown_limits
         return HuimaqiangJieguo(
-            state=HuimaqiangZhuangtai.WU_XINGTAI,
+            state=HuimaqiangZhuangtai.XINXI_BUZU if missing_count else HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=True,
 
             baseline_date=None,
@@ -489,6 +514,7 @@ def fenxi_zhangting_huimaqiang(
             baseline_index=index,
             realtime_quote=realtime_quote,
             config=config,
+            limit_evidence=baselines[index],
         )
         for index in reversed(baselines)
     ]

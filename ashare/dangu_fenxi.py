@@ -306,6 +306,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         risks.append("目标日处于退市整理期")
     question_assessment = pinggu_yanjiu_wenti(research_question, {
         "name": name, "profile": unified.get("comparison_profile") or stock, "history": history,
+        "historical_trading": historical_trading,
         "factor": unified.get("factor_analysis"), "technical": technical, "fundamental": fundamentals,
         "pattern": unified.get("limit_up_pullback_pattern"), "data_quality": {"as_of": as_of},
     })

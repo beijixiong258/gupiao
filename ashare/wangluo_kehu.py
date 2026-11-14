@@ -223,9 +223,10 @@ class GongkaiShujuHTTPKehu:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        method: str = "GET",
     ) -> tuple[str, str]:
         """文本版端点回退；主要供交易日历使用。"""
-        content, endpoint = self._qingqiu_neirong(endpoints, params=params, headers=headers, binary=False)
+        content, endpoint = self._qingqiu_neirong(endpoints, params=params, headers=headers, binary=False, method=method)
         return str(content), endpoint
 
     def qingqiu_erjinzhi(
@@ -243,8 +244,10 @@ class GongkaiShujuHTTPKehu:
 
     def _qingqiu_neirong(
         self, endpoints: Iterable[str], *, params: dict[str, Any] | None,
-        headers: dict[str, str] | None, binary: bool,
+        headers: dict[str, str] | None, binary: bool, method: str = "GET",
     ) -> tuple[str | bytes, str]:
+        if method not in {"GET", "POST"}:
+            raise ValueError("公开数据请求仅支持 GET 或 POST")
         candidates = tuple(dict.fromkeys(str(value).strip() for value in endpoints if str(value).strip()))
         if not candidates:
             raise ValueError("远端端点不能为空")
@@ -257,7 +260,7 @@ class GongkaiShujuHTTPKehu:
             host = urlsplit(endpoint).hostname or "unknown"
             for attempt in range(1, maximum_attempts + 1):
                 try:
-                    response = self._client.get(endpoint, params=params, headers=headers)
+                    response = self._client.request(method, endpoint, params=params, headers=headers)
                     response.raise_for_status()
                     content = response.content if binary else response.text
                     if not content.strip():

@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
-from ashare.lishi_jiaoyi import jiaoyi_riqi, lishi_shuzhi
+from ashare.lishi_jiaoyi import jiaoyi_riqi, lishi_shuzhi, rixian_chengjiao_biaozhi, rixian_shoupan_huibao
 from ashare.peizhi import jiazai_lianghua_peizhi
 from ashare.shichang_shuju import FenxiShujuShangxiawen, JiaoyiRili, _beijing_now, shichang_shizhong, zuixin_wanzheng_jiaoyiri
 from ashare.shuju_yuan import biaozhunhua_gupiao_daima
@@ -180,19 +180,18 @@ def duqu_ciri_huifang_jizhun(
 
 def _endpoint_return(history: pd.DataFrame | None, signal: pd.Timestamp, target: pd.Timestamp) -> dict[str, Any]:
     missing = {"signal_close": None, "target_close": None, "realized_next_day_return": None}
-    if history is None or history.empty or not {"trade_date", "close", "volume", "amount_yuan"}.issubset(history):
+    if history is None or history.empty or not {"trade_date", "close"}.issubset(history):
         return {**missing, "reason": "没有取得同源日线"}
     dates = pd.to_datetime(history["trade_date"], errors="coerce").dt.normalize()
     if dates.isna().any() or dates.duplicated().any():
         return {**missing, "reason": "日线日期无效或重复"}
     values = history.assign(trade_date=dates).set_index("trade_date").reindex([signal, target])
     closes = [lishi_shuzhi(value) for value in values["close"]]
-    volumes = [lishi_shuzhi(value) for value in values["volume"]]
-    amounts = [lishi_shuzhi(value) for value in values["amount_yuan"]]
-    valid = all(value is not None and value > 0 for value in closes + volumes + amounts)
+    trades = rixian_chengjiao_biaozhi(values).tolist()
+    change, reasons = rixian_shoupan_huibao(*closes, *trades)
     return {"signal_close": closes[0], "target_close": closes[1],
-            "realized_next_day_return": closes[1] / closes[0] - 1 if valid else None,
-            "reason": None if valid else "信号日或目标日缺少真实成交和有效收盘"}
+            "realized_next_day_return": change, "missing_reasons": reasons,
+            "reason": "信号日或目标日缺少真实成交和有效收盘" if reasons else None}
 
 
 def yanzheng_ciri_yuce(
@@ -245,7 +244,8 @@ def yanzheng_ciri_yuce(
             observed = _endpoint_return(histories.get(code), signal, target)
             source = sources.get(code)
             failure = None
-            if observed["realized_next_day_return"] is None and missing_ends < fallback_limit:
+            confirmed_halt = any(reason.endswith(":confirmed_suspension") for reason in observed.get("missing_reasons", []))
+            if observed["realized_next_day_return"] is None and not confirmed_halt and missing_ends < fallback_limit:
                 missing_ends += 1
                 try:
                     tail, tail_meta = context.dangu_qfq_jinri(code, start_date=signal.strftime("%Y%m%d"), end_date=target.strftime("%Y%m%d"))
@@ -256,7 +256,7 @@ def yanzheng_ciri_yuce(
                         failure = alternative["reason"]
                 except (RuntimeError, OSError, ValueError) as exc:
                     failure = str(exc)
-            elif observed["realized_next_day_return"] is None:
+            elif observed["realized_next_day_return"] is None and not confirmed_halt:
                 failure = "本日个股备用源已达到请求上限"
             realized = observed["realized_next_day_return"]
             primary = item.get("expected_next_day_return")

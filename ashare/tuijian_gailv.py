@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ashare.lishi_jiaoyi import PRICE_FIELDS, rixian_chengjiao_biaozhi, rixian_shoupan_huibao
 from ashare.yinzi_gongcheng import daily_atr, interval_return
 
 
@@ -24,6 +25,7 @@ SCORE_LOOKBACK_SESSIONS = 120
 RECENCY_HALF_LIFE_SESSIONS = 20
 VALIDATION_LOOKBACK_SESSIONS = 60
 _BAR_COLUMNS = ("open", "high", "low", "close", "volume", "amount_yuan")
+_TRADE_COLUMN = "daily_trade_evidence"
 _RAW_COLUMNS = ("ret_1", "ret_5", "ma20", "atr14", "atr_distance", "amount_ratio_5_15")
 _DIRECTIONS = ("up_up", "up_nonup", "nonup_up", "nonup_nonup")
 _POSITIONS = ("at_or_below_ma20", "above_ma20_within_2_atr", "above_ma20_over_2_atr")
@@ -61,7 +63,8 @@ def _calendar(trading_calendar: Iterable, as_of: Any) -> pd.DatetimeIndex:
 
 def _history(history: pd.DataFrame, dates: pd.DatetimeIndex | None, as_of: Any = None) -> pd.DataFrame:
     if not isinstance(history, pd.DataFrame) or history.empty or "trade_date" not in history:
-        return pd.DataFrame(columns=_BAR_COLUMNS, index=dates if dates is not None else pd.DatetimeIndex([]))
+        frame = pd.DataFrame(columns=_BAR_COLUMNS, index=dates if dates is not None else pd.DatetimeIndex([]), dtype=float)
+        return frame.assign(**{_TRADE_COLUMN: rixian_chengjiao_biaozhi(frame)})
     frame = history.copy()
     if "ts_code" in frame and frame["ts_code"].dropna().nunique() > 1:
         raise ValueError("价量状态必须逐股计算，不能跨证券混合历史")
@@ -72,19 +75,22 @@ def _history(history: pd.DataFrame, dates: pd.DatetimeIndex | None, as_of: Any =
     duplicated = frame["trade_date"].duplicated(keep=False)
     frame.loc[duplicated, list(_BAR_COLUMNS)] = np.nan
     frame = frame.drop_duplicates("trade_date").set_index("trade_date").sort_index()
-    frame = frame.loc[:, list(_BAR_COLUMNS)].replace([np.inf, -np.inf], np.nan)
+    frame = frame.reindex(columns=[*_BAR_COLUMNS, "is_suspended", "trade_status"]).replace([np.inf, -np.inf], np.nan)
     if as_of is not None:
         cutoff = _dates([as_of])[0]
         if pd.isna(cutoff):
             raise ValueError("as_of必须是有效的已完成分析日期")
         frame = frame.loc[frame.index <= cutoff]
-    return frame.reindex(dates) if dates is not None else frame
+    if dates is not None:
+        frame = frame.reindex(dates)
+    frame[_TRADE_COLUMN] = rixian_chengjiao_biaozhi(frame)
+    return frame.loc[:, [*_BAR_COLUMNS, _TRADE_COLUMN]]
 
 
 def _state_series(frame: pd.DataFrame) -> pd.DataFrame:
     """仅使用每行及此前输入；日历缺行与非法OHLC使连续窗口重新预热。"""
     close, high, low, opening = (frame[column] for column in ("close", "high", "low", "open"))
-    price_valid = (frame[["open", "high", "low", "close"]] > 0).all(axis=1)
+    price_valid = frame[_TRADE_COLUMN].eq("verified") & frame[list(PRICE_FIELDS)].gt(0).all(axis=1)
     price_valid &= low.le(opening) & opening.le(high) & low.le(close) & close.le(high)
     close = close.where(price_valid)
     amount = frame["amount_yuan"].where(frame["amount_yuan"].ge(0))
@@ -155,7 +161,7 @@ def _environment_series(environment: pd.DataFrame | None, frame: pd.DataFrame,
         values = pd.to_numeric(result[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
         result[column] = values.where(values.gt(-1))
     for window in (5, 20):
-        result[f"stock_ret_{window}"] = interval_return(frame["close"], window)
+        result[f"stock_ret_{window}"] = interval_return(frame["close"].where(frame[_TRADE_COLUMN].eq("verified")), window)
         result[f"industry_excess_ret_{window}"] = result[f"industry_ret_{window}"] - result[f"market_ret_{window}"]
         result[f"stock_excess_ret_{window}"] = result[f"stock_ret_{window}"] - result[f"industry_ret_{window}"]
     return result.replace([np.inf, -np.inf], np.nan)
@@ -212,27 +218,12 @@ def _joint_state(individual: dict[str, Any], environment: dict[str, Any]) -> dic
         "missing_reasons": [*individual["missing_reasons"], *environment["missing_reasons"]]}
 
 
-def _reference_limitations(row: np.ndarray) -> list[str]:
-    reasons: list[str] = []
-    if not np.isfinite(row[4:]).all() or (row[4:] < 0).any():
-        reasons.append("target:turnover_missing_or_invalid")
-    elif row[4] == 0 and row[5] == 0:
-        reasons.append("target:observed_zero_volume_and_amount")
-    elif row[4] == 0 or row[5] == 0:
-        reasons.append("target:volume_amount_inconsistent_zero")
-    return reasons
-
-
-def _event(code: str, key: str, bars: np.ndarray, position: int, dates: pd.DatetimeIndex) -> dict[str, Any]:
+def _event(code: str, key: str, closes: np.ndarray, trades: np.ndarray, position: int, dates: pd.DatetimeIndex) -> dict[str, Any]:
     exit_pos = position + 1
-    baseline, target = bars[position, 3], bars[exit_pos, 3]
-    flags = _reference_limitations(bars[exit_pos])
-    known = bool(np.isfinite([baseline, target]).all() and baseline > 0 and target > 0)
-    change = float(target / baseline - 1) if known else None
-    missing = [] if known else ["baseline_or_next_session_close_missing_or_invalid"]
-    if known and not math.isfinite(change):
-        known, change = False, None
-        missing = ["reference_return_nonfinite_after_price_ratio"]
+    baseline, target = closes[position], closes[exit_pos]
+    change, missing = rixian_shoupan_huibao(baseline, target, trades[position], trades[exit_pos])
+    known = change is not None
+    flags = [reason for reason in missing if reason.startswith(("baseline:", "target:"))]
     return {"ts_code": code, "state_key": key,
         "signal_date": dates[position].strftime("%Y-%m-%d"),
         "signal_session_index": position, "exit_session_index": exit_pos,
@@ -497,8 +488,9 @@ def goujian_tongzhuangtai_tongji(histories: dict[str, pd.DataFrame], trading_cal
             current[code] = _joint_state(individual_current[code], current_environment)
         else:
             current[code] = individual_current[code]
-        bars = frame.to_numpy(dtype=float)
-        close = bars[-1, 3] if len(bars) else np.nan
+        closes = frame["close"].to_numpy(dtype=float)
+        trades = frame[_TRADE_COLUMN].to_numpy()
+        close = closes[-1] if len(closes) and trades[-1] == "verified" else np.nan
         baselines[code] = float(close) if np.isfinite(close) and close > 0 else None
         for position in mature:
             state = _state(values.iloc[position], dates[position], True)
@@ -508,7 +500,7 @@ def goujian_tongzhuangtai_tongji(histories: dict[str, pd.DataFrame], trading_cal
                 else:
                     older_invalid_signal_count += 1
                 continue
-            event = _event(code, state["state_key"], bars, position, dates)
+            event = _event(code, state["state_key"], closes, trades, position, dates)
             baseline_events.append(event)
             if use_environment:
                 environment = _environment_state(environment_values.iloc[position], dates[position])
@@ -604,7 +596,8 @@ def goujian_tongzhuangtai_tongji(histories: dict[str, pd.DataFrame], trading_cal
             "composite_score": "10000*expected_next_day_return", "score_unit": "basis_points",
             "probability_missing_bounds_meaning": "observed_mature_event_unknown_label_bounds_not_future_confidence_interval",
             "historical_pool": "current_request_currently_eligible_stocks_not_reconstructed_historical_full_market",
-            "historical_state_sample": "valid_price_amount_references_not_verified_executable_trades",
+            "historical_state_sample": "positive_volume_and_amount_and_valid_prices; confirmed_suspensions_remain_calendar_gaps",
+            "return_observation_policy": "same_provider_closes_on_both_verified_traded_sessions; actual_flat_return_is_zero",
             "historical_identity_or_limit_rules_verified": False, "future_probability_calibrated": False,
             "training": False, "parameter_search": False, "market_data_persisted": False,
             "industry_reference_reuse_allowed": use_environment,

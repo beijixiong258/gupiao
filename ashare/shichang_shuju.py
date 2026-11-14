@@ -211,14 +211,14 @@ class FenxiShujuShangxiawen:
 
     def lishi_jiaoyi(
         self, code: str, *, start_date: str, end_date: str, profile: dict[str, Any],
-        notice_urls: Iterable[str] = (),
+        notice_urls: Iterable[str] = (), trading_only: bool = False,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         from ashare.lishi_jiaoyi_yuan import huoqu_gupiao_lishi_jiaoyi
 
         normalized = _normalize_code(code)
         start, end = map(pd.Timestamp, (start_date, end_date))
         notices = tuple(notice_urls)
-        key = ("lishi_jiaoyi", normalized, start, end, notices)
+        key = ("lishi_jiaoyi", normalized, start, end, notices, trading_only)
         if key not in self._memo:
             calendar = self.jiaoyi_rili(start_date=start_date, end_date=end_date)
             delisted = pd.to_datetime(profile.get("delist_date"), errors="coerce")
@@ -229,11 +229,18 @@ class FenxiShujuShangxiawen:
             frame, meta = huoqu_gupiao_lishi_jiaoyi(
                 normalized, start=start, end=end, calendar=calendar.open_dates, profile=profile, tushare=_tushare_pro,
                 bao_timeout=22, notice_urls=notices,
-                snapshot_day=end, reference=self.reference,
+                snapshot_day=end, reference=self.reference, trading_only=trading_only,
             )
             self._memo[key] = frame, {**meta, "calendar_source": calendar.source, "calendar_fetched_at": calendar.fetched_at}
         frame, meta = self._memo[key]
         return frame.copy(), copy.deepcopy(meta)
+
+    def dangri_xianjia_kuaizhao(
+        self, code: str, *, date: pd.Timestamp, snapshot: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        from ashare.lishi_jiaoyi_yuan import huoqu_dangri_xianjia
+
+        return huoqu_dangri_xianjia(_normalize_code(code), date=date, snapshot=snapshot, reference=self.reference)
 
     def jibenmian(self, code: str, *, trade_date: str, allow_current_snapshot: bool = False) -> dict[str, Any]:
         from ashare.gupiao_yanjiu import huoqu_jibenmian

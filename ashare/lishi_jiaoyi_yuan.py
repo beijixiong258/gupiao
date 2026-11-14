@@ -23,7 +23,7 @@ from ashare.lishi_jiaoyi import (
     zhankai_shengxiao_yinzi,
     zuihou_shiji_chengjiao,
 )
-from ashare.shuju_yuan import biaozhunhua_gupiao_daima
+from ashare.shuju_yuan import biaozhunhua_gupiao_daima, heyan_kuaizhao_shidian
 from ashare.tengxun_api import tengxun_qfq_rili_duqu
 from ashare.wangluo_kehu import GongkaiShujuHTTPKehu, WangluoQingqiuYichang
 
@@ -313,9 +313,8 @@ def _eastmoney_profile(code: str) -> dict[str, Any]:
     basic = data.get("jbzl") or {}
     offering = data.get("fxxg") or {}
     listed = jiaoyi_riqi(offering.get("ssrq"))
-    if (data.get("SecuCode") != code or data.get("CodeType") != "ABStock"
-            or data.get("Market") != exchange or pd.isna(listed)):
-        raise ValueError("东方财富公司资料未核验 A 股代码及上市日期")
+    if data.get("SecuCode") != code or data.get("CodeType") != "ABStock" or data.get("Market") != exchange:
+        raise ValueError("东方财富公司资料未核验 A 股身份")
     category = basic.get("zqlb")
     board = {"上交所主板A股": "main_board", "深交所主板A股": "main_board", "深交所创业板A股": "chinext",
              "上交所科创板A股": "star"}.get(category)
@@ -338,30 +337,56 @@ def _tushare_delisted_profile(pro: Any, code: str) -> dict[str, Any]:
             "listing_status": "delisted", "identity_source": "tushare_stock_basic_delisted"}
 
 
-def _matching_snapshot_limits(code: str, day: pd.Timestamp, daily: pd.DataFrame, reference: datetime | None) -> dict[str, Any]:
+def _matching_snapshot_limits(
+    code: str, day: pd.Timestamp, row: dict[str, Any], reference: datetime | None, *, realtime: bool = False,
+) -> dict[str, Any]:
     digits, exchange = code.split(".")
     symbol = exchange.lower() + digits
     with GongkaiShujuHTTPKehu("tencent_daily_limit_snapshot") as client:
         body, _ = client.qingqiu_wenben((f"https://qt.gtimg.cn/q={symbol}",), headers={"Referer": "https://gu.qq.com/"})
+    captured = datetime.now(_TIMEZONE)
     match = re.fullmatch(rf'v_{symbol}="([^"\r\n]+)";?', body.strip())
     fields = match[1].split("~") if match else []
     if len(fields) < 49 or fields[2] != digits or not re.fullmatch(r"\d{14}", fields[30]) or jiaoyi_riqi(fields[30][:8]) != day:
         raise ValueError("腾讯涨跌停价快照的代码或交易日未核验")
     quote_time = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=_TIMEZONE)
-    if reference is not None and quote_time > reference.astimezone(_TIMEZONE):
-        raise ValueError("腾讯涨跌停价快照晚于本次请求时点")
-    row = daily.loc[daily["trade_date"].eq(day)].iloc[0]
+    if reference is not None:
+        local_reference = reference.replace(tzinfo=_TIMEZONE) if reference.tzinfo is None else reference.astimezone(_TIMEZONE)
+        if realtime:
+            timing = heyan_kuaizhao_shidian(
+                {"provider_quote_time": quote_time, "provider_trade_date": day, "captured_at": captured},
+                expected_trade_date=day, reference_time=local_reference, require_timestamp=True,
+            )
+            if not timing["verified"]:
+                raise ValueError("腾讯涨跌停价快照时点未通过盘中核验")
+        elif quote_time > local_reference:
+            raise ValueError("腾讯涨跌停价快照晚于本次请求时点")
     observed = [lishi_shuzhi(fields[index]) for index in (5, 33, 34, 3, 4, 47, 48)]
     if any(value is None or value <= 0 for value in observed):
         raise ValueError("腾讯涨跌停价快照缺少有效价量参考")
-    expected = [lishi_shuzhi(row[field]) for field in RAW_FIELDS]
-    reference = lishi_shuzhi(row.get("limit_reference_price"))
+    expected = [lishi_shuzhi(row.get(field)) for field in RAW_FIELDS]
+    reference_price = lishi_shuzhi(row.get("limit_reference_price"))
     if (any(value is None or abs(value - actual) > 1e-8 for value, actual in zip(expected, observed[:4]))
-            or (reference is not None and abs(reference - observed[4]) > 1e-8)):
+            or (reference_price is not None and abs(reference_price - observed[4]) > 1e-8)
+            or not observed[6] <= observed[2] <= observed[1] <= observed[5]):
         raise ValueError("腾讯涨跌停价快照与同日原始日线不一致")
     return {"limit_up_price": observed[5], "limit_down_price": observed[6], "limit_source": "tencent_limit_snapshot",
             "limit_reference_price": observed[4], "limit_reference_source": row.get("limit_reference_source") or "tencent_limit_snapshot",
             "limit_quote_time": fields[30]}
+
+
+def huoqu_dangri_xianjia(code: str, *, date: pd.Timestamp, snapshot: dict[str, Any],
+                        reference: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw = dict(zip(RAW_FIELDS, (snapshot.get(key) for key in ("open", "high", "low", "last_price")), strict=True))
+    raw["limit_reference_price"] = snapshot.get("previous_close")
+    try:
+        limits = _matching_snapshot_limits(code, date, raw, reference, realtime=True)
+    except (RuntimeError, OSError, ValueError) as exc:
+        return {}, {"error": str(exc)}
+    return {**raw, **limits, "price_limit_status": "reported"}, {
+        "attempts": [{"source": "tencent_limit_snapshot", "status": "ok"}],
+        "fetched_at": datetime.now(_TIMEZONE).isoformat(timespec="seconds"),
+    }
 
 
 def _eastmoney_dividends(code: str, start: pd.Timestamp, end: pd.Timestamp) -> list[dict[str, Any]]:
@@ -541,6 +566,7 @@ def huoqu_gupiao_lishi_jiaoyi(
     snapshot_day: pd.Timestamp | None = None,
     reference: datetime | None = None,
     include_liquidity: bool = True,
+    trading_only: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """逐源核验单股证据，同一份收益价格只使用配对的原始价与因子。"""
     attempts: list[dict[str, Any]] = []
@@ -586,7 +612,8 @@ def huoqu_gupiao_lishi_jiaoyi(
     daily = pd.DataFrame()
     if exchange in {"SH", "SZ"}:
         symbol = exchange.lower() + "." + digits
-        bao = attempt("baostock", lambda: bao_gupiao_shuju(symbol, _day(fetch_start), _day(end), timeout=bao_timeout), {})
+        bao = attempt("baostock", lambda: bao_gupiao_shuju(symbol, _day(fetch_start), _day(end), timeout=bao_timeout,
+                                                        include_factors=not trading_only), {})
         for field, reason in (bao.get("errors") or {}).items():
             attempts.append({"source": "baostock_" + field, "status": "unavailable", "reason": reason})
         listed = bao.get("profile") or []
@@ -597,11 +624,11 @@ def huoqu_gupiao_lishi_jiaoyi(
                                 listing_status={"0": "delisted", "1": "listed"}.get(listed[0].get("status")))
         if bao.get("daily"):
             daily = attempt("baostock_daily", lambda: zhengli_lishi_rili(_bao_daily(bao["daily"], symbol)).reset_index(), pd.DataFrame())
-            if not daily.empty and "factors" in bao:
-                indexes = pd.DatetimeIndex(daily["trade_date"])
-                factor = attempt("baostock_factors", lambda: _bao_factors(bao.get("factors") or [], symbol, indexes), pd.Series(index=indexes, dtype=float))
-                daily["adj_factor"] = factor.to_numpy()
-                daily["factor_source"] = factor.notna().map({True: "baostock_adjust_factor", False: None}).to_numpy()
+        if not daily.empty and "factors" in bao:
+            indexes = pd.DatetimeIndex(daily["trade_date"])
+            factor = attempt("baostock_factors", lambda: _bao_factors(bao.get("factors") or [], symbol, indexes), pd.Series(index=indexes, dtype=float))
+            daily["adj_factor"] = factor.to_numpy()
+            daily["factor_source"] = factor.notna().map({True: "baostock_adjust_factor", False: None}).to_numpy()
     if identity["listing_status"] is None and pd.isna(identity["delist_date"]) and exchange != "BJ":
         if exchange == "SH":
             retired = attempt("sse_delisted_stock_directory", lambda: huoqu_sse_tuishi_shenfen(code), {})
@@ -613,7 +640,7 @@ def huoqu_gupiao_lishi_jiaoyi(
     expected = dates[(dates >= fetch_start) & (dates <= effective_end)]
     bao_daily = daily
     bao_latest = daily["trade_date"].max() if not daily.empty else pd.NaT
-    bao_factor_missing = not daily.empty and ("adj_factor" not in daily or not daily["adj_factor"].notna().any())
+    bao_factor_missing = not trading_only and not daily.empty and ("adj_factor" not in daily or not daily["adj_factor"].notna().any())
     if daily.empty or bao_factor_missing or (len(expected) and (pd.isna(bao_latest) or bao_latest < expected[-1])):
         quote_code = code
         fetch_end = max(fetch_start, effective_end)
@@ -623,7 +650,9 @@ def huoqu_gupiao_lishi_jiaoyi(
             tushare_daily = attempt("tushare_daily_old_code", lambda: zhengli_lishi_rili(_tushare_daily(tushare(), quote_code, fetch_start, fetch_end)).reset_index(), pd.DataFrame())
         if not tushare_daily.empty and (daily.empty or tushare_daily["trade_date"].max() >= bao_latest):
             indexes = pd.DatetimeIndex(tushare_daily["trade_date"])
-            factors = attempt("tushare_adj_factor", lambda: _tushare_factors(tushare(), quote_code, indexes, fetch_start, fetch_end), pd.Series(index=indexes, dtype=float))
+            factors = pd.Series(index=indexes, dtype=float)
+            if not trading_only:
+                factors = attempt("tushare_adj_factor", lambda: _tushare_factors(tushare(), quote_code, indexes, fetch_start, fetch_end), factors)
             if daily.empty or tushare_daily["trade_date"].max() > bao_latest or (bao_factor_missing and factors.notna().any()):
                 daily = tushare_daily.assign(adj_factor=factors.to_numpy(), source_ts_code=quote_code)
                 daily["factor_source"] = factors.notna().map({True: "tushare_adj_factor", False: None}).to_numpy()
@@ -638,9 +667,14 @@ def huoqu_gupiao_lishi_jiaoyi(
     if daily.empty:
         daily = pd.DataFrame(columns=["trade_date"])
     if snapshot_day is not None and start <= snapshot_day <= end and daily["trade_date"].eq(snapshot_day).any():
-        limits = attempt("tencent_limit_snapshot", lambda: _matching_snapshot_limits(code, snapshot_day, daily, reference), {})
+        row = daily.loc[daily["trade_date"].eq(snapshot_day)].iloc[0].to_dict()
+        limits = attempt("tencent_limit_snapshot", lambda: _matching_snapshot_limits(code, snapshot_day, row, reference), {})
         for field, value in limits.items():
             daily.loc[daily["trade_date"].eq(snapshot_day), field] = value
+    risk = (profile.get("risk_status") or {}) if trading_only else {}
+    if jiaoyi_riqi(risk.get("trade_date")) == end and isinstance(risk.get("is_delisting"), bool):
+        daily.loc[daily["trade_date"].eq(end), "is_delisting"] = risk["is_delisting"]
+        daily.loc[daily["trade_date"].eq(end), "delisting_status_source"] = " ".join(risk.get("delisting_status_source") or ())
     names = attempt("tushare_namechange", lambda: _tushare_names(tushare(), code, end), [])
     # 停牌可能在请求区间之前开始，上交所接口按重叠区间返回记录。
     notices = attempt("sse_historical_suspension", lambda: _sse_suspensions(code, fetch_start, effective_end), []) if exchange == "SH" else []
@@ -658,7 +692,7 @@ def huoqu_gupiao_lishi_jiaoyi(
     removal = [event for event in official if event["kind"] == "delisting"]
     if len(removal) == 1:
         identity.update(delist_date=removal[0]["start_date"], listing_status="delisted", delist_date_source=removal[0]["source"])
-    dividends = attempt("eastmoney_sharebonus", lambda: _eastmoney_dividends(code, start, end), [])
+    dividends = [] if trading_only else attempt("eastmoney_sharebonus", lambda: _eastmoney_dividends(code, start, end), [])
     source_range_conflicts = daily.loc[~daily["trade_date"].isin(dates), "trade_date"]
     daily, conflicts = zhengli_jiaoyi_zhengju(daily, dates, identity, start=fetch_start, end=end, names=names, notices=notices)
     other_halts = []
@@ -676,7 +710,7 @@ def huoqu_gupiao_lishi_jiaoyi(
     daily = daily.loc[daily["trade_date"].ge(start)].reset_index(drop=True)
     conflicts = [item for item in conflicts if item["trade_date"] >= _day(start)]
     liquidity_meta: dict[str, Any] | None = None
-    if include_liquidity and not daily.empty:
+    if not trading_only and include_liquidity and not daily.empty:
         daily, liquidity_meta = _historical_liquidity(code, daily, bao_daily, attempt)
     return daily, {
         "profile": identity, "name_intervals": names, "notice_events": notices, "corporate_actions": dividends,
