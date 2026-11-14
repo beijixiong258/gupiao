@@ -25,6 +25,47 @@ DONGCAI_KLINE_ENDPOINTS = (
     "https://7.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
 )
+DONGCAI_VALUATION_ENDPOINT = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+DONGCAI_VALUATION_COLUMNS = (
+    "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,TRADE_MARKET,TRADE_DATE,"
+    "CLOSE_PRICE,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,PE_TTM,PE_LAR,PB_MRQ"
+)
+
+
+def dongcai_rizhong_guzhi_duqu(
+    client: GongkaiShujuHTTPKehu, *, filter_text: str, sort_column: str, page_size: int,
+) -> list[dict[str, Any]]:
+    """读取当前截面或个股历史日终估值，核对分页总量。"""
+    rows: list[dict[str, Any]] = []
+    expected_count = expected_pages = None
+    for page in range(1, 21):
+        payload, _ = client.qingqiu_json((DONGCAI_VALUATION_ENDPOINT,), params={
+            "sortColumns": sort_column, "sortTypes": "1", "pageSize": str(page_size), "pageNumber": str(page),
+            "reportName": "RPT_VALUEANALYSIS_DET", "columns": DONGCAI_VALUATION_COLUMNS,
+            "source": "WEB", "client": "WEB", "filter": filter_text,
+        })
+        result = payload.get("result")
+        if payload.get("success") is not True or not isinstance(result, dict):
+            raise ValueError(f"东方财富日终估值业务响应失败：{payload.get('message') or '无有效结果'}")
+        try:
+            count, pages = int(result.get("count", 0)), int(result.get("pages", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("东方财富日终估值分页计数无效") from exc
+        batch = result.get("data")
+        if count <= 0 or not 1 <= pages <= 20 or not isinstance(batch, list) or not batch:
+            raise ValueError("东方财富日终估值为空或分页范围无效")
+        if not all(isinstance(row, dict) for row in batch):
+            raise ValueError("东方财富日终估值行结构无效")
+        if expected_count is None:
+            expected_count, expected_pages = count, pages
+        elif (count, pages) != (expected_count, expected_pages):
+            raise ValueError("东方财富日终估值分页总量变化")
+        rows.extend(batch)
+        if page == expected_pages:
+            break
+    if len(rows) != expected_count:
+        raise ValueError(f"东方财富日终估值分页不完整，应有{expected_count}行，实际{len(rows)}行")
+    return rows
 
 
 def _diff_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:

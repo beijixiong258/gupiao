@@ -66,6 +66,7 @@ def tengxun_qfq_rili_duqu(
     start_date: str,
     end_date: str,
     endpoints: Iterable[str] = TENGXUN_FQKLINE_ENDPOINTS,
+    request_current_tail: bool = False,
 ) -> tuple[list[list[Any]], dict[str, Any], str]:
     """读取前复权日线，并用同一响应中的实时证券快照做结构化核验。"""
     symbol, digits = _tengxun_symbol(code)
@@ -76,7 +77,7 @@ def tengxun_qfq_rili_duqu(
     payload, endpoint = client.qingqiu_json(
         endpoints,
         params={
-            "param": f"{symbol},day,{start},{request_end},640,qfq"
+            "param": f"{symbol},day,,,640,qfq" if request_current_tail else f"{symbol},day,{start},{request_end},640,qfq"
         },
         headers={"Referer": "https://gu.qq.com/"},
     )

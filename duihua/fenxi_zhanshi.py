@@ -41,6 +41,20 @@ _LABELS = {
     "provider_server_time": "来源服务器时钟（非指标更新时间）", "provider_updated_at": "来源指标实际更新时间",
     "source_data": "控盘来源原始证据", "requested_at": "请求发起时间", "fetched_at": "实际取得时间",
     "stock_code": "证券代码", "series": "来源逐日序列", "changes": "连续交易间隔变化",
+    "target_session": "目标日交易证据", "status_intervals": "已识别的交易状态区间",
+    "last_observed_session": "最近有真实成交日的交易证据",
+    "historical_liquidity": "历史换手率与流通市值", "turnover_verified_sessions": "换手率已核验日数",
+    "circulating_value_verified_sessions": "流通市值已核验日数", "requested_sessions": "请求的市场交易日数",
+    "traded_sessions": "已核验成交日数", "suspended_sessions": "全天停牌日数", "unverified_trade_sessions": "成交未核验日数",
+    "raw_open": "不复权开盘价（元）", "raw_high": "不复权最高价（元）",
+    "raw_low": "不复权最低价（元）", "raw_close": "不复权收盘价（元）",
+    "raw_previous_close": "上一实际成交日收盘价（元）", "limit_reference_price": "当日涨跌停计算基准（元）",
+    "adj_factor": "同源复权因子", "limit_up_price": "涨停价（元）", "limit_down_price": "跌停价（元）",
+    "price_limit_status": "涨跌停价证据", "trade_status": "该日交易状态", "historical_name": "历史有效简称",
+    "reported_is_st": "逐日来源 ST 原值", "delist_date": "摘牌日期",
+    "last_actual_trade_date": "最后实际成交日", "last_observed_trade_date": "区间内最后观察到的成交日",
+    "notice_events": "交易所及发行人公告", "name_intervals": "曾用名生效区间",
+    "corporate_actions": "分红、送转与除权除息", "technical_price_basis": "技术指标价格口径",
     "sample_range": "本次观测区间", "price_context": "同日价格与成交对照",
     "price_return": "同窗口股价收益", "control_change": "同窗口控盘原值变化", "window_comparisons": "同窗口价量对照",
     "direction_relationship": "股价与控盘变化关系", "date_aligned": "控盘与正式日线日期是否对齐",
@@ -299,6 +313,12 @@ _LABELS = {
     "size_matched_stocks": "行业与规模均可核验的同行数", "target_size_verified": "本股规模是否核验",
 }
 _STATUS = {
+    "traded": "当日有有效成交", "suspended": "确认全天停牌", "intraday_halt": "确认盘中临停",
+    "delisted": "已摘牌", "not_listed": "尚未上市", "unknown": "待核验",
+    "reported": "来源提供的限价原值", "calculated": "按适用交易规则计算", "no_limit": "当日无涨跌幅限制",
+    "same_source_raw_and_factors": "同源原始价格与复权因子", "existing_qfq_daily": "来源提供的前复权日线",
+    "provider_qfq_current_tail": "腾讯最新前复权日线", "exchange_notices_only": "已核验公告内的盘中停复牌时段",
+    "no_verified_trade": "当日成交未核验，原值仅供查证",
     "daily_leaderboards": "固定日终双榜", "fixed_daily_leaderboards": "涨幅前100与成交额前100合并去重",
     "up_up": "近5日上涨且最近1日上涨", "up_nonup": "近5日上涨但最近1日非上涨",
     "nonup_up": "近5日非上涨但最近1日上涨", "nonup_nonup": "近5日和最近1日均非上涨",
@@ -739,7 +759,7 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
         ("stock", "股票身份"), ("technical_summary", "技术指标与结构"),
         ("market_cap_check", "市值条件与原始值"),
         ("fundamental_analysis", "公司基本面与估值"),
-        ("ownership_analysis", "持仓分析（通达信控盘指标）"),
+        ("ownership_analysis", "持仓分析（通达信控盘指标）"), ("historical_trading", "原始价格与历史交易状态"),
         ("limit_up_pullback_pattern", "涨停回马枪形态"), ("late_session_analysis", "尾盘证据"),
         ("supplemental_diagnostics", "补充诊断"), ("tradability", "可交易性与执行限制"),
         ("realtime_snapshot", "本次行情快照"), ("snapshot", "本次行情快照"), ("data_analysis", "原始行情与比较资料"),
@@ -752,7 +772,28 @@ def _candidate_sections(candidate: dict[str, Any], identity: str, *, single: boo
     ):
         if key in candidate:
             kind = "metadata" if key in _METADATA_CONTAINERS else "observation"
-            sections.append((identity + " / " + title, "\n".join(_tree(candidate[key], value_kind=kind)) or "当前没有可展示的字段。"))
+            value = candidate[key]
+            if key == "historical_trading" and isinstance(value, dict) and value.get("historical_liquidity"):
+                liquidity = value["historical_liquidity"]
+                value = {field: item for field, item in value.items() if field != "historical_liquidity"}
+                columns = (
+                    ("trade_date", "交易日"), ("trade_status", "成交状态"), ("raw_close", "原始收盘（元）"),
+                    ("volume", "成交量（股）"), ("amount_yuan", "成交额（元）"),
+                    ("turnover_rate", "换手率（%）"), ("reported_turnover_rate_pct", "换手率原值（%）"),
+                    ("turnover_volume_shares", "换手来源成交量（股）"), ("turnover_status", "换手率核验"),
+                    ("turnover_source", "换手率来源"), ("circulating_market_value_yuan", "流通市值（元）"),
+                    ("reported_circulating_market_value_yuan", "流通市值原值（元）"),
+                    ("reported_valuation_close", "估值来源收盘（元）"), ("valuation_status", "流通市值核验"),
+                    ("valuation_source", "估值来源"),
+                )
+                lines = _tree({field: item for field, item in liquidity.items() if field != "series"})
+                lines.extend(["", "| " + " | ".join(label for _, label in columns) + " |",
+                              "| " + " | ".join("---" for _ in columns) + " |"])
+                for row in liquidity["series"]:
+                    cells = [_table_cell(_value(row[field])) if row.get(field) is not None else "—" for field, _ in columns]
+                    lines.append("| " + " | ".join(cells) + " |")
+                sections.append((identity + " / 历史换手率与流通市值", "\n".join(lines)))
+            sections.append((identity + " / " + title, "\n".join(_tree(value, value_kind=kind)) or "当前没有可展示的字段。"))
             if key == "ownership_analysis" and isinstance(candidate[key], dict) and candidate[key].get("metric_definitions"):
                 sections.append((identity + " / 控盘指标计算口径", "\n".join(_tree(candidate[key]["metric_definitions"], value_kind="metadata"))))
     if "daily_factor_analysis" in candidate:
@@ -862,7 +903,7 @@ def _single_stock_error_has_evidence(payload: dict[str, Any]) -> bool:
     if payload.get("status") != "error" or payload.get("analysis_type") != "single_stock_analysis":
         return False
     metadata_only = {"status", "outcome", "reason", "error", "error_code", "stage", "warnings", "errors", "source", "sources", "trade_date", "as_of", "generated_at", "captured_at"}
-    for key in ("data_analysis", "daily_factor_analysis", "technical_summary", "fundamental_analysis"):
+    for key in ("data_analysis", "daily_factor_analysis", "technical_summary", "fundamental_analysis", "historical_trading"):
         component = payload.get(key)
         if isinstance(component, dict) and any(
             value is not None and value != "" and value != {} and value != []

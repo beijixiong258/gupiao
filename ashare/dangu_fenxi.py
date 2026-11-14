@@ -14,6 +14,7 @@ from ashare.fenxi_yinzi import FenxiJisuanYichang
 from ashare.dangu_zhaiyao import goujian_dangu_zhaiyao
 from ashare.gupiao_yanjiu import zongjie_jishu
 from ashare.fenxi_wenti import pinggu_yanjiu_wenti
+from ashare.lishi_jiaoyi import LIQUIDITY_FIELDS, PRICE_FIELDS, huizong_lishi_jiaoyi, jiaoyi_riqi
 from ashare.shichang_shuju import FenxiShujuShangxiawen
 from ashare.xuangu_guize import goujian_kejiaoyixing_zhaiyao
 
@@ -57,20 +58,22 @@ def _identity(code: str, *profiles: dict[str, Any]) -> dict[str, Any]:
     for profile in profiles:
         if not isinstance(profile, dict):
             continue
-        for key in ("name", "industry", "market", "list_date"):
+        for key in ("name", "industry", "market", "list_date", "delist_date", "listing_status"):
             value = profile.get(key)
             if value is not None and not pd.isna(value) and str(value).strip() and not result.get(key):
                 result[key] = value
     return _json_safe(result)
 
 
-def _failure(query: str, *, status: str, outcome: str, code: str, stage: str, error: Any, stock=None, provenance=None) -> dict[str, Any]:
+def _failure(query: str, *, status: str, outcome: str, code: str, stage: str, error: Any,
+             stock=None, provenance=None, historical_trading=None) -> dict[str, Any]:
     return {
         "status": status, "outcome": outcome, "analysis_type": DANGU_ANALYSIS_TYPE,
         "tool_contract_version": DANGU_TOOL_CONTRACT_VERSION, "query": query,
         "error_code": code, "stage": stage, "error": " ".join(str(error).split())[:500],
         "stock": stock, "selected_stock": stock, "recommendation_available": False,
         "primary": None, "alternatives": [], "data_provenance": provenance or {},
+        **({"historical_trading": historical_trading} if historical_trading else {}),
         "retryable": status == "unavailable",
         "next_action": "补充明确的股票身份后重试" if status == "clarification_required" else "待数据恢复或错误修复后重新分析",
         "research_scope": "公开数据单股分析，不连接证券账户或执行交易",
@@ -155,13 +158,61 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         return _failure(query, status="unavailable", outcome="data_unavailable", code="calendar_unavailable", stage="calendar", error=exc, stock=stock)
     start_date = (requested_date - pd.Timedelta(days=int((config.get("dangu") or {}).get("history_calendar_days", 1440)))).strftime("%Y%m%d")
     end_date = requested_date.strftime("%Y%m%d")
+    trading_panel = pd.DataFrame()
     try:
-        histories, history_meta = context.piliang_lishi([code], start_date=start_date, end_date=end_date, minimum_rows=1)
-    except Exception as exc:
-        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_request_failed", stage="history_data", error=exc, stock=stock)
-    history = histories.get(code)
+        trading_panel, trading_meta = context.lishi_jiaoyi(code, start_date=start_date, end_date=end_date, profile=resolved_profile or {})
+        historical_trading = huizong_lishi_jiaoyi(trading_panel, trading_meta, end=requested_date)
+        trading_provenance = {key: trading_meta.get(key) for key in ("attempts", "fetched_at", "calendar_source", "calendar_fetched_at", "persistence")}
+    except (RuntimeError, OSError, ValueError) as exc:
+        historical_trading = {"status": "unavailable", "missing_reasons": [str(exc)]}
+        trading_provenance = {"status": "unavailable", "error": str(exc)}
+    delisted = jiaoyi_riqi((historical_trading.get("profile") or {}).get("delist_date"))
+    primary_end = (delisted - pd.Timedelta(days=1)).strftime("%Y%m%d") if pd.notna(delisted) and delisted <= requested_date else end_date
+    coverage = historical_trading.get("coverage") or {}
+    trade_status = (historical_trading.get("target_session") or {}).get("trade_status")
+    observed = jiaoyi_riqi((historical_trading.get("profile") or {}).get("last_observed_trade_date"))
+    if pd.notna(observed) and trade_status in {"suspended", "delisted"}:
+        primary_end = observed.strftime("%Y%m%d")
+    price_source = "same_source_raw_and_factors"
+    if (coverage.get("raw_price_sessions", 0) > 0 and coverage.get("factor_sessions") == coverage["raw_price_sessions"]
+            and (observed == requested_date or trade_status in {"suspended", "delisted"})):
+        fields = ["trade_date", *PRICE_FIELDS, "pre_close", "volume", "amount_yuan", "pct_chg"]
+        history = trading_panel.loc[trading_panel["trade_date"].le(observed), fields].copy()
+        history_meta = {"status": "ok", "technical_raw_sources": sorted(trading_panel["raw_price_source"].dropna().unique().tolist()),
+                        "technical_factor_sources": sorted(trading_panel["factor_source"].dropna().unique().tolist())}
+    else:
+        price_source = "existing_qfq_daily"
+        try:
+            histories, history_meta = context.piliang_lishi([code], start_date=start_date, end_date=primary_end, minimum_rows=1)
+        except Exception as exc:
+            histories, history_meta = {}, {"status": "unavailable", "error": str(exc)}
+        history = histories.get(code)
+        if (history is None or history.empty) and pd.notna(observed) and (
+            trade_status in {"suspended", "delisted"} or observed == requested_date
+        ):
+            try:
+                history, tail_meta = context.dangu_qfq_jinri(code, start_date=start_date, end_date=primary_end)
+            except (RuntimeError, OSError, ValueError) as exc:
+                tail_meta = {"status": "unavailable", "source": "tencent_qfq_current_tail", "reason": str(exc)}
+            history_meta["current_tail_attempt"] = tail_meta
+            if tail_meta.get("status") == "ok":
+                history_meta["status"] = "ok"
+                history_meta["source"] = tail_meta["source"]
+                price_source = "provider_qfq_current_tail"
+        if history is not None and not history.empty and not trading_panel.empty and "trade_date" in history:
+            blocked_dates = trading_panel.loc[trading_panel["trade_status"].eq("suspended"), "trade_date"]
+            history = history.copy()
+            masked = pd.to_datetime(history["trade_date"], errors="coerce").isin(blocked_dates)
+            fields = [key for key in (*PRICE_FIELDS, "pre_close", "pct_chg") if key in history]
+            history.loc[masked, fields] = np.nan
+            last_price = pd.to_datetime(history.loc[history["close"].gt(0), "trade_date"], errors="coerce").max()
+            history = history.loc[pd.to_datetime(history["trade_date"], errors="coerce").le(last_price)]
+    history_meta["technical_price_basis"] = price_source
     if history is None or history.empty:
-        return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_unavailable", stage="history_data", error=history_meta.get("error") or "没有取得目标股票的可用完整日线", stock=stock, provenance={"history": history_meta})
+        return _json_safe(_failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_unavailable",
+                                   stage="history_data", error=history_meta.get("error") or "没有取得目标股票的可用完整日线",
+                                   stock=stock, provenance={"history": history_meta, "historical_trading": trading_provenance},
+                                   historical_trading=historical_trading))
     if "trade_date" not in history:
         return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_invalid", stage="history_data", error="目标日线缺少交易日期", stock=stock, provenance={"history": history_meta})
     dates = pd.to_datetime(history["trade_date"], errors="coerce").dt.normalize()
@@ -170,10 +221,31 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
     history = history.assign(trade_date=dates).loc[dates.le(requested_date)].sort_values("trade_date").reset_index(drop=True)
     if history.empty:
         return _failure(query, status="unavailable", outcome="data_unavailable", code="single_stock_history_unavailable", stage="history_data", error="分析日及之前没有可用日线", stock=stock, provenance={"history": history_meta})
+    if set(LIQUIDITY_FIELDS).issubset(trading_panel):
+        # 保留已有有效值，只按交易日补入经独立核验的流动性字段。
+        recent = trading_panel.set_index("trade_date")
+        suspended = history["trade_date"].map(recent["trade_status"]).eq("suspended")
+        for field in LIQUIDITY_FIELDS:
+            if field not in history:
+                history[field] = np.nan
+            known = history["trade_date"].map(recent[field])
+            original = pd.to_numeric(history[field], errors="coerce")
+            if field == "turnover_rate":
+                original = original.where(original.between(0, 100))
+            else:
+                original = original.where(np.isfinite(original) & original.gt(0))
+            history[field] = original.fillna(known).mask(suspended)
     as_of = history.iloc[-1]["trade_date"].strftime("%Y-%m-%d")
     extra_gaps: list[dict[str, Any]] = []
+    historical_trading["technical_price_basis"] = price_source
+    if historical_trading.get("status") != "ok":
+        reasons = "；".join(historical_trading.get("missing_reasons") or []) or "历史交易证据尚未覆盖请求区间"
+        extra_gaps.append(_gap("historical_trading_partial", "历史交易证据", reasons))
     if as_of != requested_date.strftime("%Y-%m-%d"):
         extra_gaps.append(_gap("latest_daily_missing", "最新完整日线", f"实际日线停留在 {as_of}，没有取得请求日期 {requested_date:%Y-%m-%d} 的日线"))
+    if price_source == "provider_qfq_current_tail" and history.iloc[0]["trade_date"] > pd.Timestamp(start_date):
+        extra_gaps.append(_gap("single_stock_qfq_coverage_shorter", "技术日线覆盖",
+                               f"备用前复权日线从 {history.iloc[0]['trade_date']:%Y-%m-%d} 起，部分长期指标的样本缩短"))
     try:
         technical = zongjie_jishu(history, macd_structure_config=(config.get("fenxi") or {}).get("macd_structure"))
     except Exception as exc:
@@ -213,7 +285,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         code=code, name=name, industry=str(stock.get("industry") or ""), history=history,
         analysis_date=pd.Timestamp(as_of), snapshot=snapshot, clock=clock,
         technical=technical, fundamentals=fundamentals, tradability=tradability,
-        config=config, context=context,
+        config=config, context=context, historical_trading_panel=trading_panel,
     )
     stock = _identity(code, stock, unified.get("stock_identity") or {})
     name = str(stock.get("name") or name)
@@ -223,10 +295,15 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         *((technical.get("macd_structure") or {}).get("risk_warnings") or []),
         *(tradability.get("hard_blocks") or []), *(tradability.get("cautions") or []),
     ])
-    if "ST" in name.upper():
-        risks.append("股票简称含ST风险标记，需结合风险警示说明理解；本次仍保留完整分析")
-    if "退" in name:
-        risks.append("股票简称含退市风险标记，需核对退市安排")
+    target_trade = historical_trading.get("target_session") or {}
+    if target_trade.get("is_st") is True:
+        risks.append("本次日线对应交易日有 ST 风险警示记录")
+    elif pd.isna(target_trade.get("is_st")) and "ST" in name.upper():
+        risks.append("当前股票简称含 ST 标记，目标日的历史风险警示状态待核验")
+    if target_trade.get("trade_status") == "delisted":
+        risks.append("目标日期已进入摘牌后的区间")
+    elif target_trade.get("is_delisting") is True:
+        risks.append("目标日处于退市整理期")
     question_assessment = pinggu_yanjiu_wenti(research_question, {
         "name": name, "profile": unified.get("comparison_profile") or stock, "history": history,
         "factor": unified.get("factor_analysis"), "technical": technical, "fundamental": fundamentals,
@@ -258,6 +335,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         "late_session_analysis": unified.get("late_session_analysis"),
         "supplemental_diagnostics": unified.get("supplemental_diagnostics"),
         "ownership_analysis": unified.get("ownership_analysis"),
+        "historical_trading": historical_trading,
         "realtime_snapshot": snapshot, "tradability": tradability, "evidence_gaps": gaps,
         "risks": risks, "warnings": _texts([*(resolution_warnings or []), *(history_meta.get("warnings") or []), *(fundamentals.get("warnings") or [])]),
         "diagnosis_validity": {
@@ -280,6 +358,7 @@ def fenxi_dangu(*, gupiao: str, config: dict[str, Any], context: FenxiShujuShang
         "data_provenance": {
             "stock_resolution": {"persistence": "none", "warnings": resolution_warnings},
             "history": history_meta,
+            "historical_trading": trading_provenance,
             "realtime_snapshot": {key: snapshot.get(key) for key in ("status", "source", "captured_at", "provider_trade_date", "timeliness", "error") if key in snapshot},
             "fundamentals": {"sources": fundamentals.get("sources") or {}, "as_of": as_of, "persistence": "none"},
             **(unified.get("data_provenance") or {}),

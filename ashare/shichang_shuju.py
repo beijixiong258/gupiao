@@ -6,6 +6,9 @@ import os
 import ast
 import copy
 import importlib.util
+import json
+import subprocess
+import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,6 +28,7 @@ from ashare.peizhi import jiazai_lianghua_peizhi
 from ashare.dongcai_api import (
     DONGCAI_PUBLIC_TOKEN,
     dongcai_fenye_duqu,
+    dongcai_rizhong_guzhi_duqu,
     dongcai_rili_kxian_duqu,
 )
 from ashare.fanwei_faxian import (
@@ -165,9 +169,71 @@ class FenxiShujuShangxiawen:
         return frame.copy(), copy.deepcopy(quality)
 
     def jiexi_gupiao(self, query: str) -> tuple[str, dict[str, Any], list[str]]:
-        from ashare.gupiao_yanjiu import jiexi_gupiao
+        from ashare.gupiao_yanjiu import jiexi_gupiao, shi_a_gu
 
-        return jiexi_gupiao(query, source=self.source, stock_basic_loader=self.gupiao_ziliao)
+        try:
+            code, profile, warnings = jiexi_gupiao(query, source=self.source, stock_basic_loader=self.gupiao_ziliao)
+        except RuntimeError as exc:
+            if self.source != "auto" or not shi_a_gu(query):
+                raise
+            code = _normalize_code(query)
+            if code.endswith(".BJ"):
+                from ashare.lishi_jiaoyi_yuan import huoqu_bse_daima_duiying
+
+                try:
+                    mapping = huoqu_bse_daima_duiying(code)
+                except (RuntimeError, ValueError) as source_error:
+                    raise RuntimeError(f"{exc}；北交所新旧代码未能核验：{source_error}") from source_error
+                if mapping and mapping.get("old_ts_code") == code and mapping["ts_code"] != code:
+                    code, profile, warnings = jiexi_gupiao(mapping["ts_code"], source=self.source, stock_basic_loader=self.gupiao_ziliao)
+                    profile = {**profile, "old_ts_code": mapping["old_ts_code"], "code_change_date": mapping["code_change_date"],
+                               "code_mapping_source": mapping["identity_source"]}
+                else:
+                    raise
+            elif code.endswith(".SH"):
+                from ashare.lishi_jiaoyi_yuan import huoqu_sse_tuishi_shenfen
+
+                try:
+                    profile = huoqu_sse_tuishi_shenfen(code)
+                except (RuntimeError, ValueError) as source_error:
+                    raise RuntimeError(f"{exc}；上交所终止上市目录未能核验：{source_error}") from source_error
+                if not profile:
+                    raise
+                return code, profile, ["股票身份由上交所终止上市目录核验"]
+            else:
+                raise
+        if "gupiao_ziliao" in self._memo:
+            directory, quality, _ = self._memo["gupiao_ziliao"]
+            if not directory.empty and directory["ts_code"].eq(code).any():
+                source = (quality.get("stock_basic") or {}).get("source")
+                profile = {**profile, "identity_source": source, "listing_status": "listed"}
+        return code, profile, warnings
+
+    def lishi_jiaoyi(
+        self, code: str, *, start_date: str, end_date: str, profile: dict[str, Any],
+        notice_urls: Iterable[str] = (),
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        from ashare.lishi_jiaoyi_yuan import huoqu_gupiao_lishi_jiaoyi
+
+        normalized = _normalize_code(code)
+        start, end = map(pd.Timestamp, (start_date, end_date))
+        notices = tuple(notice_urls)
+        key = ("lishi_jiaoyi", normalized, start, end, notices)
+        if key not in self._memo:
+            calendar = self.jiaoyi_rili(start_date=start_date, end_date=end_date)
+            delisted = pd.to_datetime(profile.get("delist_date"), errors="coerce")
+            if pd.notna(delisted) and delisted < start:
+                calendar = self.jiaoyi_rili(start_date=(delisted - pd.Timedelta(days=100)).strftime("%Y-%m-%d"), end_date=end_date)
+            if not calendar.open_dates:
+                raise RuntimeError("历史交易证据需要经核验的市场交易日历")
+            frame, meta = huoqu_gupiao_lishi_jiaoyi(
+                normalized, start=start, end=end, calendar=calendar.open_dates, profile=profile, tushare=_tushare_pro,
+                bao_timeout=22, notice_urls=notices,
+                snapshot_day=end, reference=self.reference,
+            )
+            self._memo[key] = frame, {**meta, "calendar_source": calendar.source, "calendar_fetched_at": calendar.fetched_at}
+        frame, meta = self._memo[key]
+        return frame.copy(), copy.deepcopy(meta)
 
     def jibenmian(self, code: str, *, trade_date: str, allow_current_snapshot: bool = False) -> dict[str, Any]:
         from ashare.gupiao_yanjiu import huoqu_jibenmian
@@ -365,6 +431,22 @@ class FenxiShujuShangxiawen:
         histories, meta = self._memo[memo_key]
         return {code: frame.copy() for code, frame in histories.items()}, dict(meta)
 
+    def dangu_qfq_jinri(self, code: str, *, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """范围日线端点滞后时，单股用腾讯最新前复权序列整段核验。"""
+        normalized = _normalize_code(code)
+        calendar = self.jiaoyi_rili(start_date=start_date, end_date=end_date)
+        start, end = map(pd.Timestamp, (start_date, end_date))
+        expected = frozenset(day for day in calendar.open_dates if start <= day <= end)
+        with GongkaiShujuHTTPKehu("tencent_qfq_current_tail") as client:
+            rows, quote, endpoint = tengxun_qfq_rili_duqu(
+                client, code=normalized, start_date=start_date, end_date=end_date, request_current_tail=True,
+            )
+        data, quality = _jiancha_qfq_lishi_zhiliang(_jiexi_tengxun_rili(rows, quote), expected_dates=expected, minimum_rows=1)
+        return (data if quality["accepted"] else pd.DataFrame()), {
+            "source": "tencent_qfq_current_tail", "endpoint_host": urlsplit(endpoint).hostname,
+            "status": "ok" if quality["accepted"] else "unavailable", "quality": quality, "persistence": "none",
+        }
+
     def fenzhong_xingqing(self, code: str) -> tuple[pd.DataFrame, dict[str, Any]]:
         normalized = _normalize_code(code)
         key = f"fenzhong:{normalized}"
@@ -387,42 +469,10 @@ def _huoqu_dongcai_rizhong_guzhi(trade_date: str) -> tuple[pd.DataFrame, dict[st
     target = pd.Timestamp(trade_date).normalize()
     if pd.isna(target) or target > pd.Timestamp(_beijing_now().date()):
         raise ValueError("公开日终估值请求日期无效或晚于当前日期")
-    endpoint = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-    rows: list[dict[str, Any]] = []
-    expected_count: int | None = None
-    expected_pages: int | None = None
     with GongkaiShujuHTTPKehu("eastmoney_daily_valuation") as client:
-        for page in range(1, 21):
-            payload, _ = client.qingqiu_json((endpoint,), params={
-                "sortColumns": "SECURITY_CODE", "sortTypes": "1",
-                "pageSize": "5000", "pageNumber": str(page),
-                "reportName": "RPT_VALUEANALYSIS_DET",
-                "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,TRADE_MARKET,TRADE_DATE,CLOSE_PRICE,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,PE_TTM,PE_LAR,PB_MRQ",
-                "source": "WEB", "client": "WEB",
-                "filter": f"(TRADE_DATE='{target:%Y-%m-%d}')",
-            })
-            result = payload.get("result")
-            if payload.get("success") is not True or not isinstance(result, dict):
-                raise ValueError(f"东方财富日终估值业务响应失败：{payload.get('message') or '无有效结果'}")
-            try:
-                count, pages = int(result.get("count", 0)), int(result.get("pages", 0))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("东方财富日终估值分页计数无效") from exc
-            page_rows = result.get("data")
-            if not isinstance(page_rows, list) or not page_rows or count <= 0 or not 1 <= pages <= 20:
-                raise ValueError("东方财富日终估值为空或分页范围无效")
-            if expected_count is None:
-                expected_count, expected_pages = count, pages
-            elif count != expected_count or pages != expected_pages:
-                raise ValueError("东方财富日终估值分页总量发生变化，不能保证完整覆盖")
-            if not all(isinstance(row, dict) for row in page_rows):
-                raise ValueError("东方财富日终估值行结构无效")
-            rows.extend(page_rows)
-            if page == expected_pages:
-                break
+        rows = dongcai_rizhong_guzhi_duqu(client, filter_text=f"(TRADE_DATE='{target:%Y-%m-%d}')",
+                                        sort_column="SECURITY_CODE", page_size=5000)
         attempts = [attempt.to_dict() for attempt in client.attempts]
-    if len(rows) != expected_count:
-        raise ValueError(f"东方财富日终估值分页不完整：应有{expected_count}行，实际{len(rows)}行")
     raw = pd.DataFrame(rows)
     if not {"SECUCODE", "TRADE_DATE", "CLOSE_PRICE", "TOTAL_MARKET_CAP", "NOTLIMITED_MARKETCAP_A"}.issubset(raw.columns):
         raise ValueError("东方财富日终估值缺少身份、日期、收盘价或市值字段")
@@ -455,7 +505,7 @@ def _huoqu_dongcai_rizhong_guzhi(trade_date: str) -> tuple[pd.DataFrame, dict[st
     meta = {
         "source": "eastmoney_daily_valuation", "as_of": target.strftime("%Y-%m-%d"),
         "fetched_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
-        "rows": len(frame), "reported_rows": expected_count,
+        "rows": len(frame), "reported_rows": len(rows),
         "attempted_providers": attempts, "persistence": "none",
         "market_value_unit": "万元（来源原值元除以10000，兼容日终估值统一接口）",
         "pe_static_definition": "来源PE_LAR静态市盈率，与动态、滚动市盈率分开",
@@ -609,13 +659,26 @@ def _huoqu_xinlang_jiaoyi_rili(
     if not encoded:
         raise ValueError("新浪交易日历响应缺少编码数据")
     decoder, capability = _duqu_akshare_rili_jiemao()
-    try:
-        from py_mini_racer import MiniRacer
-    except ImportError as exc:
-        raise RuntimeError("当前 AKShare 运行环境缺少交易日历解码组件") from exc
-    runtime = MiniRacer()
+    # MiniRacer 的 V8 原生初始化在 Windows 上并发调用可能终止宿主进程。
+    # 解码交给独立解释器，故障按日历来源不可用处理。
+    worker = """
+import json
+import sys
+from py_mini_racer import MiniRacer
+
+decoder, encoded = json.load(sys.stdin)
+with MiniRacer() as runtime:
     runtime.eval(decoder)
-    decoded = runtime.call("d", encoded)
+    print(json.dumps(runtime.call('d', encoded)))
+"""
+    try:
+        result = subprocess.run([sys.executable, "-B", "-c", worker], input=json.dumps([decoder, encoded]),
+                                capture_output=True, encoding="utf-8", timeout=15, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("新浪交易日历解码超时") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"新浪交易日历解码进程失败，退出状态 {result.returncode}")
+    decoded = json.loads(result.stdout)
     values = pd.to_datetime(pd.Series(decoded), errors="coerce", utc=True).dropna()
     if values.empty:
         raise ValueError("新浪交易日历解码后为空")
@@ -663,13 +726,13 @@ def huoqu_jiaoyi_rili(
             )
             if frame is None or frame.empty or not {"cal_date", "is_open"}.issubset(frame.columns):
                 raise RuntimeError("Tushare 交易日历为空或字段不完整")
-            calendar_dates = pd.to_datetime(frame["cal_date"], errors="coerce").dropna().dt.normalize()
-            if calendar_dates.empty or calendar_dates.min() > start or calendar_dates.max() < end:
+            calendar_dates = pd.to_datetime(frame["cal_date"].astype(str), errors="coerce").dt.normalize()
+            flags = pd.to_numeric(frame["is_open"], errors="coerce")
+            covered = calendar_dates.between(start, end)
+            if (calendar_dates.isna().any() or calendar_dates.duplicated().any() or not flags.isin((0, 1)).all()
+                    or int(covered.sum()) != (end - start).days + 1):
                 raise RuntimeError("Tushare 交易日历未覆盖请求区间")
-            dates = pd.to_datetime(
-                frame.loc[pd.to_numeric(frame["is_open"], errors="coerce").eq(1), "cal_date"],
-                errors="coerce",
-            ).dropna()
+            dates = calendar_dates[covered & flags.eq(1)]
             if dates.empty:
                 raise RuntimeError("Tushare 交易日历没有可核验的开市日期")
             attempted.append(
@@ -1607,7 +1670,9 @@ def _qfq_history_from_tushare(
             data = heyan_fuquan_yinzi(daily, factors)
             multiplier = data["adj_factor"] / float(data["adj_factor"].iloc[-1])
             for column in ("open", "high", "low", "close", "pre_close"):
-                data[column] = pd.to_numeric(data.get(column), errors="coerce") * multiplier
+                raw_column = "limit_reference_price" if column == "pre_close" else f"raw_{column}"
+                data[raw_column] = pd.to_numeric(data.get(column), errors="coerce")
+                data[column] = data[raw_column] * multiplier
             data["volume"] = pd.to_numeric(data.get("vol"), errors="coerce") * 100.0
             data["amount_yuan"] = pd.to_numeric(data.get("amount"), errors="coerce") * 1000.0
             data["pct_chg"] = pd.to_numeric(data.get("pct_chg"), errors="coerce")
@@ -1624,6 +1689,7 @@ def _qfq_history_from_tushare(
                         "pct_chg",
                         "volume",
                         "amount_yuan",
+                        "raw_open", "raw_high", "raw_low", "raw_close", "limit_reference_price", "adj_factor",
                     )
                     if column in data.columns
                 ]

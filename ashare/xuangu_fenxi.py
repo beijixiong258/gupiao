@@ -8,6 +8,7 @@ from collections import Counter
 import pandas as pd
 
 from ashare.buchong_zhenduan import goujian_buchong_zhenduan
+from ashare.ciri_fuhe import goujian_ciri_yuce_jilu
 from ashare.fanwei_faxian import shencha_fanwei_houxuan
 from ashare.fenxi_weipan import WeipanJieduan, fenxi_weipan, panduan_weipan_jieduan
 from ashare.fenxi_xingtai import fenxi_zhangting_huimaqiang
@@ -834,6 +835,16 @@ class XuanguFenxiFuWu:
                 "next_action": "修复技术复核错误后重新获取数据并诊断",
                 "retryable": False,
             })
+        else:
+            forecast = goujian_ciri_yuce_jilu(
+                signal_date=analysis_date, clock=clock, scope=pool.metadata,
+                method=settings.get("selection_method", "environment_96"), qualified=qualified_reviewed,
+                displayed=[item["ts_code"] for item in qualified[:display_target]],
+                comparison_complete=result["comparison_coverage"]["complete"],
+                has_custom_conditions=bool(user_conditions or market_cap_condition),
+            )
+            if forecast is not None:
+                result["next_session_forecast"] = forecast
         if requested_count is not None:
             result["requested_candidate_count"] = requested_count
         return result

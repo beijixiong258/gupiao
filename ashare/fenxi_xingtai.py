@@ -400,6 +400,7 @@ def fenxi_zhangting_huimaqiang(
     name: str,
     config: dict[str, Any],
     realtime_quote: dict[str, Any] | None = None,
+    historical_trading: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """识别最近一次回马枪尝试，并公开每个规则的实际命中值。"""
     eligible, reason = _hefa_biaodi(code, name)
@@ -434,8 +435,27 @@ def fenxi_zhangting_huimaqiang(
         ).to_dict(config=config)
     tolerance = float(config.get("limit_up_tolerance_yuan", 0.005))
     baselines: list[int] = []
+    unknown_limits = 0
+    execution = historical_trading.set_index("trade_date") if historical_trading is not None and not historical_trading.empty else None
     for index, row in data.iterrows():
         if row[["open", "high", "low", "close", "volume"]].isna().any() or row["volume"] <= 0:
+            continue
+        if historical_trading is not None:
+            day = row["trade_date"]
+            if execution is None or day not in execution.index:
+                unknown_limits += 1
+                continue
+            observed = execution.loc[day]
+            if observed["price_limit_status"] == "no_limit" or observed["trade_status"] == "suspended":
+                continue
+            limit, close, opening, reference = (_number(observed[key]) for key in (
+                "limit_up_price", "raw_close", "raw_open", "limit_reference_price",
+            ))
+            if not observed["raw_bar_valid"] or any(value is None for value in (limit, close, opening, reference)) or reference <= 0:
+                unknown_limits += 1
+                continue
+            if abs(limit - _zhangtingjia(reference)) <= 0.005 and abs(close - limit) <= 1e-8 and close > opening:
+                baselines.append(int(index))
             continue
         previous_close = _number(row.get("pre_close"))
         if previous_close is None or previous_close <= 0:
@@ -444,7 +464,7 @@ def fenxi_zhangting_huimaqiang(
         if float(row["close"]) >= legal_limit - tolerance and float(row["close"]) > float(row["open"]):
             baselines.append(int(index))
     if not baselines:
-        missing_count = int(data[["open", "high", "low", "close", "volume"]].isna().any(axis=1).sum())
+        missing_count = int(data[["open", "high", "low", "close", "volume"]].isna().any(axis=1).sum()) + unknown_limits
         return HuimaqiangJieguo(
             state=HuimaqiangZhuangtai.WU_XINGTAI,
             eligible=True,

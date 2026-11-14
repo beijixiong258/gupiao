@@ -117,6 +117,7 @@ def yunxing_dangu_tongyi_lianghua(
     analysis_date: pd.Timestamp, snapshot: dict[str, Any], clock: dict[str, Any],
     technical: dict[str, Any], fundamentals: dict[str, Any], tradability: dict[str, Any],
     config: dict[str, Any], context: FenxiShujuShangxiawen,
+    historical_trading_panel: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """保留已有函数入口，返回原始诊断证据，不计算综合分或买入结论。"""
     if technical.get("status") == "error" or technical.get("outcome") == "program_error":
@@ -218,6 +219,7 @@ def yunxing_dangu_tongyi_lianghua(
             history, code=code, name=str(resolved.get("name") or name),
             config=config.get("xingtai") or {},
             realtime_quote=snapshot if clock.get("session_status") in {"trading", "midday_break"} and tradability.get("current_quote_verified") else None,
+            historical_trading=historical_trading_panel,
         )
     except Exception as exc:
         pattern = {"status": "unavailable", "reason": str(exc)}

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import asdict
 from typing import Any, Iterable, Mapping
 
@@ -22,6 +23,7 @@ from ashare.jiaoyi_zhixing import (
     jiazai_chengben_jiashe,
     koujian_jiaoyi_chengben,
 )
+from ashare.lishi_jiaoyi import KNOWN_LIMIT_STATUSES, jiaoyi_riqi, shiji_jiaoyi_xianzhi
 from ashare.macd_jiegou import (
     MACD_JIEGOU_METHOD_VERSION,
     MacdJiegouPeizhi,
@@ -90,6 +92,8 @@ def _prepare_panel(panel: pd.DataFrame, settings: MacdHuifangPeizhi) -> tuple[pd
     invalid_dates = int(data["trade_date"].isna().sum())
     data = data.dropna(subset=["trade_date"])
     duplicates = int(data.duplicated(["ts_code", "trade_date"], keep="last").sum())
+    if "raw_bar_valid" in data and (invalid_dates or duplicates):
+        raise ValueError("经核验的历史交易面板存在无效日期或重复证券日期")
     data = (
         data.sort_values(["ts_code", "trade_date"])
         .drop_duplicates(["ts_code", "trade_date"], keep="last")
@@ -125,6 +129,8 @@ def _prepare_panel(panel: pd.DataFrame, settings: MacdHuifangPeizhi) -> tuple[pd
         warnings.append(f"发现 {duplicates} 条重复股票交易日，已保留最后一条")
     if not has_production_baseline:
         warnings.append("面板未提供 baseline_selected；比较基线降级为同日全部可执行样本，不代表现有生产排名基线")
+    if "raw_bar_valid" not in data:
+        warnings.append("调用方使用旧版日线面板，成交约束沿用旧回放口径，原始价和历史状态未经本次核验")
     if int(enriched["amount_yuan"].notna().sum()) == 0:
         warnings.append("面板缺少真实成交额；流动性和动态成本约束无法完成")
     return enriched.replace([np.inf, -np.inf], np.nan), warnings, has_production_baseline
@@ -393,6 +399,13 @@ def _execution_outcome(
     exit_row = panel_rows.get((code, exit_date))
     if signal_row is None:
         return {**base, "execution_status": "data_unavailable", "execution_reason": "信号日行情缺失"}
+    if "raw_bar_valid" in signal_row.index:
+        return _verified_execution(
+            base, signal_row, entry_row, exit_row,
+            entry_date=entry_date, exit_date=exit_date,
+            interval_rows=[panel_rows.get((code, day)) for day in calendar[position + 1 : position + horizon + 1]],
+            settings=settings, cost_notional=cost_notional, cost_scenario=cost_scenario,
+        )
     if entry_row is None or _row_bool(entry_row, "is_suspended") is True:
         return {**base, "execution_status": "entry_blocked", "execution_reason": "次一市场交易日停牌或行情缺失"}
     entry_volume = _number(entry_row.get("volume"))
@@ -477,6 +490,89 @@ def _execution_outcome(
         "maximum_favorable_excursion": round(max(valid_highs) / entry_price - 1.0, 8) if valid_highs else None,
         "suspended_sessions_during_hold": int(missing_sessions),
         "limit_constraint_basis": lock_basis,
+    }
+
+
+def _verified_execution(
+    base: dict[str, Any], signal: pd.Series, entry: pd.Series | None, exit: pd.Series | None,
+    *, entry_date: pd.Timestamp, exit_date: pd.Timestamp, interval_rows: list[pd.Series | None],
+    settings: MacdHuifangPeizhi, cost_notional: float, cost_scenario: Any,
+) -> dict[str, Any]:
+    """评估原始价格上的买卖约束，并使用同源复权价格计算参考收益。"""
+    delisted = jiaoyi_riqi(signal.get("delist_date"))
+    for leg, row, day, side, price_field in (
+        ("entry", entry, entry_date, "buy", "raw_open"), ("exit", exit, exit_date, "sell", "raw_close"),
+    ):
+        if pd.notna(delisted) and day >= delisted:
+            state, basis = "blocked", "confirmed_delisting"
+        elif leg == "exit" and entry_date == exit_date:
+            state, basis = "blocked", "a_share_t_plus_one"
+        elif row is None:
+            state, basis = "unknown", "missing_target_market_session"
+        else:
+            state, basis = shiji_jiaoyi_xianzhi(row, side=side)
+        base[f"{leg}_constraint"] = {"status": state, "basis": basis}
+        base[f"{leg}_raw_price"] = _number(row.get(price_field)) if row is not None and row.get("raw_bar_valid") else None
+    base["execution_evidence"] = "point_in_time_raw_daily_reference"
+    if not signal.get("adjusted_valid"):
+        base["entry_feasibility"] = {"status": "unknown", "reason": "信号日缺少有效的同源复权日线"}
+        return {**base, "execution_status": "data_unavailable", "execution_reason": "信号日缺少有效的同源复权日线"}
+    explanations = {
+        "confirmed_delisting": "已摘牌",
+        "confirmed_full_day_suspension": "确认全天停牌",
+        "confirmed_intraday_suspension": "参考买卖时点在已公告停牌时段内",
+        "a_share_t_plus_one": "买入当日不能卖出该笔 A 股",
+        "missing_target_market_session": "该市场交易日缺少股票行情",
+        "trade_status_or_raw_bar_unavailable": "原始日线或交易状态未核验",
+        "historical_limit_unavailable": "当日涨跌停证据缺失或冲突",
+        "historical_limit_or_raw_bar_unavailable": "当日涨跌停或原始价格未核验",
+        "auction_price_at_limit": "参考价触及涨跌停，日线无法核验该时点排队成交",
+        "one_price_limit_reported": "来源限价核对为全天一字封板",
+        "one_price_limit_calculated": "按当日适用规则核对为全天一字封板",
+    }
+    entry_constraint = base["entry_constraint"]
+    state = entry_constraint["status"]
+    if state != "reference":
+        reason = "开盘建仓存在限制，" + explanations[entry_constraint["basis"]]
+        base["entry_feasibility"] = {"status": state, "reason": reason}
+        return {**base, "execution_status": f"entry_{state}", "execution_reason": reason}
+    trailing_amount = _number(signal.get("_trailing_amount_yuan"))
+    if trailing_amount is None:
+        state, reason = "unknown", "信号日前滚动成交额不足，无法核验流动性"
+    elif trailing_amount < settings.minimum_trailing_amount_yuan:
+        state, reason = "blocked", "信号日前滚动成交额低于回放流动性门槛"
+    else:
+        cost_rate, cost_meta = jisuan_gupiao_wangfan_chengben(
+            base["ts_code"], base["entry_raw_price"], cost_notional, cost_scenario, daily_amount_yuan=trailing_amount,
+            atr_pct=_number(signal.get("atr_14_pct")),
+            trading_settings={"max_participation_rate": settings.maximum_participation_rate, "dynamic_slippage_enabled": True},
+        )
+        state, reason = ("blocked", cost_meta["reason"]) if cost_rate is None else ("reference", None)
+    base["entry_feasibility"] = {"status": state, "reason": reason}
+    if state != "reference":
+        return {**base, "execution_status": f"entry_{state}", "execution_reason": reason}
+    exit_constraint = base["exit_constraint"]
+    if exit_constraint["status"] != "reference":
+        return {**base, "execution_status": f"exit_{exit_constraint['status']}",
+                "execution_reason": "目标日收盘退出存在限制，" + explanations[exit_constraint["basis"]]}
+    entry_price = _number(entry.get("open"))
+    exit_price = _number(exit.get("close"))
+    if entry_price is None or entry_price <= 0 or exit_price is None or exit_price <= 0:
+        return {**base, "execution_status": "data_unavailable", "execution_reason": "买卖端点同源复权价格缺失"}
+    gross_return = exit_price / entry_price - 1.0
+    lows = [_number(row.get("low")) for row in interval_rows if row is not None and row.get("raw_bar_valid")]
+    highs = [_number(row.get("high")) for row in interval_rows if row is not None and row.get("raw_bar_valid")]
+    suspended = sum(row is not None and row.get("trade_status") == "suspended" for row in interval_rows)
+    unknown = len(interval_rows) - len(lows) - suspended + lows.count(None)
+    return {
+        **base, "execution_status": "completed", "execution_reason": "",
+        "gross_return": round(gross_return, 8), "net_return": round(koujian_jiaoyi_chengben(gross_return, cost_rate), 8),
+        "roundtrip_cost_rate": round(cost_rate, 8), "estimated_buy_shares": cost_meta.get("estimated_buy_shares"),
+        "estimated_participation_rate": cost_meta.get("estimated_participation_rate"),
+        "dynamic_slippage_bps_roundtrip": (cost_meta.get("dynamic_slippage") or {}).get("dynamic_extra_bps_roundtrip"),
+        "maximum_adverse_excursion": round(min(lows) / entry_price - 1.0, 8) if not unknown and lows else None,
+        "maximum_favorable_excursion": round(max(highs) / entry_price - 1.0, 8) if not unknown and highs else None,
+        "suspended_sessions_during_hold": suspended, "unknown_sessions_during_hold": unknown,
     }
 
 
@@ -802,6 +898,14 @@ def _coverage(panel: pd.DataFrame, events: list[dict[str, Any]], has_baseline: b
         if limit_columns
         else 0.0
     )
+    historical = {}
+    if "raw_bar_valid" in panel:
+        traded = panel.loc[panel["raw_bar_valid"]]
+        limit_coverage = ratio(traded["price_limit_status"].isin(KNOWN_LIMIT_STATUSES))
+        historical = {"raw_daily_price_coverage": ratio(panel["raw_bar_valid"]),
+                      "same_source_factor_coverage": ratio(traded["adj_factor"].gt(0)),
+                      "historical_st_coverage": ratio(panel["is_st"].notna()),
+                      "known_trade_status_coverage": ratio(panel["raw_bar_valid"] | panel["trade_status"].eq("suspended"))}
     return {
         "production_baseline_available": has_baseline,
         "market_regime_coverage": ratio(event.get("market_regime") != "unavailable" for event in events),
@@ -818,7 +922,33 @@ def _coverage(panel: pd.DataFrame, events: list[dict[str, Any]], has_baseline: b
         "end_date": _date(panel["trade_date"].max()),
         "calendar_days": int((panel["trade_date"].max() - panel["trade_date"].min()).days),
         "sample_scopes": sorted({_sample_scope(row) for _, row in panel.iterrows()}),
+        **historical,
     }
+
+
+def _execution_summary(observations: pd.DataFrame) -> list[dict[str, Any]]:
+    """每只股票、信号日、期限只计一次，两侧的约束独立统计。"""
+    events = observations.drop_duplicates(["ts_code", "signal_date", "horizon_sessions"])
+    result = []
+    for horizon, rows in events.groupby("horizon_sessions", sort=True):
+        counts = Counter(rows["execution_status"])
+        mature = len(rows) - counts["future_incomplete"]
+        item = {"horizon_sessions": int(horizon), "events": len(rows), "mature_events": mature,
+                "future_incomplete_events": counts["future_incomplete"], "execution_status_counts": dict(counts)}
+        if "entry_feasibility" in rows:
+            entry_reference = rows["entry_feasibility"].map(lambda value: isinstance(value, dict) and value.get("status") == "reference")
+            for key, values in (("entry", rows["entry_feasibility"]),
+                                ("exit", rows.loc[entry_reference, "exit_constraint"]),
+                                ("exit_market_constraint", rows["exit_constraint"])):
+                evidence = Counter(value.get("status") for value in values if isinstance(value, dict))
+                evaluated = sum(evidence.values())
+                item[key] = {"evaluated": evaluated, "blocked": evidence["blocked"], "unknown": evidence["unknown"],
+                             "blocked_rate": evidence["blocked"] / evaluated if evaluated else None,
+                             "unknown_rate": evidence["unknown"] / evaluated if evaluated else None}
+            missing = counts["entry_unknown"] + counts["exit_unknown"] + counts["data_unavailable"]
+            item.update(unknown_execution_events=missing, unknown_execution_rate=missing / mature if mature else None)
+        result.append(item)
+    return result
 
 
 def _huifang_macd_jiegou_impl(
@@ -955,6 +1085,7 @@ def _huifang_macd_jiegou_impl(
             "calendar_source": calendar_source,
             "cost_scenario": "research_reference_with_dynamic_liquidity_and_atr_slippage",
             "persistence": "none",
+            "execution_basis": "point_in_time_raw_daily_reference" if "raw_bar_valid" in features else "legacy_input_panel",
         },
         "configuration": {
             "validation": asdict(settings),
@@ -977,6 +1108,7 @@ def _huifang_macd_jiegou_impl(
         },
         "component_performance": component_performance,
         "family_performance": family_performance,
+        "execution_summary": _execution_summary(configured_families),
         "stratified_performance": _stratified_metrics(family_frame, settings),
         "parameter_sensitivity": sensitivity_performance,
         "research_assessment": assessments,

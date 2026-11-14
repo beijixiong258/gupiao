@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+from pathlib import Path
 import sys
 import time
 from typing import Any, Callable, Optional
@@ -503,6 +504,100 @@ def cmd_clean_runs(*, confirmed: bool) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_replay_macd(args: argparse.Namespace) -> int:
+    from collections import defaultdict
+
+    import pandas as pd
+
+    from ashare.ciri_fuhe import duqu_ciri_huifang_jizhun
+    from ashare.dangu_fenxi import _json_safe
+    from ashare.macd_huifang import huifang_macd_jiegou
+    from ashare.peizhi import jiazai_lianghua_peizhi
+    from ashare.rqalpha_lishi import duqu_rqalpha_lishi
+    from ashare.shichang_shuju import huoqu_jiaoyi_rili, zuixin_wanzheng_jiaoyiri
+    from ashare.shuju_yuan import biaozhunhua_gupiao_daima
+
+    try:
+        start, end = (pd.Timestamp(value).normalize() for value in (args.start, args.end))
+        if pd.isna(start) or pd.isna(end) or start.tzinfo is not None or end.tzinfo is not None or start > end:
+            raise ValueError("起止日期须为有效日期，且起始日不得晚于结束日")
+        calendar_end = end + pd.Timedelta(days=14) if args.baseline_forecast else end
+        calendar = huoqu_jiaoyi_rili(start_date=(start - pd.Timedelta(days=45)).strftime("%Y-%m-%d"), end_date=calendar_end.strftime("%Y-%m-%d"))
+        if not calendar.open_dates:
+            raise ValueError("本次未取得经核验的市场交易日历")
+        completed = zuixin_wanzheng_jiaoyiri(calendar=calendar)
+        if completed is None or end > completed and any(completed < day <= end for day in calendar.open_dates):
+            raise ValueError("回放区间包含尚未完成的市场交易日")
+        baseline = duqu_ciri_huifang_jizhun(_read_forecast_records(args.baseline_forecast), calendar, start=start, end=end)
+        baseline_members = {day: info["codes"] for day, info in baseline.items()}
+        requested_codes = {biaozhunhua_gupiao_daima(value) for value in args.stock}
+        baseline_codes = set().union(*baseline_members.values())
+        stocks = sorted(requested_codes | baseline_codes)
+        if not stocks:
+            raise ValueError("至少指定一只股票或提供包含合格候选的原始预测基线")
+        notices = defaultdict(list)
+        for value in args.notice:
+            code, separator, url = value.partition("=")
+            if not separator or not url or biaozhunhua_gupiao_daima(code) not in stocks:
+                raise ValueError("--notice 须为本次证券代码=公告链接")
+            notices[biaozhunhua_gupiao_daima(code)].append(url)
+        panel, evidence = duqu_rqalpha_lishi(args.bundle_dir, stocks, start=start, end=end,
+                                             trading_calendar=calendar.open_dates, notice_urls=notices)
+        if baseline and not panel.empty:
+            panel["baseline_selected"] = [code in baseline_members.get(day, ()) for code, day in zip(panel["ts_code"], panel["trade_date"])]
+        config, _ = jiazai_lianghua_peizhi()
+        analysis = config.get("fenxi") or {}
+        replay = huifang_macd_jiegou(panel, trading_calendar=sorted(day for day in calendar.open_dates if start <= day <= end),
+                                    structure_config=analysis.get("macd_structure"),
+                                    validation_config=analysis.get("macd_structure_validation"))
+        result = {**replay, "historical_trading": evidence,
+                  "calendar_provenance": {"source": calendar.source, "fetched_at": calendar.fetched_at,
+                                          "warnings": calendar.warnings, "attempted_providers": calendar.attempted_providers}}
+        if baseline:
+            usable = panel.loc[panel["trade_date"].isin(baseline) & panel["adjusted_valid"]] if not panel.empty else None
+            by_date = {day: set(group["ts_code"]) for day, group in usable.groupby("trade_date")} if usable is not None else {}
+            result["baseline_coverage"] = [
+                {"signal_date": str(day.date()), "source": "original_qualified_forecast_candidates",
+                 "issued_at": item["issued_at"], "selection_method": item["selection_method"],
+                 "comparison_complete_at_issue": item["comparison_complete_at_issue"],
+                 "requested_codes": sorted(item["codes"]), "unavailable_signal_codes": sorted(item["codes"] - by_date.get(day, set()))}
+                for day, item in sorted(baseline.items())
+            ]
+            if result.get("validation_readiness") and any(
+                row["unavailable_signal_codes"] or not row["comparison_complete_at_issue"] for row in result["baseline_coverage"]
+            ):
+                result["validation_readiness"]["ready_for_evidence_review"] = False
+                result["validation_readiness"]["unmet_requirements"].append("部分事前基线的当日比较覆盖或成员行情不完整")
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        result = {"status": "unavailable", "outcome": "data_unavailable", "reason": str(exc)}
+    print(_console_safe(json.dumps(_json_safe(result), ensure_ascii=False, allow_nan=False)))
+    return EXIT_SUCCESS if result["status"] in {"ok", "insufficient_data"} else EXIT_RUN_FAILED
+
+
+def _read_forecast_records(paths: list[str]) -> list[dict[str, Any]]:
+    records = []
+    for path in paths:
+        with Path(path).open(encoding="utf-8-sig") as stream:
+            value = json.load(stream)
+        records.append(value.get("next_session_forecast", value) if isinstance(value, dict) else value)
+    return records
+
+
+def cmd_forecast(args: argparse.Namespace) -> int:
+    from ashare.ciri_fuhe import FORECAST_RECORD_TYPE, chuju_ciri_yuce, yanzheng_ciri_yuce
+    from ashare.dangu_fenxi import _json_safe
+    from ashare.shichang_shuju import FenxiShujuShangxiawen
+
+    try:
+        context = FenxiShujuShangxiawen()
+        result = (chuju_ciri_yuce(context, count=args.count) if args.command == "forecast-record" else
+                  yanzheng_ciri_yuce(_read_forecast_records(args.forecast), context))
+    except (OSError, RuntimeError, ValueError) as exc:
+        result = {"status": "unavailable", "outcome": "data_unavailable", "reason": str(exc)}
+    print(json.dumps(_json_safe(result), ensure_ascii=True, allow_nan=False))
+    return EXIT_SUCCESS if result.get("type") == FORECAST_RECORD_TYPE or result.get("status") in {"ok", "partial", "pending"} else EXIT_RUN_FAILED
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="个人 A 股自然语言分析与诊断工具")
     sub = parser.add_subparsers(dest="command")
@@ -529,6 +624,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     openai_login.add_argument("--no-browser", action="store_true", help="不自动打开登录网页")
     sub.add_parser("openai-logout", help="删除本机保存的 ChatGPT OAuth 登录")
 
+    replay = sub.add_parser("replay-macd", help="使用显式 RQAlpha 日线包运行独立 MACD 回放")
+    replay.add_argument("--bundle-dir", required=True, help="已解压的 RQAlpha 数据包目录")
+    replay.add_argument("--stock", action="append", default=[], help="六位 A 股代码，可重复指定")
+    replay.add_argument("--start", required=True, help="起始日期 YYYY-MM-DD")
+    replay.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
+    replay.add_argument("--notice", action="append", default=[], help="证券代码=交易所或巨潮公告链接，可重复指定")
+    replay.add_argument("--baseline-forecast", action="append", default=[], help="同一信号日出具的 forecast-record JSON，可重复指定")
+
+    record = sub.add_parser("forecast-record", help="生成最近完整交易日固定双榜的事前预测记录，输出 JSON")
+    record.add_argument("--count", type=int, choices=range(1, 11), help="当时展示的候选数量")
+    verify = sub.add_parser("verify-forecast", help="以正式次日日线复核原始预测记录，输出 JSON")
+    verify.add_argument("--forecast", action="append", required=True, help="原始预测记录 JSON，每个信号日一份")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -549,6 +657,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_openai_login(args.no_browser)
     if args.command == "openai-logout":
         return cmd_openai_logout()
+    if args.command == "replay-macd":
+        return cmd_replay_macd(args)
+    if args.command in {"forecast-record", "verify-forecast"}:
+        return cmd_forecast(args)
 
     return cmd_chat(50)
 
